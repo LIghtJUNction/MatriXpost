@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MatriXpost</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script defer src="app.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">LOCAL-ONLY DESKTOP</p>
+        <h1>MatriXpost</h1>
+        <p id="availability" class="notice" role="status">
+          Provider automation is unavailable. This application never sends media remotely.
+        </p>
+      </header>
+
+      <section aria-labelledby="overview-title">
+        <div class="section-heading">
+          <h2 id="overview-title">Local state</h2>
+          <button id="refresh" type="button">Refresh</button>
+        </div>
+        <dl class="summary" id="summary" aria-live="polite"></dl>
+        <div id="platforms" class="platforms" aria-label="Platform availability"></div>
+      </section>
+
+      <section aria-labelledby="draft-title">
+        <h2 id="draft-title">Save a local draft</h2>
+        <p class="hint">The media path is saved locally as a draft. No upload or publish action exists in this shell.</p>
+        <form id="draft-form">
+          <label>
+            Title
+            <input name="title" required maxlength="120" autocomplete="off" />
+          </label>
+          <label>
+            Media path
+            <input name="mediaPath" required autocomplete="off" placeholder="/path/to/video.mp4" />
+          </label>
+          <fieldset>
+            <legend>Targets</legend>
+            <div id="target-options" class="targets"></div>
+          </fieldset>
+          <label>
+            Local schedule (optional)
+            <input name="scheduledAt" inputmode="numeric" placeholder="YYYY-MM-DD HH:MM:SS" />
+          </label>
+          <button type="submit">Save local draft</button>
+          <p id="draft-result" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section aria-labelledby="accounts-title">
+        <h2 id="accounts-title">Local video accounts</h2>
+        <p class="hint">Save only display and routing metadata. The routing fields are required by the local account model, but this application never stores passwords, cookies, tokens, or session data.</p>
+        <form id="account-form">
+          <label>
+            Platform
+            <select name="platform" required>
+              <option value="dy">Douyin (dy)</option>
+              <option value="sph">WeChat Channels (sph)</option>
+              <option value="blbl">Bilibili (blbl)</option>
+              <option value="bjh">Baijiahao (bjh)</option>
+              <option value="tt">Toutiao (tt)</option>
+              <option value="ks">Kuaishou (ks)</option>
+              <option value="xhs">Xiaohongshu (xhs)</option>
+              <option value="fqsp">Fanqie Video (fqsp)</option>
+            </select>
+          </label>
+          <label>
+            Display name
+            <input name="displayName" required maxlength="120" autocomplete="off" />
+          </label>
+          <label>
+            Local status
+            <select name="status" required>
+              <option value="logged_in">Logged in</option>
+              <option value="expired">Expired</option>
+              <option value="logged_out" selected>Logged out</option>
+              <option value="unavailable">Unavailable</option>
+            </select>
+          </label>
+          <label>
+            Routing phone or label
+            <input name="phone" required maxlength="120" autocomplete="off" aria-describedby="routing-help" />
+          </label>
+          <label>
+            Routing partition
+            <input name="partition" required pattern="persist:.*" placeholder="persist:my-account" autocomplete="off" aria-describedby="routing-help" />
+          </label>
+          <p id="routing-help" class="hint">These are local routing labels, not login credentials. The partition must begin with <code>persist:</code>.</p>
+          <button type="submit">Save local account metadata</button>
+          <p id="account-result" role="status" aria-live="polite"></p>
+        </form>
+        <ul id="accounts" class="accounts" aria-live="polite" aria-label="Saved local video accounts"></ul>
+      </section>
+
+      <section aria-labelledby="history-title">
+        <h2 id="history-title">Local publication history</h2>
+        <p class="hint">History shows only titles, targets, local state, and timing intent. Media paths and account routing details are never displayed.</p>
+        <form id="history-form">
+          <label>
+            Time range
+            <select name="days">
+              <option value="7" selected>Last 7 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+          </label>
+          <label class="checkbox-label">
+            <input name="all" type="checkbox" />
+            Show all local history
+          </label>
+          <label>
+            Platform
+            <select name="platform">
+              <option value="">All platforms</option>
+              <option value="dy">Douyin (dy)</option>
+              <option value="sph">WeChat Channels (sph)</option>
+              <option value="blbl">Bilibili (blbl)</option>
+              <option value="bjh">Baijiahao (bjh)</option>
+              <option value="tt">Toutiao (tt)</option>
+              <option value="ks">Kuaishou (ks)</option>
+              <option value="xhs">Xiaohongshu (xhs)</option>
+              <option value="fqsp">Fanqie Video (fqsp)</option>
+            </select>
+          </label>
+          <label>
+            State
+            <select name="status">
+              <option value="">All states</option>
+              <option value="success">Success</option>
+              <option value="failed">Failed</option>
+              <option value="publishing">Publishing</option>
+              <option value="scheduled">Scheduled</option>
+            </select>
+          </label>
+          <button type="submit">Apply history filters</button>
+          <p id="history-result" role="status" aria-live="polite"></p>
+        </form>
+        <ul id="history" class="accounts" aria-live="polite" aria-label="Filtered local publication history"></ul>
+      </section>
+
+      <section aria-labelledby="article-accounts-title">
+        <h2 id="article-accounts-title">Local Juejin article metadata</h2>
+        <p class="hint">This saves only local metadata for Juejin. It does not log in, store a session, open a browser, or publish an article. Routing labels are never rendered after saving.</p>
+        <form id="article-account-form">
+          <label>
+            Display name
+            <input name="displayName" required maxlength="120" autocomplete="off" />
+          </label>
+          <label>
+            Local status
+            <select name="status" required>
+              <option value="logged_in">Logged in metadata</option>
+              <option value="expired">Expired metadata</option>
+              <option value="logged_out" selected>Logged out metadata</option>
+              <option value="unavailable">Unavailable metadata</option>
+            </select>
+          </label>
+          <label>
+            Routing phone or label
+            <input name="phone" required maxlength="120" autocomplete="off" aria-describedby="article-routing-help" />
+          </label>
+          <label>
+            Routing partition
+            <input name="partition" required pattern="persist:.*" placeholder="persist:my-juejin-account" autocomplete="off" aria-describedby="article-routing-help" />
+          </label>
+          <p id="article-routing-help" class="hint">Routing labels are local metadata, not login or session data. The partition must begin with <code>persist:</code>.</p>
+          <button type="submit">Save local Juejin metadata</button>
+          <p id="article-account-result" role="status" aria-live="polite"></p>
+        </form>
+        <ul id="article-accounts" class="accounts" aria-live="polite" aria-label="Saved local Juejin article metadata"></ul>
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+# Example only. Do not place credentials, cookies, or browser profiles in this file.
+# `state_path` is the SQLite file used for credential-free durable state.
+# Command-line --bind and --state-path override these values.
+bind = "127.0.0.1:8788"
+state_path = "/var/lib/matrixpost/matrixpost.db"
+
+# Optional, local-only runner declarations. A TCP entry invokes the separately
+# started matrixpost-webdriver-runner v1 protocol; matrixpostd never reads
+# browser data, profiles, cookies, or credentials. Unix socket and named-pipe
+# declarations remain visibility-only until audited transport adapters exist.
+#
+# [[provider_runners]]
+# platform = "dy"
+# transport = "tcp"
+# address = "127.0.0.1:39001"
+#
+# Other supported transports are `unix_socket` with an absolute `path`, and
+# `named_pipe` with a `name` under `\\\\.\\pipe\\`. Do not put credentials,
+# cookies, tokens, browser profiles, or remote addresses in this configuration.

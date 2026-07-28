@@ -1,0 +1,28 @@
+[package]
+name = "matrixpostd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless HTTP daemon for MatriXpost"
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/matrixpostd"
+categories = ["web-programming::http-server"]
+keywords = ["daemon", "http", "publishing", "matrixpost"]
+
+[[bin]]
+name = "matrixpostd"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+matrixpost-core = { version = "0.1.0", path = "../matrixpost-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

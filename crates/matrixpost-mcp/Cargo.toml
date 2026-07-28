@@ -1,0 +1,26 @@
+[package]
+name = "matrixpost-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local stdio MCP server for credential-free MatriXpost state"
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/matrixpost-mcp"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["mcp", "stdio", "publishing", "matrixpost"]
+
+[[bin]]
+name = "matrixpost-mcp"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+matrixpost-core = { version = "0.1.0", path = "../matrixpost-core" }
+rmcp.workspace = true
+schemars = "=1.2.2"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true

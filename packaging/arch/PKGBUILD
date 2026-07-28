@@ -1,0 +1,37 @@
+# Maintainer: lightjunction <lightjunction@users.noreply.github.com>
+
+pkgname=matrixpost
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Rust CLI, MCP server, and headless publication daemon for MatriXpost'
+arch=('x86_64' 'aarch64')
+url='https://github.com/lightjunction/MatriXpost'
+license=('GPL-2.0-only')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'git' 'rust')
+source=("${pkgname}::git+${url}.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+
+build() {
+  cd "${srcdir}/${pkgname}"
+
+  cargo build --frozen --release \
+    --package matrixpost-cli \
+    --package matrixpost-mcp \
+    --package matrixpostd
+}
+
+package() {
+  cd "${srcdir}/${pkgname}"
+
+  install -Dm755 target/release/matrixpost "${pkgdir}/usr/bin/matrixpost"
+  install -Dm755 target/release/matrixpost-mcp "${pkgdir}/usr/bin/matrixpost-mcp"
+  install -Dm755 target/release/matrixpostd "${pkgdir}/usr/bin/matrixpostd"
+
+  install -Dm644 deploy/matrixpostd.service \
+    "${pkgdir}/usr/lib/systemd/system/matrixpostd.service"
+  install -Dm644 deploy/matrixpostd.example.toml \
+    "${pkgdir}/usr/share/doc/${pkgname}/matrixpostd.example.toml"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
