@@ -39,6 +39,7 @@ const ELEMENT_POLL_ATTEMPTS: usize = 3;
 const ELEMENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const ACKNOWLEDGEMENT_ATTEMPTS: usize = 60;
 const ACKNOWLEDGEMENT_INTERVAL: Duration = Duration::from_secs(5);
+const DEBUGGER_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 const VISIBLE_SCRIPT: &str = r#"const e=arguments[0];const s=getComputedStyle(e);const r=e.getBoundingClientRect();return !(e.getAttribute('aria-hidden')==='true'||s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0||r.width===0||r.height===0);"#;
 const CODEMIRROR_WRITE_SCRIPT: &str = r#"const root=arguments[0],text=arguments[1];const editor=root.closest('.cm-editor')||root;const view=editor.cmView?.view||root.cmView?.view;if(view){view.dispatch({changes:{from:0,to:view.state.doc.length,insert:text}});return view.state.doc.toString()===text;}root.focus();root.textContent=text;root.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:text}));return root.textContent===text;"#;
 const MAX_ARTICLE_BODY_BYTES: usize = 1_000_000;
@@ -786,11 +787,63 @@ impl<T: WebDriverTransport> ArticlePublicationExecutor for WebDriverPublisher<T>
 struct RunnerService {
     executor: Option<Arc<dyn PublicationExecutor>>,
     article_executor: Option<Arc<dyn ArticlePublicationExecutor>>,
+    browser_debugger_address: Option<SocketAddr>,
+    debugger_probe: Arc<dyn BrowserDebuggerProbe>,
+}
+
+trait BrowserDebuggerProbe: Send + Sync {
+    fn is_ready(&self, address: SocketAddr) -> bool;
+}
+
+struct HttpBrowserDebuggerProbe;
+
+impl BrowserDebuggerProbe for HttpBrowserDebuggerProbe {
+    fn is_ready(&self, address: SocketAddr) -> bool {
+        if !address.ip().is_loopback() {
+            return false;
+        }
+        let endpoint = format!("http://{address}/json/version");
+        ureq::AgentBuilder::new()
+            .timeout(DEBUGGER_PROBE_TIMEOUT)
+            .build()
+            .get(&endpoint)
+            .call()
+            .ok()
+            .and_then(|response| response.into_string().ok())
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            .is_some_and(|response| valid_chrome_devtools_version(&response))
+    }
+}
+
+fn valid_chrome_devtools_version(response: &Value) -> bool {
+    response
+        .get("Browser")
+        .and_then(Value::as_str)
+        .is_some_and(|browser| browser.starts_with("Chrome/"))
+        && response
+            .get("Protocol-Version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| !version.is_empty())
+        && response
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .and_then(|url| Url::parse(url).ok())
+            .is_some_and(|url| matches!(url.scheme(), "ws" | "wss"))
 }
 
 async fn health(State(state): State<Arc<RunnerService>>) -> impl IntoResponse {
+    let browser_debugger_configured = state.browser_debugger_address.is_some();
+    let attached_browser = match (state.executor.is_some(), state.browser_debugger_address) {
+        (true, Some(address)) => {
+            let probe = Arc::clone(&state.debugger_probe);
+            tokio::task::spawn_blocking(move || probe.is_ready(address))
+                .await
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
     Json(
-        json!({"ok":true,"service":"matrixpost-webdriver-runner","protocol_version":PROVIDER_RUNNER_PROTOCOL_VERSION,"attached_browser":state.executor.is_some()}),
+        json!({"ok":true,"service":"matrixpost-webdriver-runner","protocol_version":PROVIDER_RUNNER_PROTOCOL_VERSION,"browser_debugger_configured":browser_debugger_configured,"attached_browser":attached_browser}),
     )
 }
 
@@ -1007,6 +1060,8 @@ async fn main() -> ExitCode {
     let service = Arc::new(RunnerService {
         executor,
         article_executor,
+        browser_debugger_address: args.browser_debugger_address,
+        debugger_probe: Arc::new(HttpBrowserDebuggerProbe),
     });
     let listener = match tokio::net::TcpListener::bind(args.bind).await {
         Ok(listener) => listener,
@@ -1158,6 +1213,100 @@ mod tests {
             },
             next_job: AtomicU64::new(1),
         }
+    }
+
+    struct StaticBrowserDebuggerProbe(bool);
+
+    impl BrowserDebuggerProbe for StaticBrowserDebuggerProbe {
+        fn is_ready(&self, _: SocketAddr) -> bool {
+            self.0
+        }
+    }
+
+    fn runner_service(
+        executor: Option<Arc<dyn PublicationExecutor>>,
+        article_executor: Option<Arc<dyn ArticlePublicationExecutor>>,
+    ) -> RunnerService {
+        RunnerService {
+            executor,
+            article_executor,
+            browser_debugger_address: None,
+            debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
+        }
+    }
+
+    fn runner_service_with_probe(
+        executor: Option<Arc<dyn PublicationExecutor>>,
+        browser_debugger_address: Option<SocketAddr>,
+        probe_ready: bool,
+    ) -> RunnerService {
+        RunnerService {
+            executor,
+            article_executor: None,
+            browser_debugger_address,
+            debugger_probe: Arc::new(StaticBrowserDebuggerProbe(probe_ready)),
+        }
+    }
+
+    async fn health_status(service: RunnerService) -> Value {
+        let response = app(Arc::new(service))
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_reports_configured_but_unreachable_browser_as_detached() {
+        let status = health_status(runner_service_with_probe(
+            Some(Arc::new(Accepted)),
+            Some(debugger_address()),
+            false,
+        ))
+        .await;
+
+        assert_eq!(status["browser_debugger_configured"], true);
+        assert_eq!(status["attached_browser"], false);
+    }
+
+    #[tokio::test]
+    async fn health_reports_ready_configured_browser_as_attached() {
+        let status = health_status(runner_service_with_probe(
+            Some(Arc::new(Accepted)),
+            Some(debugger_address()),
+            true,
+        ))
+        .await;
+
+        assert_eq!(status["browser_debugger_configured"], true);
+        assert_eq!(status["attached_browser"], true);
+    }
+
+    #[tokio::test]
+    async fn health_without_browser_debugger_address_is_detached() {
+        let status = health_status(runner_service_with_probe(
+            Some(Arc::new(Accepted)),
+            None,
+            true,
+        ))
+        .await;
+
+        assert_eq!(status["browser_debugger_configured"], false);
+        assert_eq!(status["attached_browser"], false);
+    }
+
+    #[test]
+    fn devtools_version_probe_requires_chrome_protocol_evidence() {
+        assert!(valid_chrome_devtools_version(&json!({
+            "Browser": "Chrome/150.0.0.0",
+            "Protocol-Version": "1.3",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/test"
+        })));
+        assert!(!valid_chrome_devtools_version(&json!({
+            "Browser": "Chrome/150.0.0.0",
+            "Protocol-Version": "1.3"
+        })));
     }
 
     #[test]
@@ -1430,10 +1579,7 @@ mod tests {
     }
     #[tokio::test]
     async fn protocol_accepts_only_versioned_targeted_requests() {
-        let router = app(Arc::new(RunnerService {
-            executor: Some(Arc::new(Accepted)),
-            article_executor: None,
-        }));
+        let router = app(Arc::new(runner_service(Some(Arc::new(Accepted)), None)));
         let runner_request = ProviderRunnerRequest {
             version: PROVIDER_RUNNER_PROTOCOL_VERSION,
             platform: Platform::Douyin,
@@ -1494,10 +1640,7 @@ mod tests {
     }
     #[tokio::test]
     async fn no_debugger_address_returns_unavailable_without_starting_a_session() {
-        let router = app(Arc::new(RunnerService {
-            executor: None,
-            article_executor: None,
-        }));
+        let router = app(Arc::new(runner_service(None, None)));
         let request = ProviderRunnerRequest {
             version: PROVIDER_RUNNER_PROTOCOL_VERSION,
             platform: Platform::Douyin,
@@ -1693,10 +1836,7 @@ mod tests {
 
     #[tokio::test]
     async fn article_protocol_is_unavailable_without_explicit_opt_in_even_with_video_attach() {
-        let router = app(Arc::new(RunnerService {
-            executor: Some(Arc::new(Accepted)),
-            article_executor: None,
-        }));
+        let router = app(Arc::new(runner_service(Some(Arc::new(Accepted)), None)));
         let request = ArticleRunnerRequest {
             version: ARTICLE_RUNNER_PROTOCOL_VERSION,
             request: article_request(),
@@ -1751,10 +1891,7 @@ mod tests {
 
     #[tokio::test]
     async fn article_protocol_queues_executor_response_and_rejects_unknown_payload_fields() {
-        let router = app(Arc::new(RunnerService {
-            executor: None,
-            article_executor: Some(Arc::new(Accepted)),
-        }));
+        let router = app(Arc::new(runner_service(None, Some(Arc::new(Accepted)))));
         let request = ArticleRunnerRequest {
             version: ARTICLE_RUNNER_PROTOCOL_VERSION,
             request: article_request(),
@@ -1796,10 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn article_protocol_rejects_scheduled_requests_before_starting_an_executor() {
         let executor = Arc::new(CountingArticleExecutor(AtomicU64::new(0)));
-        let router = app(Arc::new(RunnerService {
-            executor: None,
-            article_executor: Some(executor.clone()),
-        }));
+        let router = app(Arc::new(runner_service(None, Some(executor.clone()))));
         let mut request = article_request();
         request.scheduled_at =
             Some(matrixpost_core::LocalSchedule::parse("2026-01-02 03:04:05").unwrap());
@@ -1824,10 +1958,10 @@ mod tests {
 
     #[tokio::test]
     async fn article_protocol_marks_executor_failure_as_an_attempted_automation() {
-        let router = app(Arc::new(RunnerService {
-            executor: None,
-            article_executor: Some(Arc::new(FailingArticleExecutor)),
-        }));
+        let router = app(Arc::new(runner_service(
+            None,
+            Some(Arc::new(FailingArticleExecutor)),
+        )));
         let response = router
             .oneshot(
                 Request::post("/v1/publish-article")
@@ -1857,10 +1991,10 @@ mod tests {
 
     #[tokio::test]
     async fn article_protocol_marks_pre_session_validation_failure_as_not_attempted() {
-        let router = app(Arc::new(RunnerService {
-            executor: None,
-            article_executor: Some(Arc::new(LocalValidationArticleExecutor)),
-        }));
+        let router = app(Arc::new(runner_service(
+            None,
+            Some(Arc::new(LocalValidationArticleExecutor)),
+        )));
         let response = router
             .oneshot(
                 Request::post("/v1/publish-article")
