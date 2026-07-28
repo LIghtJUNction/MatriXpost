@@ -112,13 +112,14 @@ public-package metadata validation, and a `matrixpost-core` package archive,
 plus macOS/Windows desktop type checks. It intentionally does not package
 dependent crate archives until `matrixpost-core` is available on crates.io.
 The only desktop bundle evidence is a locally generated and inspected Linux
-amd64 `.deb`; it was not installed or launched. macOS and Windows CI jobs are
-configured for native compilation only and have not run, so neither platform
-has bundle or runtime evidence.
+amd64 `.deb`; it was not installed or launched. CI run 30376876522 passed
+native macOS and Windows desktop compilation, but neither platform has bundle
+or runtime evidence.
 The first Cargo release publishes core first, then package-verifies/publishes
 CLI, daemon, and MCP serially. The systemd unit is supplied but never installed
 or enabled automatically. The PKGBUILD is an unreleased tag-based AUR recipe.
 The four public crates are prepared for Cargo packaging; desktop and WebDriver
-runner crates are not published. No remote CI result, GitHub commit or release,
-crates.io publication, AUR upload, or authenticated live-platform proof has
-been performed. No `.cursor` directory is used.
+runner crates are not published. GitHub commits/pushes and CI run 30376876522
+have occurred; no GitHub release, crates.io publication, AUR upload, server
+install/enablement, or authenticated live-platform draft acceptance has been
+performed. No `.cursor` directory is used.

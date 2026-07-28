@@ -92,9 +92,11 @@ cannot normalize their crate archives while the core dependency is unpublished.
 For systemd deployment, preserve the supplied hardening model: least privilege,
 dedicated state directory, secret-free configuration, and an intentional bind
 address. Do not install, enable, restart, or expose the unit without explicit
-approval. The repository includes a CI workflow, a systemd unit, and an Arch
-PKGBUILD, but no remote CI run, GitHub release, crates.io publication, or AUR
-upload is evidence until it is actually performed and checked.
+approval. GitHub commits and pushes have occurred, and CI run 30376876522
+passed its Linux workspace/package checks and native macOS/Windows desktop
+compilation. That CI evidence does not establish a macOS/Windows bundle or
+runtime result. No GitHub release, crates.io publication, AUR upload, or
+server install/enablement has been performed.
 
 ## Reference loading
 
