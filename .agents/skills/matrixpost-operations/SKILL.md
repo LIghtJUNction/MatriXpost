@@ -78,9 +78,9 @@ support against the actual tree. Treat publication to GitHub, crates.io, AUR,
 or a server as an external write requiring explicit user authorization.
 
 Current desktop delivery evidence is limited to a generated and locally
-inspected Linux amd64 `.deb` bundle; it was not installed or launched. CI has
-only configured native macOS/Windows desktop compilation and those jobs have
-not run, so neither platform has bundle or runtime evidence.
+inspected Linux amd64 `.deb` bundle; it was not installed or launched. Native
+macOS/Windows desktop compilation is verified in CI, but neither platform has
+bundle or runtime evidence.
 
 For the first Cargo release, do not read CI's core-only package archive as
 proof that dependent crate archives exist. Publish `matrixpost-core` first and

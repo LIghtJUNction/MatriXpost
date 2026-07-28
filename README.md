@@ -203,9 +203,8 @@ cargo tauri build
 
 Delivery evidence is intentionally narrow: a Linux amd64 `.deb` bundle has
 been generated and inspected locally, but it has not been installed or
-launched. CI only configures native macOS and Windows desktop compilation, and
-those jobs have not run; there is no macOS or Windows bundle or runtime
-evidence.
+launched. Native macOS and Windows desktop compilation is verified in CI, but
+there is no macOS or Windows bundle or runtime evidence.
 
 The static frontend uses Tauri's injected global IPC bridge
 (`withGlobalTauri:true`) because it has no Node dependency or bundler. That
