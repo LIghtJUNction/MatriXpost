@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use matrixpost_core::Platform;
+use matrixpost_core::{Platform, PublishRequest};
 use url::Url;
 
 pub(crate) const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
@@ -50,6 +50,54 @@ pub(crate) const FANQIE_REVIEW_STATUS_SCRIPT: &str = r#"const n=v=>String(v||'')
 /// waits for unbounded UI activity in an attached user browser.
 pub(crate) const WECHAT_SHADOW_ACTION_POLL_ATTEMPTS: usize = 30;
 pub(crate) const WECHAT_SHADOW_ACTION_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Autonomous-statement interactions are bounded independently from generic
+/// publish acknowledgement. A visible but incomplete declaration must never
+/// be followed by a submit action.
+pub(crate) const DOUYIN_STATEMENT_POLL_ATTEMPTS: usize = 30;
+pub(crate) const DOUYIN_STATEMENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// These scripts return only booleans and accept one of the finite labels
+/// resolved by the Rust runner. They intentionally do not return page text.
+pub(crate) const DOUYIN_STATEMENT_OPEN_SCRIPT: &str = r#"const n=v=>String(v||'').replace(/\s+/g,'').trim();const keys=['请选择自主声明','添加自主声明','自主声明'];for(const el of document.querySelectorAll('[class]')){const classes=typeof el.className==='string'?el.className.split(/\s+/):[];if(!classes.some(item=>item.startsWith('selectText-')))continue;if(keys.some(key=>n(el.textContent).includes(n(key)))){el.click();return true;}}for(const el of document.querySelectorAll('span,div,label,[role="button"],.semi-select')){const text=n(el.textContent);if(text.length<=24&&keys.some(key=>text.includes(n(key)))){el.click();return true;}}return false;"#;
+pub(crate) const DOUYIN_STATEMENT_DIALOG_VISIBLE_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},matches=Array.from(document.querySelectorAll('.semi-modal-body')).filter(body=>visible(body)&&Array.from(body.querySelectorAll('.semi-radio-addon')).some(item=>String(item.textContent||'').trim()===expected));return matches.length===1;"#;
+pub(crate) const DOUYIN_STATEMENT_SELECT_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},matches=Array.from(document.querySelectorAll('.semi-modal-body')).filter(body=>visible(body)&&Array.from(body.querySelectorAll('.semi-radio-addon')).some(item=>String(item.textContent||'').trim()===expected));if(matches.length!==1)return false;const option=Array.from(matches[0].querySelectorAll('.semi-radio-addon')).find(item=>String(item.textContent||'').trim()===expected);const label=option?.closest('label.semi-radio');if(!label)return false;label.click();return true;"#;
+pub(crate) const DOUYIN_STATEMENT_CONFIRM_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},matches=Array.from(document.querySelectorAll('.semi-modal-body')).filter(body=>visible(body)&&Array.from(body.querySelectorAll('.semi-radio-addon')).some(item=>String(item.textContent||'').trim()===expected));if(matches.length!==1)return false;const root=matches[0].closest('.semi-modal')||matches[0],buttons=Array.from(root.querySelectorAll('.semi-button.semi-button-primary')).filter(item=>!item.disabled&&item.getAttribute('aria-disabled')!=='true');if(buttons.length!==1)return false;buttons[0].click();return true;"#;
+pub(crate) const DOUYIN_STATEMENT_DIALOG_GONE_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},matches=Array.from(document.querySelectorAll('.semi-modal-body')).filter(body=>visible(body)&&Array.from(body.querySelectorAll('.semi-radio-addon')).some(item=>String(item.textContent||'').trim()===expected));return matches.length===0;"#;
+
+/// Match MatrixMedia's target-specific Douyin resolver. An explicitly
+/// supplied unsupported value follows the upstream `none` fallback and is
+/// still selected on the page; an absent Douyin override remains absent.
+pub(crate) fn douyin_autonomous_statement_label(request: &PublishRequest) -> Option<&'static str> {
+    let value = request
+        .overrides
+        .iter()
+        .find(|item| item.platform == Platform::Douyin)
+        .and_then(|item| item.creative_statement.as_deref())?
+        .trim();
+    Some(match value {
+        "ai_generated"
+        | "AI生成"
+        | "含AI生成内容"
+        | "内容由AI生成"
+        | "内容为AI生成"
+        | "笔记含AI合成内容" => "内容由AI生成",
+        "fiction"
+        | "虚构演绎"
+        | "含虚构演绎内容"
+        | "虚构演绎，仅供娱乐"
+        | "演绎情节，仅供娱乐"
+        | "虚构演绎，故事经历" => "虚构演绎，仅供娱乐",
+        "marketing" | "营销推广" | "内容含营销信息" | "内容含营销推广信息" => {
+            "内容含营销推广信息"
+        }
+        "personal_opinion" | "个人观点" | "个人观点，仅供参考" | "内容为个人观点或见解" => {
+            "内容为个人观点或见解"
+        }
+        "repost" | "转载" | "内容为转载" | "内容为转载信息" | "取自站外" | "素材来源于网络" => {
+            "内容为转载信息"
+        }
+        _ => "无需添加自主声明",
+    })
+}
 /// These scripts return only booleans. Product names, identifiers, and DOM
 /// content deliberately never leave the attached page through WebDriver.
 pub(crate) const WECHAT_PRODUCT_TYPE_READY_SCRIPT: &str = r#"const app=document.querySelector('wujie-app.wujie_iframe');const root=app?.shadowRoot;if(!root)return false;const link=root.querySelector('.post-with-link');if(!link)return false;const selected=String(link.querySelector('.choosen-link-wrap span')?.textContent||'').trim();const chooser=link.querySelector('.post-component-choose-wrap .content-wrap');if(selected==='商品'&&chooser)return true;const menu=link.querySelector('.link-list-options');const visible=menu&&getComputedStyle(menu).display!=='none';if(!visible){link.querySelector('.link-display-wrap')?.click();return false;}const product=Array.from(menu.querySelectorAll('.link-option-item')).find(item=>String(item.textContent||'').replace(/\s+/g,'')==='商品');product?.click();return false;"#;

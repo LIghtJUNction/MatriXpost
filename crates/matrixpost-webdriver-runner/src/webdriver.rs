@@ -237,6 +237,23 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         Ok(false)
     }
 
+    fn wait_for_douyin_statement_action(
+        &self,
+        session: &str,
+        script: &str,
+        args: Value,
+    ) -> Result<(), String> {
+        for attempt in 0..DOUYIN_STATEMENT_POLL_ATTEMPTS {
+            if self.execute_bool(session, script, args.clone())? {
+                return Ok(());
+            }
+            if attempt + 1 < DOUYIN_STATEMENT_POLL_ATTEMPTS {
+                std::thread::sleep(DOUYIN_STATEMENT_POLL_INTERVAL);
+            }
+        }
+        Err("Douyin autonomous-statement action did not complete before its deadline".into())
+    }
+
     pub(crate) fn wechat_product_id(request: &PublishRequest) -> Result<Option<String>, String> {
         let link = &request.wechat_link;
         let product_id = link.product_id.as_deref().map(str::trim);
@@ -308,6 +325,28 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         self.wait_for_wechat_shadow_action(
             session,
             WECHAT_CREATIVE_STATEMENT_SELECT_SCRIPT,
+            json!([label]),
+        )
+    }
+
+    fn apply_douyin_autonomous_statement(&self, session: &str, label: &str) -> Result<(), String> {
+        if !self.execute_bool(session, DOUYIN_STATEMENT_OPEN_SCRIPT, json!([]))? {
+            return Err("Douyin autonomous-statement selector could not be opened".into());
+        }
+        self.wait_for_douyin_statement_action(
+            session,
+            DOUYIN_STATEMENT_DIALOG_VISIBLE_SCRIPT,
+            json!([label]),
+        )?;
+        if !self.execute_bool(session, DOUYIN_STATEMENT_SELECT_SCRIPT, json!([label]))? {
+            return Err("Douyin autonomous-statement option could not be selected".into());
+        }
+        if !self.execute_bool(session, DOUYIN_STATEMENT_CONFIRM_SCRIPT, json!([label]))? {
+            return Err("Douyin autonomous-statement confirmation was unavailable".into());
+        }
+        self.wait_for_douyin_statement_action(
+            session,
+            DOUYIN_STATEMENT_DIALOG_GONE_SCRIPT,
             json!([label]),
         )
     }
@@ -568,7 +607,7 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         if let Some(address) = &request.address {
             fields.push(address.clone());
         }
-        if platform != Platform::WechatChannels
+        if !matches!(platform, Platform::WechatChannels | Platform::Douyin)
             && let Some(statement) =
                 override_value.and_then(|item| item.creative_statement.as_ref())
         {
@@ -725,6 +764,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
         let wechat_creative_statement = (platform == Platform::WechatChannels)
             .then(|| Self::wechat_creative_statement_label(request))
             .flatten();
+        let douyin_autonomous_statement = (platform == Platform::Douyin)
+            .then(|| douyin_autonomous_statement_label(request))
+            .flatten();
         let session = self.session()?;
         let outcome: Result<(), String> = (|| {
             self.navigate(&session, profile.upload_url)?;
@@ -745,6 +787,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             }
             if let Some(label) = wechat_creative_statement {
                 self.apply_wechat_creative_statement(&session, label)?;
+            }
+            if let Some(label) = douyin_autonomous_statement {
+                self.apply_douyin_autonomous_statement(&session, label)?;
             }
             if platform == Platform::WechatChannels {
                 self.try_declare_wechat_original(&session)?;
