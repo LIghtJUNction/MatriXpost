@@ -1,144 +1,53 @@
 # MatriXpost protocol reference
 
-Read the current Rust source before changing a contract. This reference records
-the implemented local surface; a runner result is never proof of platform-side
-publication or processing.
+Read current Rust source before changing a contract. This reference records implemented surfaces; local runner outcomes never prove remote publication.
 
-## Canonical platform codes
+## Publication compatibility
 
-| Code | Platform | Accepted aliases in the core |
-| --- | --- | --- |
-| `dy` | Douyin | `douyin`, `抖音` |
-| `sph` | WeChat Channels | `wechat_channels`, `wechat`, `视频号`, `微信视频号` |
-| `blbl` | Bilibili | `bilibili`, `哔哩哔哩`, `b站` |
-| `bjh` | Baijiahao | `baijiahao`, `百家号` |
-| `tt` | Toutiao | `toutiao`, `今日头条`, `头条` |
-| `ks` | Kuaishou | `kuaishou`, `快手` |
-| `xhs` | Xiaohongshu | `xiaohongshu`, `小红书` |
-| `fqsp` | Fanqie Video | `fanqie_video`, `fanqie-video`, `fanqie`, `fq`, `番茄视频` |
+Serialize these canonical video platform codes: `dy`, `sph`, `blbl`, `bjh`, `tt`, `ks`, `xhs`, and `fqsp`. Preserve accepted aliases in core without adding another canonical code absent an explicit compatibility decision.
 
-Serialize the first-column codes. Do not add a ninth platform or change a
-canonical code without an explicit compatibility decision.
+`matrixpost` writes one JSON document to stdout. Its publication commands validate local intent; `login` is unavailable, video `publish` requires an explicit eligible loopback provider runner, and `publish-article` accepts Juejin only and requires one explicit eligible article runner. `accounts`, `history`, and `providers` expose credential-free local state.
 
-## CLI and loopback runners
+`matrixpostd` defaults to `127.0.0.1:8788`. `GET /`, `GET /health`, `GET /platforms`, `GET /providers`, `GET /creative-statements`, `POST /changeData`, and `POST /publish` retain the MatrixMedia-compatible publication surface. `POST /publish` returns local availability/queue truth, never remote publication proof.
 
-`matrixpost` emits one JSON document on stdout. Exit code `0` means a completed
-local query or local runner workflow, `2` invalid input, `3` unavailable, and
-`4` rejected or internally failed dispatch. Exit code `1` has no stable meaning.
+Expose the same generic lifecycle model over HTTP: `GET|POST /lifecycle/objects`, `GET /lifecycle/objects/{id}`, `POST /lifecycle/objects/{id}/transition`, `GET|POST /lifecycle/objects/{id}/ledger`, and `GET|POST /lifecycle/objects/{id}/attributions`. Use snake_case request fields on this HTTP surface. Return `404 not_found` for a missing object; return an empty child list only for an existing object with no entries or attributions.
 
-| Command | Current behavior |
+## Generic lifecycle CLI
+
+Keep the global `--state-path <path>` before the command. Every command emits JSON.
+
+| Intent | CLI command |
 | --- | --- |
-| `login --platform <code>` | Validates then returns unavailable; no login occurs. |
-| `publish --platform <code> --file <path-or-http-url> --title <title>` | Validates a typed video request. Without a runner it is unavailable. |
-| `publish-article --platform juejin --title <title> (--content <text>\|--file <path>)` | Validates a typed Juejin request. Without an article runner it is unavailable. |
-| `accounts --json` | Returns credential-free video account metadata from SQLite. |
-| `history --json [--days N] [--platform <code>] [--status <status>] [--all]` | Returns filtered local history; default is seven trailing days. `fqsp` is not a history filter. |
-| `providers --json` | Shows deterministic video-provider availability. |
+| List objects | `matrixpost lifecycle objects` |
+| Read one object | `matrixpost lifecycle object get --id <id>` |
+| Create object | `matrixpost lifecycle object create --id <id> --kind <kind> --display-name <name> [--external-id <id>] [--attribute KEY=VALUE]` |
+| List ledger | `matrixpost lifecycle ledger list --object <id>` |
+| Append immutable entry | `matrixpost lifecycle ledger add --id <id> --object <id> --direction expense|revenue --category <category> --amount-minor <integer> --currency <ISO4217>` |
+| List attribution | `matrixpost lifecycle attribution list --object <id>` |
+| Link content history | `matrixpost lifecycle attribution add --object <id> --history <history-id>` |
+| Transition object | `matrixpost lifecycle transition --id <id> --expected-revision <n> --lifecycle-status draft|active|completed|archived --approval-status pending|approved|rejected` |
 
-Video runners are declared with repeatable
-`--provider-runner PLATFORM=tcp:127.0.0.1:PORT` (or the validated but currently
-unavailable Unix-socket/named-pipe forms). A TCP declaration posts only to a
-separately started loopback `matrixpost-webdriver-runner` at `/v1/publish`; the
-CLI never starts it. Juejin uses exactly one
-`--article-runner tcp:127.0.0.1:PORT`, which posts only to
-`/v1/publish-article`. Both addresses must be loopback and credential-free.
-Account routing is stripped before either runner request.
-
-The video runner needs both a loopback WebDriver endpoint and a loopback
-browser DevTools address. It attaches ChromeDriver to the user-managed browser;
-it does not start a browser profile. Article dispatch additionally requires the
-runner startup flag `--allow-article-publish`. Without a configured or eligible
-runner, no runner attempt occurs. Article schedules are rejected before
-WebDriver execution. `queued` means only that the local runner completed its
-workflow; it never confirms remote publication. No authenticated live-platform
-acceptance proof exists.
-
-## Daemon HTTP surface
-
-`matrixpostd` defaults to `127.0.0.1:8788` and uses SQLite selected by
-`--state-path` (or its runtime default). Its credential-free TOML
-`provider_runners` accepts the same video declarations as the CLI. TCP entries
-can call the separately started runner; Unix sockets and named pipes are still
-unavailable.
-
-| Method and path | Current behavior |
-| --- | --- |
-| `GET /`, `GET /health` | Return healthy local-service status. |
-| `GET /platforms` | Return platform metadata and availability fields. |
-| `GET /providers` | Return configured provider availability. |
-| `GET /creative-statements` | Returns `503 unavailable`. |
-| `POST /changeData` | Persists supported non-secret `account`, `pushData`, and metadata records. |
-| `POST /publish` | Parses MatrixMedia-compatible JSON and dispatches the configured video registry. All unavailable yields `503`; all local runner workflows queued yields `202`; mixed outcomes yield rejection. None confirms remote publication. |
-
-The publish DTO supports `platform`/`platforms`, string `file`, `publishAt`,
-`sphProductId`, `sphLink`, and `platformOptions`; it is mapped to the typed
-core request. Remote-media staging is bounded but is not invoked by a provider.
+Accept optional RFC3339 timestamps, counterparty, reference, and description where the CLI exposes them. Use integer minor amounts; never use floating-point currency. Append-only ledger entries have no update or delete operation. Refresh the object after every transition because success increments its revision.
 
 ## MCP stdio surface
 
-`matrixpost-mcp` opens the same SQLite state as CLI. Its stdout is exclusively
-MCP JSON-RPC; `MATRIXPOST_MCP_LOG=1` enables diagnostics only on stderr. State
-selection is `--state-path`, then `MATRIXPOST_STATE_PATH`, then
-`matrixpost.db` in the current directory. It has no shell, daemon-spawn, or
-credential/session path.
+`matrixpost-mcp` uses the same SQLite state as CLI. Resolve state in this order: `--state-path`, `MATRIXPOST_STATE_PATH`, then `matrixpost.db` in the current directory. Keep stdout exclusively MCP JSON-RPC; send optional diagnostics only to stderr through `MATRIXPOST_MCP_LOG=1`.
 
-| Tool | Current behavior |
+There are twelve typed tools. Tool names are snake_case. All typed tool inputs use camelCase field names (for example `businessObjectId` and `expectedRevision`); returned core records preserve their Rust serialization with snake_case fields (for example `business_object_id`, `lifecycle_status`, and `amount_minor`).
+
+| Group | Tools |
 | --- | --- |
-| `list_accounts` | Lists safe routing fields `{phone, platform, partition}` for exact supported platforms. |
-| `list_history` | Applies the same local seven-day/default, platform, status, and all-history filtering as the CLI. |
-| `publish_video` | Validates and persists a local video draft/queued job for `dy`, `ks`, `blbl`, `bjh`, `tt`, or `sph`; it does not invoke video automation. |
-| `publish_article` | Accepts only Juejin. Without `--article-runner tcp:127.0.0.1:PORT`, returns unavailable with no runner attempt. With it, forwards only through the same local runner contract and reports queued, unavailable, or rejected truthfully. |
-| `list_business_objects` | Lists generic local business objects; accepts an empty object only. |
-| `get_business_object` | Returns one local business object for `{id}`. |
-| `create_business_object` | Persists `{id, kind, displayName, externalId?, lifecycleStatus?, approvalStatus?, attributes?}` with server UTC timestamps and revision zero. |
-| `list_ledger_entries` | Lists immutable local ledger entries for `{businessObjectId}`. |
-| `append_ledger_entry` | Appends a validated local expense or revenue entry from `{id, businessObjectId, direction, category, amountMinor, currency, ...}`; it never changes an existing entry. |
-| `list_content_attributions` | Lists local publication-history links for `{businessObjectId}`. |
-| `add_content_attribution` | Persists a local `{businessObjectId, historyId, createdAt?}` link only when both records already exist. |
-| `transition_business_object` | Applies a guarded local state update from `{id, expectedRevision, lifecycleStatus, approvalStatus, updatedAt?}`; stale or invalid transitions are rejected. |
+| Publication (4) | `list_accounts`, `list_history`, `publish_video`, `publish_article` |
+| Lifecycle (8) | `list_business_objects`, `get_business_object`, `create_business_object`, `list_ledger_entries`, `append_ledger_entry`, `list_content_attributions`, `add_content_attribution`, `transition_business_object` |
 
-MCP article scheduling is rejected by the runner before browser work. Its
-`queued` output only describes local runner completion. Inputs reject unknown
-fields. Generic lifecycle `attributes` reject sensitive **key names** (such as
-`token`, `cookie`, `password`, and `session`); values are not scanned
-heuristically, so ordinary business text may contain those words. Cookies,
-passwords, tokens, sessions, and credentials are never accepted as named
-fields or returned. The eight lifecycle tools are SQLite-only generic state
-management: they do not create a browser session, invoke a provider, or claim
-remote publication.
+Lifecycle examples use `create_business_object` with `{id, kind, displayName, externalId?, lifecycleStatus?, approvalStatus?, attributes?}`; `append_ledger_entry` with `{id, businessObjectId, direction, category, amountMinor, currency, ...}`; and `transition_business_object` with `{id, expectedRevision, lifecycleStatus, approvalStatus, updatedAt?}`. Reject unknown input fields. Return `not_found` for a missing object or history record; return an empty list only for an existing object with no corresponding entries or links.
 
-## Desktop and delivery artifacts
+Reject lifecycle attribute key names such as `token`, `cookie`, `password`, and `session`. Do not scan ordinary attribute values heuristically. Never accept or return named credential, cookie, token, password, or session fields. Lifecycle tools are generic local SQLite state management only: do not invoke a provider, browser, runner, remote publishing path, or agent runtime.
 
-`matrixpost-desktop` is an implemented Tauri v2 shell for Linux, macOS, and
-Windows. It opens application-data `matrixpost.db` and exposes twelve typed
-IPC commands: `desktop_snapshot`, `save_local_draft`, `save_account`,
-`save_article_account`, `local_history`, `lifecycle_objects`,
-`create_lifecycle_object`, `lifecycle_ledger_entries`,
-`append_lifecycle_ledger_entry`, `lifecycle_content_attributions`,
-`add_lifecycle_content_attribution`, and `transition_lifecycle_object`. The
-lifecycle IPC uses the same generic local SQLite object, immutable-ledger,
-attribution, and revision-guarded transition contracts as the other adapters.
-Account snapshot entries are display metadata; history
-entries are id, state, timestamp, title, targets, and local intent. Media
-paths, phone/partition routing, serialized requests, sessions, and credentials
-are not projected to the frontend. The desktop starts no daemon, shell,
-browser, provider, or runner and has no remote-dispatch UI.
+## Tauri and service delivery
 
-The repository contains `.github/workflows/ci.yml`,
-`deploy/matrixpostd.service`, `deploy/matrixpostd.example.toml`, and
-`packaging/arch/PKGBUILD`. CI defines Linux workspace checks, locked
-public-package metadata validation, and a `matrixpost-core` package archive,
-plus macOS/Windows desktop type checks. It intentionally does not package
-dependent crate archives until `matrixpost-core` is available on crates.io.
-The only desktop bundle evidence is a locally generated and inspected Linux
-amd64 `.deb`; it was not installed or launched. CI run 30376876522 passed
-native macOS and Windows desktop compilation, but neither platform has bundle
-or runtime evidence.
-Version 0.1.0 of the four public crates was published after core-first,
-then dependent-crates serial verification. The lifecycle API is the next
-coordinated 0.2.0 release and is not published yet. The systemd unit is
-supplied but never installed or enabled automatically. The PKGBUILD is a
-checksum-pinned 0.1.0 commit archive recipe and has not been uploaded to AUR.
-Desktop and WebDriver runner crates are not published. A GitHub v0.1.0 release
-exists; server installation/enablement and authenticated live-platform draft
-acceptance have not occurred. No `.cursor` directory is used.
+The Tauri v2 desktop shell opens application-data `matrixpost.db`; it starts no daemon, shell, browser, provider, or runner. It exposes twelve IPC commands: `desktop_snapshot`, `save_local_draft`, `save_account`, `save_article_account`, `local_history`, `lifecycle_objects`, `create_lifecycle_object`, `lifecycle_ledger_entries`, `append_lifecycle_ledger_entry`, `lifecycle_content_attributions`, `add_lifecycle_content_attribution`, and `transition_lifecycle_object`. Project only safe display metadata and local lifecycle records to the frontend.
+
+Use `deploy/matrixpostd.service` and `deploy/matrixpostd.example.toml` as the systemd deployment starting point. Do not install or enable it automatically. Keep its bind address intentional and its configuration secret-free.
+
+The repository includes CI for locked workspace checks, public-package metadata, a core package archive, and macOS/Windows desktop compilation checks. Version 0.2.0 of the four public crates is published on crates.io and the v0.2.0 GitHub Release exists. The desktop and WebDriver runner crates are not crates.io packages. Validate the current checksum-pinned PKGBUILD source archive locally before any AUR operation; do not claim an AUR remote upload without inspecting the remote result. No authenticated live-platform acceptance proof exists, and no `.cursor` directory is used.

@@ -1,106 +1,53 @@
 ---
 name: matrixpost-operations
-description: This skill should be used when the user asks to "publish with MatriXpost", "run matrixpostd", "check MatriXpost accounts or history", "add a MatriXpost MCP server", "build the Tauri desktop app", "package MatriXpost for AUR", "install the MatriXpost systemd service", or "release MatriXpost to Cargo or GitHub".
-version: 0.1.0
+description: This skill should be used when the user asks to "publish with MatriXpost", "run matrixpostd", "manage MatriXpost lifecycle objects", "add a MatriXpost MCP server", "use the MatriXpost CLI", "build the Tauri desktop app", "install the MatriXpost systemd service", "package MatriXpost for AUR", or "release MatriXpost to Cargo or GitHub".
+version: 0.2.0
 ---
 
 # MatriXpost Operations
 
-Operate and extend MatriXpost without representing planned adapters as live
-automation. Keep publication intent, credentials, browser state, and release
-authority distinct.
+Operate MatriXpost as a Rust product with separate publication and operating-lifecycle surfaces. Preserve the boundary between local records, local runner workflows, and confirmed remote platform outcomes. Do not introduce an agent runtime, secret store, browser automation shortcut, or `.cursor` directory.
 
-## Select the right surface
+## Select a surface
 
-Use `matrixpost` for a local, one-shot JSON command. Use `matrixpostd` for a
-long-running server process and its HTTP contract. Use `matrixpost-core` when
-adding domain rules, persistence, scheduling, or provider ports. The Tauri
-desktop shell is present for local state, local drafts, account metadata, and
-filtered local history; it has no runner configuration or remote-dispatch UI.
-`matrixpost-mcp` is a real stdio server with four typed tools, but it stays
-credential-free and must not be treated as authenticated platform automation.
+Use `matrixpost` for deterministic local JSON commands. Use `matrixpostd` for the HTTP service and systemd deployment. Use `matrixpost-mcp` for stdio MCP clients. Use the Tauri desktop app for local state and lifecycle UI. Keep `matrixpost-core` free of network, browser, provider, and UI side effects.
 
-Read `references/protocol.md` before composing a CLI invocation, HTTP request,
-provider adapter, or compatibility test. Use only its canonical platform codes
-on public wire surfaces.
+Treat the generic lifecycle model as the common foundation for a vehicle, asset, project, product, or other business object. Do not hardcode VIN or a vertical-specific schema into the shared model. Use a vertical template only at the caller boundary.
 
-## Preflight before an operation
+Read `references/protocol.md` before composing a public CLI, HTTP, MCP, desktop, runner, or release command. Treat source and tests as authoritative if they disagree with this reference.
 
-1. Inspect repository state and current implementation before relying on this
-   skill; source and tests are authoritative.
-2. Query `matrixpost accounts` and `matrixpost history` against the configured
-   SQLite state store before proposing a publish workflow. Treat an empty
-   result as normal only for a fresh database; do not treat it as proof that a
-   provider or account is configured.
-3. For a daemon, check its bind address, state path, and health endpoint before
-   changing service configuration. Keep public exposure behind an explicitly
-   approved reverse proxy or firewall decision.
-4. Validate platform codes, title, media source, target uniqueness, and local
-   scheduling format before any adapter call.
-5. Stop when credentials, cookies, browser profiles, or a secret file would be
-   printed, copied, committed, or placed in a sample config.
+## Preflight
 
-## Publication safety
+1. Inspect the repository state, selected state path, and current implementation.
+2. Query `matrixpost accounts --json` and `matrixpost history --json` before planning a publication operation. Treat empty local data as normal for a fresh database, not as provider evidence.
+3. Check the daemon bind address, state path, and health endpoint before service changes. Keep non-loopback exposure behind an explicit reverse-proxy or firewall decision.
+4. Validate identifiers, platform codes, titles, local scheduling, and runner declarations before runner work.
+5. Stop if an operation would print, copy, commit, or place a token, cookie, password, session, browser profile, or other secret in configuration, state projection, documentation, or logs.
 
-Require a fresh, explicit user confirmation that names the targets and intent
-immediately before any real provider dispatch. Do not treat an earlier request
-to build, test, queue, schedule, or inspect as publish authorization. Report
-the exact outcome per target and preserve durable history when adapters exist.
+## Operate publication safely
 
-Without a configured loopback runner, CLI login and publication commands
-return `unavailable`; do not work around that response with browser automation,
-direct website calls, or fabricated success. For video, only explicit
-`--provider-runner PLATFORM=tcp:127.0.0.1:PORT` dispatches to a separately
-started loopback WebDriver runner. For Juejin articles, exactly one explicit
-`--article-runner tcp:127.0.0.1:PORT` is required in the CLI or MCP process and
-the runner itself must have started with `--allow-article-publish`. The default
-is unavailable and makes no runner attempt. A `queued` result proves only that
-the local runner workflow completed; it never proves platform-side publication
-or processing. Scheduled articles are rejected before WebDriver execution.
+Require fresh explicit approval naming targets and publication intent immediately before real provider dispatch. Do not treat build, queue, schedule, draft, inspection, or test permission as publication permission.
 
-The daemon also accepts credential-free `provider_runners` TOML declarations.
-Its TCP declarations dispatch to the separately started video runner; its
-Unix-socket and Windows-named-pipe declarations remain unavailable. `/publish`
-returns `503 unavailable` when every selected provider is unavailable, and a
-`202 queued` response still does not describe remote publication.
+Treat `unavailable` as a correct result when no eligible loopback runner exists. Do not start browsers, invoke websites directly, or fabricate remote success. Treat `queued` as completion of a local runner workflow only; it never proves platform-side acceptance, publication, or processing.
 
-## Development and release boundaries
+Use repeatable `--provider-runner PLATFORM=tcp:127.0.0.1:PORT` declarations only for the separately started video runner. Use exactly one `--article-runner tcp:127.0.0.1:PORT` for Juejin and require that runner to have started with `--allow-article-publish`. Keep all runner addresses loopback and credential-free.
 
-Keep desktop, MCP, provider, remote-media, and service work behind explicit
-interfaces and tests. Do not add network or browser side effects to
-`matrixpost-core`. Do not create `.cursor` or introduce secrets into source,
-tests, examples, generated files, commits, CI variables, or logs.
+## Operate generic lifecycle records
 
-Before a GitHub, Cargo, or AUR release, require passing relevant Rust tests,
-format/lint checks, package/build checks, and CI evidence. Verify version,
-license, repository URL, artifacts, installation instructions, and platform
-support against the actual tree. Treat publication to GitHub, crates.io, AUR,
-or a server as an external write requiring explicit user authorization.
+Create an object before adding ledger entries or content attribution. Use caller-defined `kind`, stable `id`, optional external identifier, and safe attributes. Keep attributes descriptive; reject sensitive key names rather than guessing from ordinary business text.
 
-Current desktop delivery evidence is limited to a generated and locally
-inspected Linux amd64 `.deb` bundle; it was not installed or launched. Native
-macOS/Windows desktop compilation is verified in CI, but neither platform has
-bundle or runtime evidence.
+Append ledger entries rather than editing history. Record expense or revenue in integer minor currency units, with category and approval state. Link content only to an existing local history record. Use the returned object revision for every transition; reload after a stale-revision rejection instead of retrying blindly.
 
-For the first Cargo release, do not read CI's core-only package archive as
-proof that dependent crate archives exist. Publish `matrixpost-core` first and
-wait until crates.io resolves it, then run `cargo package --locked --no-verify`
-and publish `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` serially.
-CI validates the locked workspace metadata for those dependent packages but
-cannot normalize their crate archives while the core dependency is unpublished.
+Treat a missing object or history record as `not_found`. Treat an existing object with no ledger entries or attribution links as a successful empty list. Keep lifecycle work local to SQLite: it must not invoke a provider, runner, browser, remote publication, secret source, or agent framework.
 
-For systemd deployment, preserve the supplied hardening model: least privilege,
-dedicated state directory, secret-free configuration, and an intentional bind
-address. Do not install, enable, restart, or expose the unit without explicit
-approval. GitHub commits and pushes have occurred, and CI run 30376876522
-passed its Linux workspace/package checks and native macOS/Windows desktop
-compilation. That CI evidence does not establish a macOS/Windows bundle or
-runtime result. No GitHub release, crates.io publication, AUR upload, or
-server install/enablement has been performed.
+## Deploy and release deliberately
 
-## Reference loading
+Preserve the supplied systemd hardening model: a dedicated state directory, least privilege, secret-free configuration, and intentional bind address. Do not install, enable, restart, or expose the unit without explicit approval.
 
-Load `references/protocol.md` for the exact platform mapping and the current
-CLI/HTTP/MCP/desktop capability tables. Refresh that reference in the same
-change whenever the public surface changes; distinguish implemented local
-artifacts from unperformed external releases and unproven live-platform work.
+Run relevant format, tests, lint, documentation, package/build checks, and CI before a release. Treat GitHub, crates.io, AUR, and server writes as external actions requiring explicit authorization. Publish dependent public crates only after `matrixpost-core` is visible to crates.io.
+
+Version `0.2.0` is the coordinated lifecycle release: `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` are published, and the v0.2.0 GitHub Release exists. Verify each external registry or release endpoint live before making a new status claim. Validate any AUR recipe against its exact immutable source archive and checksum; a local recipe or GitHub commit is not evidence of an AUR remote upload.
+
+## Reference
+
+Load **`references/protocol.md`** for exact CLI subcommands, HTTP routes, MCP tool and field names, desktop IPC commands, lifecycle invariants, and delivery evidence. Update that reference in the same change as any public-surface change.
