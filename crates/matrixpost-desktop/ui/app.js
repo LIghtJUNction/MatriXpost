@@ -1,4 +1,10 @@
-const invoke = window.__TAURI__.core.invoke;
+const tauriCore = window.__TAURI__?.core;
+const bridgeError = typeof tauriCore?.invoke === "function"
+  ? null
+  : "The Tauri IPC bridge is unavailable. Start the installed MatriXpost desktop application and check its stderr output.";
+const invoke = bridgeError
+  ? () => Promise.reject(new Error(bridgeError))
+  : tauriCore.invoke.bind(tauriCore);
 
 const platforms = document.querySelector("#platforms");
 const targets = document.querySelector("#target-options");
@@ -29,6 +35,13 @@ const lifecycleRelationTargetSelect = document.querySelector("#lifecycle-relatio
 const lifecycleTransitionResult = document.querySelector("#lifecycle-transition-result");
 const lifecycleTransitionForm = document.querySelector("#lifecycle-transition-form");
 let lifecycleObjects = [];
+
+if (bridgeError) {
+  document.querySelector("#availability").textContent = bridgeError;
+  document.querySelectorAll("button, input, select, textarea").forEach((control) => {
+    control.disabled = true;
+  });
+}
 
 function platformLabel(platform) {
   return `${platform.name} (${platform.code})`;

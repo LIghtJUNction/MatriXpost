@@ -189,5 +189,8 @@ pub fn run() {
             transition_lifecycle_object
         ])
         .run(tauri::generate_context!())
-        .expect("error while running MatriXpost desktop");
+        .unwrap_or_else(|_| {
+            eprintln!("matrixpost-desktop failed to start; local state could not be initialized");
+            std::process::exit(1);
+        });
 }
