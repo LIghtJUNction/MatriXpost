@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::{cell::Cell, process::ExitCode};
 
 use clap::Parser;
 use matrixpost_core::{AccountReadiness, ArticleDispatchOutcome, Platform, ProviderRunner};
@@ -8,7 +8,7 @@ use crate::{
     args::{Cli, Command},
     output::emit_article_dispatch_outcome,
     runners::{
-        accounts_with_readiness_using, article_runner, dispatch_fanqie_review_status,
+        accounts_with_query_readiness_using, article_runner, dispatch_fanqie_review_status,
         dispatch_manual_login, login_runner, provider_registry, provider_runners,
     },
 };
@@ -22,26 +22,102 @@ fn review_status_parser_is_deterministic_and_has_no_runner_fallback() {
         ExitCode::from(3)
     );
 }
-#[test]
-fn accounts_keep_persisted_fields_and_project_safe_runner_readiness() {
-    let account = matrixpost_core::Account {
-        id: "account-1".into(),
-        platform: Platform::Douyin,
+fn account(id: &str, platform: Platform, phone: &str) -> matrixpost_core::Account {
+    matrixpost_core::Account {
+        id: id.into(),
+        platform,
         display_name: "local".into(),
         status: matrixpost_core::AccountStatus::LoggedIn,
-        phone: "123".into(),
+        phone: phone.into(),
         partition: "persist:local".into(),
+    }
+}
+fn account_args(arguments: &[&str]) -> crate::args::AccountsArgs {
+    let parsed = Cli::try_parse_from(arguments).unwrap();
+    let Command::Accounts(args) = parsed.command else {
+        panic!("expected accounts")
     };
-    let unavailable = accounts_with_readiness_using(vec![account.clone()], &[], |_| {
-        panic!("no runner must not probe")
-    });
+    args
+}
+#[test]
+fn accounts_keep_persisted_fields_and_project_safe_runner_readiness() {
+    let account = account("account-1", Platform::Douyin, "123");
+    let args = account_args(&["matrixpost", "accounts"]);
+    let unavailable =
+        accounts_with_query_readiness_using(vec![account.clone()], &[], &args, |_| {
+            panic!("no runner must not probe")
+        });
     assert_eq!(unavailable[0]["id"], "account-1");
     assert_eq!(unavailable[0]["readiness"], "unavailable");
     let runner = ProviderRunner::parse_cli("dy=tcp:127.0.0.1:39001").unwrap();
-    let ready =
-        accounts_with_readiness_using(vec![account], &[runner], |_| AccountReadiness::Ready);
+    let ready = accounts_with_query_readiness_using(vec![account], &[runner], &args, |_| {
+        AccountReadiness::Ready
+    });
     assert_eq!(ready[0]["readiness"], "ready");
     assert!(ready[0].get("cookie").is_none());
+}
+#[test]
+fn account_metadata_filter_precedes_readiness_probe() {
+    let args = account_args(&[
+        "matrixpost",
+        "accounts",
+        "--platform",
+        "dy",
+        "--phone",
+        "keep",
+    ]);
+    let runner = ProviderRunner::parse_cli("dy=tcp:127.0.0.1:39001").unwrap();
+    let probes = Cell::new(0);
+    let accounts = accounts_with_query_readiness_using(
+        vec![
+            account("keep", Platform::Douyin, "keep"),
+            account("wrong-phone", Platform::Douyin, "skip"),
+            account("wrong-platform", Platform::Kuaishou, "keep"),
+        ],
+        &[runner],
+        &args,
+        |_| {
+            probes.set(probes.get() + 1);
+            AccountReadiness::Ready
+        },
+    );
+    assert_eq!(probes.get(), 1);
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["id"], "keep");
+}
+#[test]
+fn account_readiness_filters_only_retain_their_explicit_state() {
+    let runner = ProviderRunner::parse_cli("dy=tcp:127.0.0.1:39001").unwrap();
+    let logged_in = account_args(&["matrixpost", "accounts", "--logged-in"]);
+    let ready = accounts_with_query_readiness_using(
+        vec![account("ready", Platform::Douyin, "1")],
+        std::slice::from_ref(&runner),
+        &logged_in,
+        |_| AccountReadiness::Ready,
+    );
+    assert_eq!(ready.len(), 1);
+    let rejected = accounts_with_query_readiness_using(
+        vec![account("rejected", Platform::Douyin, "1")],
+        &[runner],
+        &logged_in,
+        |_| AccountReadiness::Rejected,
+    );
+    let unavailable = accounts_with_query_readiness_using(
+        vec![account("unavailable", Platform::Kuaishou, "1")],
+        &[],
+        &logged_in,
+        |_| panic!("missing runner must not probe"),
+    );
+    assert!(rejected.is_empty());
+    assert!(unavailable.is_empty());
+    let logged_out = account_args(&["matrixpost", "accounts", "--logged-out"]);
+    let not_ready = accounts_with_query_readiness_using(
+        vec![account("not-ready", Platform::Douyin, "1")],
+        &[ProviderRunner::parse_cli("dy=tcp:127.0.0.1:39001").unwrap()],
+        &logged_out,
+        |_| AccountReadiness::NotReady,
+    );
+    assert_eq!(not_ready.len(), 1);
 }
 #[test]
 fn tcp_runner_argument_builds_an_execution_registry() {

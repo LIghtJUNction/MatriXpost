@@ -1,14 +1,15 @@
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use matrixpost_core::{
     ApprovalStatus, BusinessObjectStatus, HistoryStatus, LedgerDirection, LocalSchedule, Platform,
 };
 
 use crate::query::{
-    parse_approval_status, parse_business_object_status, parse_currency, parse_history_platform,
-    parse_ledger_direction, parse_positive_minor_amount, parse_rfc3339,
+    parse_approval_status, parse_business_object_status, parse_currency, parse_history_date,
+    parse_history_platform, parse_ledger_direction, parse_positive_minor_amount, parse_rfc3339,
+    parse_video_platform,
 };
 
 /// MatriXpost CLI. Mutating commands never claim that a provider published media.
@@ -60,10 +61,7 @@ pub(crate) enum Command {
         #[arg(long = "publish-at")]
         publish_at: Option<LocalSchedule>,
     },
-    Accounts {
-        #[arg(long)]
-        json: bool,
-    },
+    Accounts(AccountsArgs),
     /// Query only a bounded Fanqie title's safe review-status label through a matching explicit local runner.
     #[command(name = "review-status")]
     ReviewStatus {
@@ -78,6 +76,24 @@ pub(crate) enum Command {
     },
     /// Manage generic objects, immutable financial entries, and content attribution.
     Lifecycle(LifecycleArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AccountsArgs {
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Exact video platform code or one of its established aliases.
+    #[arg(short, long, value_parser = parse_video_platform)]
+    pub(crate) platform: Option<Platform>,
+    /// Exact non-secret account phone route.
+    #[arg(long)]
+    pub(crate) phone: Option<String>,
+    /// Retain only accounts whose configured local runner reports ready.
+    #[arg(long, conflicts_with = "logged_out")]
+    pub(crate) logged_in: bool,
+    /// Retain only accounts whose configured local runner reports not_ready.
+    #[arg(long, conflicts_with = "logged_in")]
+    pub(crate) logged_out: bool,
 }
 
 #[derive(Debug, Args)]
@@ -258,6 +274,18 @@ pub(crate) struct HistoryArgs {
     /// One of success, failed, publishing, or scheduled.
     #[arg(long)]
     pub(crate) status: Option<HistoryStatus>,
+    /// Exact non-secret account phone route stored on the publication request.
+    #[arg(long)]
+    pub(crate) phone: Option<String>,
+    /// Maximum retained records after filtering, newest first.
+    #[arg(short = 'n', long, default_value_t = NonZeroUsize::new(50).expect("nonzero"))]
+    pub(crate) limit: NonZeroUsize,
+    /// Inclusive local-calendar lower bound. Overrides --days and --all when supplied.
+    #[arg(long, value_parser = parse_history_date)]
+    pub(crate) since: Option<NaiveDate>,
+    /// Inclusive local-calendar upper bound. Overrides --days and --all when supplied.
+    #[arg(long, value_parser = parse_history_date)]
+    pub(crate) until: Option<NaiveDate>,
     /// Return all local history without a trailing-days cutoff.
     #[arg(long)]
     pub(crate) all: bool,

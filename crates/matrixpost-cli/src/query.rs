@@ -1,12 +1,43 @@
 use std::{collections::BTreeMap, str::FromStr};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use matrixpost_core::{
-    AccountSelection, ApprovalStatus, BusinessObjectStatus, HistoryFilter, LedgerDirection,
-    MediaSource, Platform, PlatformOverride, PublishRequest, WechatLink,
+    AccountSelection, ApprovalStatus, BusinessObjectStatus, HistoryFilter, HistoryRecord,
+    LedgerDirection, MediaSource, Platform, PlatformOverride, PublishRequest, WechatLink,
 };
 
 use crate::args::{HistoryArgs, PublishArgs};
+
+/// A CLI-only refinement around the core's durable history filter.
+#[derive(Debug)]
+pub(crate) struct HistoryQuery {
+    filter: HistoryFilter,
+    phone: Option<String>,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    limit: usize,
+}
+
+pub(crate) fn parse_video_platform(value: &str) -> Result<Platform, String> {
+    Platform::from_str(value).map_err(|error| error.to_string())
+}
+
+pub(crate) fn parse_history_date(value: &str) -> Result<NaiveDate, String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !matches!(index, 4 | 7))
+            .all(|(_, byte)| byte.is_ascii_digit())
+    {
+        return Err("date must use YYYY-MM-DD format".into());
+    }
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| "date must use YYYY-MM-DD format".to_owned())
+}
 
 pub(crate) fn parse_history_platform(value: &str) -> Result<Platform, String> {
     let platform = Platform::from_str(value).map_err(|error| error.to_string())?;
@@ -93,9 +124,57 @@ pub(crate) fn parse_attributes(values: Vec<String>) -> Result<BTreeMap<String, S
     Ok(attributes)
 }
 
-pub(crate) fn parse_history_filter(args: &HistoryArgs) -> Result<HistoryFilter, String> {
-    HistoryFilter::from_query(args.days, args.all, args.platform, args.status, Utc::now())
-        .map_err(|error| error.to_string())
+pub(crate) fn parse_history_filter(args: &HistoryArgs) -> Result<HistoryQuery, String> {
+    if args
+        .since
+        .is_some_and(|since| args.until.is_some_and(|until| since > until))
+    {
+        return Err("since must not be later than until".into());
+    }
+    let has_explicit_bounds = args.since.is_some() || args.until.is_some();
+    let filter = HistoryFilter::from_query(
+        if has_explicit_bounds { None } else { args.days },
+        has_explicit_bounds || args.all,
+        args.platform,
+        args.status,
+        Utc::now(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(HistoryQuery {
+        filter,
+        phone: args.phone.clone(),
+        since: args.since,
+        until: args.until,
+        limit: args.limit.get(),
+    })
+}
+
+impl HistoryQuery {
+    pub(crate) fn filter(&self, history: Vec<HistoryRecord>) -> Vec<HistoryRecord> {
+        let mut retained = self
+            .filter
+            .filter(history)
+            .into_iter()
+            .filter(|record| {
+                self.phone
+                    .as_ref()
+                    .is_none_or(|phone| record.request.account.phone.as_ref() == Some(phone))
+            })
+            .filter(|record| {
+                let date = record.recorded_at.with_timezone(&Local).date_naive();
+                self.since.is_none_or(|since| date >= since)
+                    && self.until.is_none_or(|until| date <= until)
+            })
+            .collect::<Vec<_>>();
+        retained.sort_by(|left, right| {
+            right
+                .recorded_at
+                .cmp(&left.recorded_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        retained.truncate(self.limit);
+        retained
+    }
 }
 
 pub(crate) fn parse_request(args: PublishArgs) -> Result<PublishRequest, String> {

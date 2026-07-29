@@ -11,7 +11,7 @@ use crate::{
     output::{emit, emit_article_dispatch_outcome, emit_dispatch},
     query::{parse_history_filter, parse_request},
     runners::{
-        accounts_with_readiness, article_runner, dispatch_fanqie_review_status,
+        accounts_with_query_readiness, article_runner, dispatch_fanqie_review_status,
         dispatch_manual_login, provider_registry, provider_runners,
     },
 };
@@ -98,12 +98,12 @@ pub(crate) fn run() -> ExitCode {
                 Err(error) => emit(2, serde_json::Value::Null, Some(&error.to_string())),
             }
         }
-        Command::Accounts { json: _ } => match open(cli.state_path)
+        Command::Accounts(args) => match open(cli.state_path)
             .and_then(|repository| repository.accounts().map_err(|error| error.to_string()))
         {
             Ok(accounts) => emit(
                 0,
-                serde_json::json!({ "accounts": accounts_with_readiness(accounts, &runners) }),
+                serde_json::json!({ "accounts": accounts_with_query_readiness(accounts, &runners, &args) }),
                 None,
             ),
             Err(error) => emit(4, serde_json::Value::Null, Some(&error)),

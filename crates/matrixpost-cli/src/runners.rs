@@ -5,7 +5,7 @@ use matrixpost_core::{
     ProviderRunner, ReviewStatus,
 };
 
-use crate::output::emit;
+use crate::{args::AccountsArgs, output::emit};
 
 pub(crate) fn provider_registry(values: &[String]) -> Result<ProviderRegistry, String> {
     ProviderRegistry::from_runners(provider_runners(values)?).map_err(|error| error.to_string())
@@ -106,19 +106,21 @@ pub(crate) fn dispatch_fanqie_review_status(runners: &[ProviderRunner], title: &
         ),
     }
 }
-pub(crate) fn accounts_with_readiness(
+pub(crate) fn accounts_with_query_readiness(
     accounts: Vec<Account>,
     runners: &[ProviderRunner],
+    args: &AccountsArgs,
 ) -> Vec<serde_json::Value> {
-    accounts_with_readiness_using(accounts, runners, |runner| {
+    accounts_with_query_readiness_using(accounts, runners, args, |runner| {
         runner
             .account_readiness()
             .unwrap_or(AccountReadiness::Rejected)
     })
 }
-pub(crate) fn accounts_with_readiness_using<F>(
+pub(crate) fn accounts_with_query_readiness_using<F>(
     accounts: Vec<Account>,
     runners: &[ProviderRunner],
+    args: &AccountsArgs,
     probe: F,
 ) -> Vec<serde_json::Value>
 where
@@ -126,19 +128,33 @@ where
 {
     accounts
         .into_iter()
-        .map(|account| {
+        .filter(|account| {
+            args.platform
+                .is_none_or(|platform| account.platform == platform)
+        })
+        .filter(|account| {
+            args.phone
+                .as_ref()
+                .is_none_or(|phone| account.phone == *phone)
+        })
+        .filter_map(|account| {
             let readiness = login_runner(runners, account.platform)
                 .map(&probe)
                 .unwrap_or(AccountReadiness::Unavailable);
-            let mut account = serde_json::to_value(account).expect("account is serializable");
-            account
-                .as_object_mut()
-                .expect("account serializes as an object")
-                .insert(
-                    "readiness".into(),
-                    serde_json::to_value(readiness).expect("readiness is serializable"),
-                );
-            account
+            let matches_readiness = (!args.logged_in || readiness == AccountReadiness::Ready)
+                && (!args.logged_out || readiness == AccountReadiness::NotReady);
+            matches_readiness.then(|| account_with_readiness(account, readiness))
         })
         .collect()
+}
+fn account_with_readiness(account: Account, readiness: AccountReadiness) -> serde_json::Value {
+    let mut account = serde_json::to_value(account).expect("account is serializable");
+    account
+        .as_object_mut()
+        .expect("account serializes as an object")
+        .insert(
+            "readiness".into(),
+            serde_json::to_value(readiness).expect("readiness is serializable"),
+        );
+    account
 }
