@@ -7,11 +7,10 @@ pkgbase = matrixpost
 	arch = aarch64
 	license = GPL-2.0-only
 	makedepends = cargo
-	makedepends = git
 	makedepends = rust
 	depends = gcc-libs
 	depends = glibc
-	source = matrixpost::git+https://github.com/lightjunction/MatriXpost.git#tag=v0.1.0
-	sha256sums = SKIP
+	source = matrixpost-0.1.0.tar.gz::https://github.com/LIghtJUNction/MatriXpost/archive/3a9044981b75ad631f9ce7c7bb9622362d65c19d.tar.gz
+	sha256sums = d2f6f3a24c2526234ff82f999e17cafea0fa4c0615998cfe518611c7651fcd4f
 
 pkgname = matrixpost
