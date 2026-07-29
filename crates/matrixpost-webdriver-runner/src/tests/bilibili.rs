@@ -23,6 +23,7 @@ fn completed_statement_replies() -> Vec<Result<Value, String>> {
         value(json!(null)),
         element("file"),
         value(json!(null)),
+        value(json!("ready")),
         element("title"),
         value(json!(null)),
         element("description"),
@@ -39,6 +40,41 @@ fn completed_statement_replies() -> Vec<Result<Value, String>> {
         value(json!(true)),
         value(json!(null)),
     ]
+}
+
+fn bilibili_upload_replies(
+    states: impl IntoIterator<Item = &'static str>,
+) -> Vec<Result<Value, String>> {
+    let mut replies = vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+    ];
+    replies.extend(states.into_iter().map(|state| value(json!(state))));
+    replies.push(value(json!(null)));
+    replies
+}
+
+fn assert_bilibili_upload_failed_before_metadata_and_action(
+    publisher: &WebDriverPublisher<MockWebDriver>,
+) {
+    let paths = publisher.transport.paths.lock().unwrap();
+    assert!(
+        paths
+            .last()
+            .is_some_and(|path| path.ends_with("/session/s"))
+    );
+    assert!(!paths.iter().any(|path| path.ends_with("/click")));
+    drop(paths);
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert!(!bodies.iter().any(|body| {
+        body.get("text") == Some(&Value::String("Title".into()))
+            || body.get("text") == Some(&Value::String("Description".into()))
+    }));
+    assert!(!bodies.iter().any(|body| {
+        body.get("script") == Some(&Value::String(BILIBILI_STATEMENT_OPEN_SCRIPT.into()))
+    }));
 }
 
 #[test]
@@ -114,6 +150,76 @@ fn bilibili_target_statement_selects_before_submit_without_description_leak() {
 }
 
 #[test]
+fn bilibili_upload_readiness_precedes_metadata_statement_and_final_action() {
+    let publisher = test_publisher(MockWebDriver::new(completed_statement_replies()));
+    publisher
+        .publish(Platform::Bilibili, &request_with_statement("marketing"))
+        .unwrap();
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    let ready = bodies
+        .iter()
+        .position(|body| {
+            body.get("script") == Some(&Value::String(BILIBILI_UPLOAD_READY_STATE_SCRIPT.into()))
+        })
+        .unwrap();
+    let title = bodies
+        .iter()
+        .position(|body| {
+            body.get("value")
+                == Some(&Value::String(
+                    profile(Platform::Bilibili).unwrap().title[0].into(),
+                ))
+        })
+        .unwrap();
+    let statement = bodies
+        .iter()
+        .position(|body| {
+            body.get("script") == Some(&Value::String(BILIBILI_STATEMENT_OPEN_SCRIPT.into()))
+        })
+        .unwrap();
+    let submit = bodies
+        .iter()
+        .position(|body| body.get("value") == Some(&Value::String("button[type='submit']".into())))
+        .unwrap();
+    assert!(ready < title && title < statement && statement < submit);
+}
+
+#[test]
+fn bilibili_upload_pending_uses_the_complete_bounded_poll_budget_without_actions() {
+    let publisher = test_publisher(MockWebDriver::new(bilibili_upload_replies(
+        std::iter::repeat_n("pending", BILIBILI_UPLOAD_READY_POLL_ATTEMPTS),
+    )));
+    assert!(publisher.publish(Platform::Bilibili, &request()).is_err());
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|body| {
+                body.get("script")
+                    == Some(&Value::String(BILIBILI_UPLOAD_READY_STATE_SCRIPT.into()))
+            })
+            .count(),
+        BILIBILI_UPLOAD_READY_POLL_ATTEMPTS
+    );
+    drop(bodies);
+    assert_bilibili_upload_failed_before_metadata_and_action(&publisher);
+}
+
+#[test]
+fn bilibili_ambiguous_upload_fails_closed_before_metadata_and_action() {
+    let publisher = test_publisher(MockWebDriver::new(bilibili_upload_replies(["ambiguous"])));
+    assert!(publisher.publish(Platform::Bilibili, &request()).is_err());
+    assert_bilibili_upload_failed_before_metadata_and_action(&publisher);
+}
+
+#[test]
+fn bilibili_invalid_upload_state_fails_closed_before_metadata_and_action() {
+    let publisher = test_publisher(MockWebDriver::new(bilibili_upload_replies(["invalid"])));
+    assert!(publisher.publish(Platform::Bilibili, &request()).is_err());
+    assert_bilibili_upload_failed_before_metadata_and_action(&publisher);
+}
+
+#[test]
 fn bilibili_none_and_unknown_values_actively_select_the_none_label() {
     for value in ["none", "内容无需标注", "not-supported"] {
         let publisher = test_publisher(MockWebDriver::new(completed_statement_replies()));
@@ -143,6 +249,7 @@ fn bilibili_without_target_override_does_not_run_statement_scripts() {
         value(json!(null)),
         element("file"),
         value(json!(null)),
+        value(json!("ready")),
         element("title"),
         value(json!(null)),
         element("description"),
@@ -189,6 +296,7 @@ fn bilibili_ambiguous_visible_lists_fail_closed_and_clean_up_before_submit() {
         value(json!(null)),
         element("file"),
         value(json!(null)),
+        value(json!("ready")),
         element("title"),
         value(json!(null)),
         element("description"),
@@ -216,6 +324,7 @@ fn bilibili_disabled_option_fails_closed_and_cleans_up_before_submit() {
         value(json!(null)),
         element("file"),
         value(json!(null)),
+        value(json!("ready")),
         element("title"),
         value(json!(null)),
         element("description"),
@@ -243,6 +352,7 @@ fn bilibili_persistent_visible_list_fails_closed_and_cleans_up_before_submit() {
         value(json!(null)),
         element("file"),
         value(json!(null)),
+        value(json!("ready")),
         element("title"),
         value(json!(null)),
         element("description"),

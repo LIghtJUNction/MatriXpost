@@ -14,6 +14,7 @@ use std::{
 };
 use url::Url;
 mod baijiahao;
+mod bilibili;
 mod douyin;
 mod fanqie;
 mod kuaishou;
@@ -729,6 +730,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
         let outcome: Result<(), String> = (|| {
             self.navigate(&session, profile.upload_url)?;
             self.input(&session, profile.file, file)?;
+            if platform == Platform::Bilibili {
+                self.wait_for_bilibili_upload_ready(&session)?;
+            }
             if platform == Platform::Kuaishou {
                 self.input_kuaishou_metadata(&session, request)?;
             } else {
