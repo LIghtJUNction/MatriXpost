@@ -1,8 +1,8 @@
 //! Local stdio MCP adapter for MatriXpost's credential-free SQLite state.
 //!
-//! The server intentionally has no browser, provider, shell, daemon, or network
-//! integration. It can inspect local account/history metadata and record a
-//! validated video job, but never reports remote publication success.
+//! The server never starts a browser, provider, shell, or daemon. Video
+//! publication can use only an explicitly declared loopback local runner; it
+//! never reports remote publication success.
 
 use std::{collections::BTreeMap, ffi::OsStr, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -10,8 +10,9 @@ use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use matrixpost_core::{
     Account, AccountSelection, ApprovalStatus, ArticleAccount, ArticleDispatchOutcome,
     ArticleRunner, BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution,
-    DomainError, HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry,
-    LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformOverride, PublicationQueue,
+    DispatchOutcome, DomainError, HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection,
+    LedgerEntry, LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformOverride,
+    ProviderDispatchReport, ProviderRegistry, ProviderRunner, PublicationQueue,
     PublishArticleRequest, PublishRequest, PublishState, Repository, ScheduledJob,
     SqliteRepository, WechatLink,
 };
@@ -26,7 +27,7 @@ const DEFAULT_STATE_PATH: &str = "matrixpost.db";
 const STATE_PATH_ENV: &str = "MATRIXPOST_STATE_PATH";
 const LOG_ENV: &str = "MATRIXPOST_MCP_LOG";
 const PROVIDER_MESSAGE: &str =
-    "no provider implementation is configured; no remote publishing was attempted";
+    "no local provider runner is configured; no remote publishing was attempted";
 
 /// Exact upstream account-query platform set.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
@@ -356,7 +357,20 @@ struct PublicationResult {
     remote_publish_attempted: bool,
     persisted: bool,
     job: Option<JobResult>,
+    providers: Option<BTreeMap<Platform, SafeProviderOutcome>>,
     message: &'static str,
+}
+
+/// A reason-free local runner status for one requested platform.
+///
+/// This is deliberately not [`DispatchOutcome`]: runner response reasons can
+/// include transport details that do not belong in MCP tool output.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SafeProviderOutcome {
+    Queued,
+    Unavailable,
+    Rejected,
 }
 
 /// Typed, inspectable validation result for an MCP tool call.
@@ -370,6 +384,7 @@ struct ToolFailure {
 #[derive(Clone)]
 struct MatrixpostMcp {
     repository: Arc<SqliteRepository>,
+    provider_registry: Arc<ProviderRegistry>,
     article_runner: Option<ArticleRunner>,
 }
 
@@ -402,7 +417,7 @@ impl MatrixpostMcp {
     }
 
     #[tool(
-        description = "Validate and persist a local video job. No provider automation or remote publication is attempted."
+        description = "Dispatch an immediate video only through an explicitly configured local runner. Drafts and scheduled jobs remain local. A queued result proves only local runner completion, never remote publication."
     )]
     async fn publish_video(
         &self,
@@ -725,17 +740,40 @@ impl MatrixpostMcp {
 
     fn publish_video_result(&self, input: PublishVideoInput) -> Result<PublicationResult, String> {
         let request = video_request(input)?;
+        if request.draft || request.scheduled_at.is_some() {
+            return self.persist_local_video_job(&request);
+        }
+        let report = self
+            .provider_registry
+            .dispatch_all(&request)
+            .map_err(|error| error.to_string())?;
+        Ok(video_dispatch_result(report))
+    }
+
+    fn persist_local_video_job(
+        &self,
+        request: &PublishRequest,
+    ) -> Result<PublicationResult, String> {
         let job = self
             .repository
-            .enqueue(&request, Utc::now())
+            .enqueue(request, Utc::now())
             .map_err(|error| error.to_string())?;
         Ok(PublicationResult {
-            outcome: "queued_locally",
+            outcome: if request.draft {
+                "draft_locally"
+            } else {
+                "scheduled_locally"
+            },
             provider_available: false,
             remote_publish_attempted: false,
             persisted: true,
             job: Some(job_result(job)),
-            message: PROVIDER_MESSAGE,
+            providers: None,
+            message: if request.draft {
+                "local draft was persisted; no remote publishing was attempted"
+            } else {
+                "local scheduled job was persisted; no remote publishing was attempted"
+            },
         })
     }
 
@@ -761,6 +799,7 @@ fn article_unavailable_result() -> PublicationResult {
         remote_publish_attempted: false,
         persisted: false,
         job: None,
+        providers: None,
         message: "no article runner is configured; no remote publishing was attempted",
     }
 }
@@ -773,6 +812,7 @@ fn article_dispatch_result(outcome: ArticleDispatchOutcome) -> PublicationResult
             remote_publish_attempted: true,
             persisted: false,
             job: None,
+            providers: None,
             message: "local article runner completed its WebDriver workflow; remote publication is not confirmed",
         },
         ArticleDispatchOutcome::Unavailable { .. } => PublicationResult {
@@ -781,6 +821,7 @@ fn article_dispatch_result(outcome: ArticleDispatchOutcome) -> PublicationResult
             remote_publish_attempted: false,
             persisted: false,
             job: None,
+            providers: None,
             message: "article runner was unavailable; no remote publishing was attempted",
         },
         ArticleDispatchOutcome::Rejected {
@@ -792,8 +833,71 @@ fn article_dispatch_result(outcome: ArticleDispatchOutcome) -> PublicationResult
             remote_publish_attempted: automation_attempted,
             persisted: false,
             job: None,
+            providers: None,
             message: "article runner rejected the request; no remote publication success is claimed",
         },
+    }
+}
+
+fn video_dispatch_result(report: ProviderDispatchReport) -> PublicationResult {
+    let providers = report
+        .outcomes
+        .iter()
+        .map(|(platform, outcome)| (*platform, safe_provider_outcome(outcome)))
+        .collect::<BTreeMap<_, _>>();
+    let all_queued = report
+        .outcomes
+        .values()
+        .all(|outcome| matches!(outcome, DispatchOutcome::Queued { .. }));
+    let all_unavailable = report
+        .outcomes
+        .values()
+        .all(|outcome| matches!(outcome, DispatchOutcome::Unavailable { .. }));
+    let remote_publish_attempted = report.outcomes.values().any(|outcome| {
+        matches!(
+            outcome,
+            DispatchOutcome::Queued { .. } | DispatchOutcome::Rejected { .. }
+        )
+    });
+
+    if all_queued {
+        return PublicationResult {
+            outcome: "queued",
+            provider_available: true,
+            remote_publish_attempted: true,
+            persisted: false,
+            job: None,
+            providers: Some(providers),
+            message: "local provider runner completed its WebDriver workflow; remote publication is not confirmed",
+        };
+    }
+    if all_unavailable {
+        return PublicationResult {
+            outcome: "unavailable",
+            provider_available: false,
+            remote_publish_attempted: false,
+            persisted: false,
+            job: None,
+            providers: Some(providers),
+            message: PROVIDER_MESSAGE,
+        };
+    }
+    PublicationResult {
+        outcome: "rejected",
+        provider_available: false,
+        remote_publish_attempted,
+        persisted: false,
+        job: None,
+        providers: Some(providers),
+        message: "local provider runner dispatch was incomplete; no remote publication success is claimed",
+    }
+}
+
+fn safe_provider_outcome(outcome: &DispatchOutcome) -> SafeProviderOutcome {
+    match outcome {
+        DispatchOutcome::Queued { .. } => SafeProviderOutcome::Queued,
+        DispatchOutcome::Unavailable { .. } => SafeProviderOutcome::Unavailable,
+        DispatchOutcome::Rejected { .. } => SafeProviderOutcome::Rejected,
     }
 }
 
@@ -1051,6 +1155,7 @@ fn tool_error(code: &'static str, message: String) -> CallToolResult {
 
 struct McpConfig {
     state_path: PathBuf,
+    provider_registry: Arc<ProviderRegistry>,
     article_runner: Option<ArticleRunner>,
 }
 
@@ -1059,6 +1164,7 @@ fn mcp_config(
     env_path: Option<&OsStr>,
 ) -> Result<McpConfig, String> {
     let mut state_path = None;
+    let mut provider_runners = Vec::new();
     let mut article_runner = None;
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
@@ -1073,6 +1179,16 @@ fn mcp_config(
             if value.is_empty() || state_path.replace(PathBuf::from(value)).is_some() {
                 return Err("--state-path must be supplied once with a non-empty path".into());
             }
+        } else if argument == "--provider-runner" {
+            let value = args.next().ok_or_else(|| {
+                "--provider-runner requires PLATFORM=tcp:127.0.0.1:PORT".to_owned()
+            })?;
+            provider_runners.push(mcp_provider_runner(&value)?);
+        } else if let Some(value) = argument.strip_prefix("--provider-runner=") {
+            if value.is_empty() {
+                return Err("--provider-runner requires PLATFORM=tcp:127.0.0.1:PORT".into());
+            }
+            provider_runners.push(mcp_provider_runner(value)?);
         } else if argument == "--article-runner" {
             let value = args
                 .next()
@@ -1094,12 +1210,23 @@ fn mcp_config(
             return Err(format!("unsupported argument: {argument}"));
         }
     }
+    let provider_registry =
+        ProviderRegistry::from_runners(provider_runners).map_err(|error| error.to_string())?;
     Ok(McpConfig {
         state_path: state_path
             .or_else(|| env_path.map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_PATH)),
+        provider_registry: Arc::new(provider_registry),
         article_runner,
     })
+}
+
+fn mcp_provider_runner(value: &str) -> Result<ProviderRunner, String> {
+    let runner = ProviderRunner::parse_cli(value).map_err(|error| error.to_string())?;
+    if runner.loopback_tcp_address().is_none() {
+        return Err("--provider-runner requires PLATFORM=tcp:127.0.0.1:PORT".into());
+    }
+    Ok(runner)
 }
 
 #[cfg(test)]
@@ -1144,6 +1271,7 @@ async fn main() -> ExitCode {
     };
     let service = match (MatrixpostMcp {
         repository,
+        provider_registry: config.provider_registry,
         article_runner: config.article_runner,
     })
     .serve(stdio())
@@ -1166,9 +1294,14 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    use matrixpost_core::{ArticleAccountStatus, ArticlePlatform};
+    use matrixpost_core::{
+        ArticleAccountStatus, ArticlePlatform, ProviderAvailability, PublishProvider,
+    };
     use rmcp::{
         ClientHandler, RoleClient, ServiceExt,
         model::{CallToolRequestParams, ClientInfo},
@@ -1181,7 +1314,61 @@ mod tests {
     fn service() -> MatrixpostMcp {
         MatrixpostMcp {
             repository: Arc::new(SqliteRepository::in_memory().unwrap()),
+            provider_registry: Arc::new(ProviderRegistry::new()),
             article_runner: None,
+        }
+    }
+
+    struct QueuedProvider(Arc<AtomicUsize>);
+
+    impl PublishProvider for QueuedProvider {
+        fn platform(&self) -> Platform {
+            Platform::Douyin
+        }
+
+        fn availability(&self) -> ProviderAvailability {
+            ProviderAvailability::Available
+        }
+
+        fn enqueue(&self, _: &PublishRequest) -> Result<DispatchOutcome, DomainError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(DispatchOutcome::Queued {
+                job_id: "local-job".into(),
+            })
+        }
+    }
+
+    fn service_with_queued_provider() -> (MatrixpostMcp, Arc<AtomicUsize>) {
+        let mut provider_registry = ProviderRegistry::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        provider_registry
+            .register(Box::new(QueuedProvider(Arc::clone(&calls))))
+            .unwrap();
+        (
+            MatrixpostMcp {
+                repository: Arc::new(SqliteRepository::in_memory().unwrap()),
+                provider_registry: Arc::new(provider_registry),
+                article_runner: None,
+            },
+            calls,
+        )
+    }
+
+    fn video_input(draft: Option<bool>, publish_at: Option<&str>) -> PublishVideoInput {
+        PublishVideoInput {
+            platform: VideoPlatform::Dy,
+            file: "/tmp/video.mp4".into(),
+            title: "Title".into(),
+            phone: "13800138000".into(),
+            bt2: None,
+            tags: None,
+            address: None,
+            publish_at: publish_at.map(str::to_owned),
+            show: None,
+            draft,
+            creative_statement: None,
+            sph_product_id: None,
+            sph_link: None,
         }
     }
 
@@ -1470,29 +1657,103 @@ mod tests {
     }
 
     #[test]
-    fn publish_video_persists_only_a_local_job_and_reports_provider_unavailable() {
+    fn immediate_video_without_a_runner_reports_unavailable_without_persisting() {
         let result = service()
-            .publish_video_result(PublishVideoInput {
-                platform: VideoPlatform::Dy,
-                file: "/tmp/video.mp4".into(),
-                title: "Title".into(),
-                phone: "13800138000".into(),
-                bt2: None,
-                tags: None,
-                address: None,
-                publish_at: None,
-                show: None,
-                draft: None,
-                creative_statement: None,
-                sph_product_id: None,
-                sph_link: None,
-            })
+            .publish_video_result(video_input(None, None))
             .unwrap();
-        assert_eq!(result.outcome, "queued_locally");
+        assert_eq!(result.outcome, "unavailable");
         assert!(!result.provider_available);
         assert!(!result.remote_publish_attempted);
-        assert!(result.persisted);
-        assert!(result.job.is_some());
+        assert!(!result.persisted);
+        assert!(result.job.is_none());
+        assert_eq!(
+            serde_json::to_value(result).unwrap()["providers"]["dy"],
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn immediate_video_dispatches_through_the_configured_provider_registry() {
+        let (service, calls) = service_with_queued_provider();
+        let result = service
+            .publish_video_result(video_input(None, None))
+            .unwrap();
+        assert_eq!(result.outcome, "queued");
+        assert!(result.provider_available);
+        assert!(result.remote_publish_attempted);
+        assert!(!result.persisted);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn scheduled_and_draft_videos_persist_without_dispatching() {
+        let (service, calls) = service_with_queued_provider();
+        let scheduled = service
+            .publish_video_result(video_input(None, Some("2026-08-01 10:20")))
+            .unwrap();
+        let draft = service
+            .publish_video_result(video_input(Some(true), None))
+            .unwrap();
+        assert_eq!(scheduled.outcome, "scheduled_locally");
+        assert!(!scheduled.remote_publish_attempted);
+        assert!(scheduled.persisted);
+        assert_eq!(draft.outcome, "draft_locally");
+        assert!(!draft.remote_publish_attempted);
+        assert!(draft.persisted);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn video_dispatch_projection_is_reason_free_and_truthful() {
+        let queued = video_dispatch_result(ProviderDispatchReport {
+            outcomes: BTreeMap::from([(
+                Platform::Douyin,
+                DispatchOutcome::Queued {
+                    job_id: "local-job".into(),
+                },
+            )]),
+        });
+        assert_eq!(queued.outcome, "queued");
+        assert!(queued.provider_available);
+        assert!(queued.remote_publish_attempted);
+        assert!(!queued.persisted);
+
+        let mixed = video_dispatch_result(ProviderDispatchReport {
+            outcomes: BTreeMap::from([
+                (
+                    Platform::Douyin,
+                    DispatchOutcome::Rejected {
+                        reason: "http://127.0.0.1:39001 private failure".into(),
+                    },
+                ),
+                (
+                    Platform::Bilibili,
+                    DispatchOutcome::Unavailable {
+                        reason: "tcp:127.0.0.1:39002 private failure".into(),
+                    },
+                ),
+            ]),
+        });
+        let serialized = serde_json::to_string(&mixed).unwrap();
+        assert_eq!(mixed.outcome, "rejected");
+        assert!(mixed.remote_publish_attempted);
+        assert!(!serialized.contains("127.0.0.1"));
+        assert!(!serialized.contains("private failure"));
+    }
+
+    #[test]
+    fn video_dispatch_projection_marks_only_all_unavailable_as_not_attempted() {
+        let result = video_dispatch_result(ProviderDispatchReport {
+            outcomes: BTreeMap::from([(
+                Platform::Douyin,
+                DispatchOutcome::Unavailable {
+                    reason: "runner unavailable".into(),
+                },
+            )]),
+        });
+        assert_eq!(result.outcome, "unavailable");
+        assert!(!result.provider_available);
+        assert!(!result.remote_publish_attempted);
     }
 
     #[test]
@@ -1506,11 +1767,14 @@ mod tests {
     }
 
     #[test]
-    fn mcp_arguments_accept_only_state_path_and_one_loopback_article_runner() {
+    fn mcp_arguments_accept_state_path_repeatable_provider_runners_and_one_article_runner() {
         let config = mcp_config(
             [
                 "--state-path".to_owned(),
                 "state.db".to_owned(),
+                "--provider-runner=dy=tcp:127.0.0.1:39001".to_owned(),
+                "--provider-runner".to_owned(),
+                "blbl=tcp:127.0.0.1:39003".to_owned(),
                 "--article-runner=tcp:127.0.0.1:39002".to_owned(),
             ],
             None,
@@ -1521,8 +1785,31 @@ mod tests {
             config.article_runner.unwrap().address.to_string(),
             "127.0.0.1:39002"
         );
+        assert!(matches!(
+            config.provider_registry.availability(Platform::Douyin),
+            matrixpost_core::ProviderAvailability::Available
+        ));
         assert!(mcp_config(["--provider-runner=tcp:127.0.0.1:39001".into()], None).is_err());
+        assert!(mcp_config(["--provider-runner=dy=tcp:192.0.2.1:39001".into()], None).is_err());
+        assert!(mcp_config(["--provider-runner=dy=unix:/tmp/runner.sock".into()], None).is_err());
+        assert!(
+            mcp_config(
+                [r"--provider-runner=dy=pipe:\\.\pipe\matrixpost-dy".into()],
+                None
+            )
+            .is_err()
+        );
         assert!(mcp_config(["--article-runner=tcp:192.0.2.1:39002".into()], None).is_err());
+        assert!(
+            mcp_config(
+                [
+                    "--provider-runner=dy=tcp:127.0.0.1:39001".into(),
+                    "--provider-runner=dy=tcp:127.0.0.1:39002".into(),
+                ],
+                None
+            )
+            .is_err()
+        );
         assert!(
             mcp_config(
                 [

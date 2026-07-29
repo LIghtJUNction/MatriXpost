@@ -37,7 +37,7 @@ Create both endpoint objects before adding a relation. Relations are immutable, 
 
 ## MCP stdio surface
 
-`matrixpost-mcp` uses the same SQLite state as CLI. Resolve state in this order: `--state-path`, `MATRIXPOST_STATE_PATH`, then `matrixpost.db` in the current directory. Keep stdout exclusively MCP JSON-RPC; send optional diagnostics only to stderr through `MATRIXPOST_MCP_LOG=1`.
+`matrixpost-mcp` uses the same SQLite state as CLI. Resolve state in this order: `--state-path`, `MATRIXPOST_STATE_PATH`, then `matrixpost.db` in the current directory. Keep stdout exclusively MCP JSON-RPC; send optional diagnostics only to stderr through `MATRIXPOST_MCP_LOG=1`. It accepts repeatable `--provider-runner PLATFORM=tcp:127.0.0.1:PORT` declarations (the split `--provider-runner PLATFORM=tcp:127.0.0.1:PORT` form is equivalent). Declarations are parsed through the core local-only runner contract: duplicate platforms, malformed declarations, and non-loopback TCP endpoints fail before the server starts. They neither start a runner/browser nor persist an endpoint.
 
 There are fourteen typed tools. Tool names are snake_case. All typed tool inputs use camelCase field names (for example `businessObjectId` and `expectedRevision`); returned core records preserve their Rust serialization with snake_case fields (for example `business_object_id`, `lifecycle_status`, and `amount_minor`).
 
@@ -49,6 +49,8 @@ There are fourteen typed tools. Tool names are snake_case. All typed tool inputs
 Lifecycle examples use `create_business_object` with `{id, kind, displayName, externalId?, lifecycleStatus?, approvalStatus?, attributes?}`; `append_ledger_entry` with `{id, businessObjectId, direction, category, amountMinor, currency, ...}`; `add_business_relation` with `{id, sourceBusinessObjectId, targetBusinessObjectId, relationType, attributes?}` after creating both objects; and `transition_business_object` with `{id, expectedRevision, lifecycleStatus, approvalStatus, updatedAt?}`. Reject unknown input fields. Relations are directed, immutable, non-self links and list from either endpoint. Return `not_found` for a missing object or history record; return an empty list only for an existing object with no corresponding entries, links, or relations.
 
 Reject lifecycle attribute key names such as `token`, `cookie`, `password`, and `session`. Do not scan ordinary attribute values heuristically. Never accept or return named credential, cookie, token, password, or session fields. Lifecycle tools are generic local SQLite state management only: do not invoke a provider, browser, runner, remote publishing path, or agent runtime.
+
+For `publish_video`, an immediate request is dispatched once through the matching declared local runner. `queued` means every requested runner completed its local workflow; it sets `provider_available:true`, `remote_publish_attempted:true`, and `persisted:false`, but never proves platform-side publication. With no matching runner, the safe result is `unavailable` with no attempt. A partial or rejected local dispatch is `rejected`; it reports only per-platform `queued`/`unavailable`/`rejected` labels, never runner endpoints or runner-provided reasons. `remote_publish_attempted` is true only when a local runner was contacted. Requests with `draft:true` or `publishAt` are persisted as `draft_locally` or `scheduled_locally` and never dispatched by MCP; scheduled execution is a separate service concern.
 
 ## Tauri and service delivery
 
