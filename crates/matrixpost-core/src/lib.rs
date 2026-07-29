@@ -824,6 +824,167 @@ pub struct HistoryRecord {
     pub detail: Option<String>,
 }
 
+/// The lifecycle phase of a generic business object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessObjectStatus {
+    Draft,
+    Active,
+    Completed,
+    Archived,
+}
+
+impl BusinessObjectStatus {
+    /// Returns whether a lifecycle update from `self` to `next` is legal.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Draft, Self::Active | Self::Archived)
+                | (Self::Active, Self::Completed | Self::Archived)
+                | (Self::Completed, Self::Archived)
+        )
+    }
+
+    fn db(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Archived => "archived",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "draft" => Ok(Self::Draft),
+            "active" => Ok(Self::Active),
+            "completed" => Ok(Self::Completed),
+            "archived" => Ok(Self::Archived),
+            _ => Err(DomainError::CorruptState(format!(
+                "business object status: {value}"
+            ))),
+        }
+    }
+}
+
+/// Approval state shared by business objects and financial entries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl ApprovalStatus {
+    /// Returns whether an approval update from `self` to `next` is legal.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Pending, Self::Approved | Self::Rejected) | (Self::Rejected, Self::Pending)
+        )
+    }
+
+    fn db(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            _ => Err(DomainError::CorruptState(format!(
+                "approval status: {value}"
+            ))),
+        }
+    }
+}
+
+/// A configurable business object tracked throughout its lifecycle.
+///
+/// `kind` selects a caller-defined template such as `asset`, `campaign`, or
+/// `project`; it is deliberately not a fixed domain enum. `external_id` is an
+/// optional identifier unique within that kind. Attribute keys resembling
+/// credential names are rejected, while values remain generic business text
+/// and are not content-scanned; callers must never supply credentials as
+/// values.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BusinessObject {
+    pub id: String,
+    pub kind: String,
+    pub external_id: Option<String>,
+    pub display_name: String,
+    pub lifecycle_status: BusinessObjectStatus,
+    pub approval_status: ApprovalStatus,
+    /// Monotonically increasing version used to reject conflicting updates.
+    #[serde(default)]
+    pub revision: u64,
+    pub attributes: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Whether a ledger entry represents a cost or income.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerDirection {
+    Expense,
+    Revenue,
+}
+
+impl LedgerDirection {
+    fn db(self) -> &'static str {
+        match self {
+            Self::Expense => "expense",
+            Self::Revenue => "revenue",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "expense" => Ok(Self::Expense),
+            "revenue" => Ok(Self::Revenue),
+            _ => Err(DomainError::CorruptState(format!(
+                "ledger direction: {value}"
+            ))),
+        }
+    }
+}
+
+/// An immutable, money-safe entry in a business object's ledger.
+///
+/// Amounts are stored in the smallest unit of `currency` (for example, cents)
+/// and therefore never use floating-point values. Corrections are represented
+/// by a separate entry rather than an update or delete operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: String,
+    pub business_object_id: String,
+    pub direction: LedgerDirection,
+    pub category: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub occurred_at: DateTime<Utc>,
+    pub approval_status: ApprovalStatus,
+    pub counterparty: Option<String>,
+    pub reference: Option<String>,
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A durable link from published content history to a generic business object.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContentAttribution {
+    pub business_object_id: String,
+    pub history_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// The publication states accepted by the upstream history query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HistoryStatus {
@@ -954,6 +1115,53 @@ pub trait Repository: Send + Sync {
     fn delete_config(&self, key: &str) -> Result<bool, DomainError>;
 }
 
+/// Persistence boundary for generic business-object lifecycle data.
+///
+/// Ledger entries are append-only: corrections must be represented by a new
+/// entry, and this trait intentionally provides no update or delete operation.
+pub trait LifecycleRepository: Send + Sync {
+    /// Inserts a new generic business object after validating its identifiers and attributes.
+    fn insert_business_object(&self, object: &BusinessObject) -> Result<(), DomainError>;
+    /// Returns a business object by its stable identifier.
+    fn business_object(&self, id: &str) -> Result<Option<BusinessObject>, DomainError>;
+    /// Lists all business objects in creation order.
+    fn business_objects(&self) -> Result<Vec<BusinessObject>, DomainError>;
+    /// Atomically changes one or both controlled object states when `expected_revision` matches.
+    ///
+    /// A status left unchanged is retained; callers must change at least one
+    /// status, and each changed status must follow its corresponding graph.
+    fn transition_business_object(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        next_lifecycle_status: BusinessObjectStatus,
+        next_approval_status: ApprovalStatus,
+        updated_at: DateTime<Utc>,
+    ) -> Result<BusinessObject, DomainError>;
+    /// Appends an immutable ledger entry for an existing business object.
+    fn insert_ledger_entry(&self, entry: &LedgerEntry) -> Result<(), DomainError>;
+    /// Lists a business object's ledger entries in occurrence order.
+    ///
+    /// Returns [`DomainError::UnknownBusinessObject`] when the parent object
+    /// does not exist; an empty result therefore unambiguously means that an
+    /// existing object has no entries.
+    fn ledger_entries(&self, business_object_id: &str) -> Result<Vec<LedgerEntry>, DomainError>;
+    /// Links a business object to an existing publication-history record.
+    fn insert_content_attribution(
+        &self,
+        attribution: &ContentAttribution,
+    ) -> Result<(), DomainError>;
+    /// Lists publication-history links for a business object.
+    ///
+    /// Returns [`DomainError::UnknownBusinessObject`] when the parent object
+    /// does not exist; an empty result therefore unambiguously means that an
+    /// existing object has no links.
+    fn content_attributions(
+        &self,
+        business_object_id: &str,
+    ) -> Result<Vec<ContentAttribution>, DomainError>;
+}
+
 /// Queue semantics separated from persistence so schedulers are replaceable.
 pub trait PublicationQueue: Send + Sync {
     fn enqueue(
@@ -992,7 +1200,7 @@ impl SqliteRepository {
         })
     }
     fn migrate(connection: &Connection) -> Result<(), DomainError> {
-        connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY); CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY NOT NULL, platform TEXT NOT NULL, display_name TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE IF NOT EXISTS article_accounts (id TEXT PRIMARY KEY NOT NULL, platform TEXT NOT NULL, display_name TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE IF NOT EXISTS history (id TEXT PRIMARY KEY NOT NULL, request_json TEXT NOT NULL, state TEXT NOT NULL, recorded_at TEXT NOT NULL, detail TEXT); CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY NOT NULL, request_json TEXT NOT NULL, state TEXT NOT NULL, due_at TEXT, revision INTEGER NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS job_sequence (id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT OR IGNORE INTO schema_migrations(version) VALUES (2); INSERT OR IGNORE INTO schema_migrations(version) VALUES (3); COMMIT;").map_err(DomainError::database)?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; BEGIN; CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY); CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY NOT NULL, platform TEXT NOT NULL, display_name TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE IF NOT EXISTS article_accounts (id TEXT PRIMARY KEY NOT NULL, platform TEXT NOT NULL, display_name TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE IF NOT EXISTS history (id TEXT PRIMARY KEY NOT NULL, request_json TEXT NOT NULL, state TEXT NOT NULL, recorded_at TEXT NOT NULL, detail TEXT); CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY NOT NULL, request_json TEXT NOT NULL, state TEXT NOT NULL, due_at TEXT, revision INTEGER NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS job_sequence (id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT OR IGNORE INTO schema_migrations(version) VALUES (2); INSERT OR IGNORE INTO schema_migrations(version) VALUES (3); COMMIT;").map_err(DomainError::database)?;
         let version_four: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=4)",
@@ -1002,6 +1210,16 @@ impl SqliteRepository {
             .map_err(DomainError::database)?;
         if !version_four {
             connection.execute_batch("BEGIN; ALTER TABLE accounts ADD COLUMN phone TEXT NOT NULL DEFAULT ''; ALTER TABLE accounts ADD COLUMN partition TEXT NOT NULL DEFAULT ''; ALTER TABLE article_accounts ADD COLUMN phone TEXT NOT NULL DEFAULT ''; ALTER TABLE article_accounts ADD COLUMN partition TEXT NOT NULL DEFAULT ''; INSERT INTO schema_migrations(version) VALUES (4); COMMIT;").map_err(DomainError::database)?;
+        }
+        let version_five: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if !version_five {
+            connection.execute_batch("BEGIN; CREATE TABLE business_objects (id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, external_id TEXT, display_name TEXT NOT NULL, lifecycle_status TEXT NOT NULL, approval_status TEXT NOT NULL, revision INTEGER NOT NULL, attributes_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE UNIQUE INDEX business_objects_kind_external_id_unique ON business_objects(kind, external_id) WHERE external_id IS NOT NULL; CREATE TABLE ledger_entries (id TEXT PRIMARY KEY NOT NULL, business_object_id TEXT NOT NULL REFERENCES business_objects(id), direction TEXT NOT NULL, category TEXT NOT NULL, amount_minor INTEGER NOT NULL, currency TEXT NOT NULL, occurred_at TEXT NOT NULL, approval_status TEXT NOT NULL, counterparty TEXT, reference TEXT, description TEXT, created_at TEXT NOT NULL); CREATE TABLE content_attributions (business_object_id TEXT NOT NULL REFERENCES business_objects(id), history_id TEXT NOT NULL REFERENCES history(id), created_at TEXT NOT NULL, PRIMARY KEY(business_object_id, history_id)); INSERT INTO schema_migrations(version) VALUES (5); COMMIT;").map_err(DomainError::database)?;
         }
         Ok(())
     }
@@ -1195,6 +1413,228 @@ impl Repository for SqliteRepository {
             .execute("DELETE FROM config WHERE key=?1", [key])
             .map_err(DomainError::database)?
             > 0)
+    }
+}
+
+impl LifecycleRepository for SqliteRepository {
+    fn insert_business_object(&self, object: &BusinessObject) -> Result<(), DomainError> {
+        validate_business_object(object)?;
+        let connection = self.locked()?;
+        let duplicate_id: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM business_objects WHERE id=?1)",
+                [&object.id],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if duplicate_id {
+            return Err(DomainError::DuplicateBusinessObjectId(object.id.clone()));
+        }
+        if let Some(external_id) = &object.external_id {
+            let duplicate_external_id: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM business_objects WHERE kind=?1 AND external_id=?2)",
+                    params![object.kind, external_id],
+                    |row| row.get(0),
+                )
+                .map_err(DomainError::database)?;
+            if duplicate_external_id {
+                return Err(DomainError::DuplicateBusinessObjectExternalId {
+                    kind: object.kind.clone(),
+                    external_id: external_id.clone(),
+                });
+            }
+        }
+        connection.execute("INSERT INTO business_objects(id, kind, external_id, display_name, lifecycle_status, approval_status, revision, attributes_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", params![object.id, object.kind, object.external_id, object.display_name, object.lifecycle_status.db(), object.approval_status.db(), object.revision, json(&object.attributes)?, object.created_at.to_rfc3339(), object.updated_at.to_rfc3339()]).map_err(DomainError::database)?;
+        Ok(())
+    }
+
+    fn business_object(&self, id: &str) -> Result<Option<BusinessObject>, DomainError> {
+        let connection = self.locked()?;
+        load_business_object(&connection, id)
+    }
+
+    fn business_objects(&self) -> Result<Vec<BusinessObject>, DomainError> {
+        let connection = self.locked()?;
+        let mut statement = connection
+            .prepare("SELECT id, kind, external_id, display_name, lifecycle_status, approval_status, revision, attributes_json, created_at, updated_at FROM business_objects ORDER BY created_at, id")
+            .map_err(DomainError::database)?;
+        statement
+            .query_map([], row_to_business_object)
+            .map_err(DomainError::database)?
+            .map(|row| row.map_err(DomainError::database)?)
+            .collect()
+    }
+
+    fn transition_business_object(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        next_lifecycle_status: BusinessObjectStatus,
+        next_approval_status: ApprovalStatus,
+        updated_at: DateTime<Utc>,
+    ) -> Result<BusinessObject, DomainError> {
+        let mut connection = self.locked()?;
+        let transaction = connection.transaction().map_err(DomainError::database)?;
+        let current = load_business_object_tx(&transaction, id)?
+            .ok_or_else(|| DomainError::UnknownBusinessObject(id.to_owned()))?;
+
+        if current.revision != expected_revision {
+            return Err(DomainError::StaleBusinessObjectRevision {
+                id: id.to_owned(),
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        let lifecycle_changed = current.lifecycle_status != next_lifecycle_status;
+        let approval_changed = current.approval_status != next_approval_status;
+        if !lifecycle_changed && !approval_changed {
+            return Err(DomainError::BusinessObjectTransitionNoop(id.to_owned()));
+        }
+        if lifecycle_changed
+            && !current
+                .lifecycle_status
+                .can_transition_to(next_lifecycle_status)
+        {
+            return Err(DomainError::InvalidBusinessObjectLifecycleTransition {
+                from: current.lifecycle_status,
+                to: next_lifecycle_status,
+            });
+        }
+        if approval_changed
+            && !current
+                .approval_status
+                .can_transition_to(next_approval_status)
+        {
+            return Err(DomainError::InvalidBusinessObjectApprovalTransition {
+                from: current.approval_status,
+                to: next_approval_status,
+            });
+        }
+
+        let revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| DomainError::BusinessObjectRevisionOverflow(id.to_owned()))?;
+        let changed = transaction
+            .execute(
+                "UPDATE business_objects SET lifecycle_status=?1, approval_status=?2, revision=?3, updated_at=?4 WHERE id=?5 AND revision=?6",
+                params![next_lifecycle_status.db(), next_approval_status.db(), revision, updated_at.to_rfc3339(), id, expected_revision],
+            )
+            .map_err(DomainError::database)?;
+        if changed != 1 {
+            return Err(DomainError::ConcurrentBusinessObjectUpdate(id.to_owned()));
+        }
+        transaction.commit().map_err(DomainError::database)?;
+        Ok(BusinessObject {
+            lifecycle_status: next_lifecycle_status,
+            approval_status: next_approval_status,
+            revision,
+            updated_at,
+            ..current
+        })
+    }
+
+    fn insert_ledger_entry(&self, entry: &LedgerEntry) -> Result<(), DomainError> {
+        validate_ledger_entry(entry)?;
+        let connection = self.locked()?;
+        if !business_object_exists(&connection, &entry.business_object_id)? {
+            return Err(DomainError::UnknownBusinessObject(
+                entry.business_object_id.clone(),
+            ));
+        }
+        let duplicate_id: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ledger_entries WHERE id=?1)",
+                [&entry.id],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if duplicate_id {
+            return Err(DomainError::DuplicateLedgerEntryId(entry.id.clone()));
+        }
+        connection.execute("INSERT INTO ledger_entries(id, business_object_id, direction, category, amount_minor, currency, occurred_at, approval_status, counterparty, reference, description, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)", params![entry.id, entry.business_object_id, entry.direction.db(), entry.category, entry.amount_minor, entry.currency, entry.occurred_at.to_rfc3339(), entry.approval_status.db(), entry.counterparty, entry.reference, entry.description, entry.created_at.to_rfc3339()]).map_err(DomainError::database)?;
+        Ok(())
+    }
+
+    fn ledger_entries(&self, business_object_id: &str) -> Result<Vec<LedgerEntry>, DomainError> {
+        let connection = self.locked()?;
+        if !business_object_exists(&connection, business_object_id)? {
+            return Err(DomainError::UnknownBusinessObject(
+                business_object_id.to_owned(),
+            ));
+        }
+        let mut statement = connection
+            .prepare("SELECT id, business_object_id, direction, category, amount_minor, currency, occurred_at, approval_status, counterparty, reference, description, created_at FROM ledger_entries WHERE business_object_id=?1 ORDER BY occurred_at, id")
+            .map_err(DomainError::database)?;
+        statement
+            .query_map([business_object_id], row_to_ledger_entry)
+            .map_err(DomainError::database)?
+            .map(|row| row.map_err(DomainError::database)?)
+            .collect()
+    }
+
+    fn insert_content_attribution(
+        &self,
+        attribution: &ContentAttribution,
+    ) -> Result<(), DomainError> {
+        validate_non_empty(
+            "content attribution business object id",
+            &attribution.business_object_id,
+        )?;
+        validate_non_empty("content attribution history id", &attribution.history_id)?;
+        let connection = self.locked()?;
+        if !business_object_exists(&connection, &attribution.business_object_id)? {
+            return Err(DomainError::UnknownBusinessObject(
+                attribution.business_object_id.clone(),
+            ));
+        }
+        let history_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM history WHERE id=?1)",
+                [&attribution.history_id],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if !history_exists {
+            return Err(DomainError::UnknownHistoryRecord(
+                attribution.history_id.clone(),
+            ));
+        }
+        let duplicate_pair: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_attributions WHERE business_object_id=?1 AND history_id=?2)",
+                params![attribution.business_object_id, attribution.history_id],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if duplicate_pair {
+            return Err(DomainError::DuplicateContentAttribution {
+                business_object_id: attribution.business_object_id.clone(),
+                history_id: attribution.history_id.clone(),
+            });
+        }
+        connection.execute("INSERT INTO content_attributions(business_object_id, history_id, created_at) VALUES (?1, ?2, ?3)", params![attribution.business_object_id, attribution.history_id, attribution.created_at.to_rfc3339()]).map_err(DomainError::database)?;
+        Ok(())
+    }
+
+    fn content_attributions(
+        &self,
+        business_object_id: &str,
+    ) -> Result<Vec<ContentAttribution>, DomainError> {
+        let connection = self.locked()?;
+        if !business_object_exists(&connection, business_object_id)? {
+            return Err(DomainError::UnknownBusinessObject(
+                business_object_id.to_owned(),
+            ));
+        }
+        let mut statement = connection
+            .prepare("SELECT business_object_id, history_id, created_at FROM content_attributions WHERE business_object_id=?1 ORDER BY created_at, history_id")
+            .map_err(DomainError::database)?;
+        statement
+            .query_map([business_object_id], row_to_content_attribution)
+            .map_err(DomainError::database)?
+            .map(|row| row.map_err(DomainError::database)?)
+            .collect()
     }
 }
 
@@ -1977,22 +2417,28 @@ impl ProviderRunner {
     }
 }
 
-fn reject_credential_like_endpoint(value: &str) -> Result<(), ProviderRunnerConfigError> {
+const CREDENTIAL_LIKE_TERMS: &[&str] = &[
+    "cookie",
+    "token",
+    "password",
+    "secret",
+    "session",
+    "authorization",
+    "credential",
+];
+
+fn contains_credential_like_term(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    if [
-        "cookie",
-        "token",
-        "password",
-        "secret",
-        "session",
-        "authorization",
-        "credential",
-        "@",
-        "?",
-        "#",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    CREDENTIAL_LIKE_TERMS
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn reject_credential_like_endpoint(value: &str) -> Result<(), ProviderRunnerConfigError> {
+    if contains_credential_like_term(value)
+        || value
+            .chars()
+            .any(|character| matches!(character, '@' | '?' | '#'))
     {
         return Err(ProviderRunnerConfigError::CredentialLikeEndpoint);
     }
@@ -2251,6 +2697,187 @@ fn load_job_tx(
         .map_err(DomainError::database)?
         .transpose()
 }
+
+fn load_business_object(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<BusinessObject>, DomainError> {
+    connection
+        .query_row(
+            "SELECT id, kind, external_id, display_name, lifecycle_status, approval_status, revision, attributes_json, created_at, updated_at FROM business_objects WHERE id=?1",
+            [id],
+            row_to_business_object,
+        )
+        .optional()
+        .map_err(DomainError::database)?
+        .transpose()
+}
+
+fn load_business_object_tx(
+    transaction: &Transaction<'_>,
+    id: &str,
+) -> Result<Option<BusinessObject>, DomainError> {
+    transaction
+        .query_row(
+            "SELECT id, kind, external_id, display_name, lifecycle_status, approval_status, revision, attributes_json, created_at, updated_at FROM business_objects WHERE id=?1",
+            [id],
+            row_to_business_object,
+        )
+        .optional()
+        .map_err(DomainError::database)?
+        .transpose()
+}
+
+fn business_object_exists(connection: &Connection, id: &str) -> Result<bool, DomainError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM business_objects WHERE id=?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(DomainError::database)
+}
+
+fn row_to_business_object(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<BusinessObject, DomainError>> {
+    let id = row.get::<_, String>(0)?;
+    let kind = row.get::<_, String>(1)?;
+    let external_id = row.get::<_, Option<String>>(2)?;
+    let display_name = row.get::<_, String>(3)?;
+    let lifecycle_status = row.get::<_, String>(4)?;
+    let approval_status = row.get::<_, String>(5)?;
+    let revision = row.get::<_, u64>(6)?;
+    let attributes = row.get::<_, String>(7)?;
+    let created_at = row.get::<_, String>(8)?;
+    let updated_at = row.get::<_, String>(9)?;
+    Ok((|| {
+        Ok(BusinessObject {
+            id,
+            kind,
+            external_id,
+            display_name,
+            lifecycle_status: BusinessObjectStatus::from_db(&lifecycle_status)?,
+            approval_status: ApprovalStatus::from_db(&approval_status)?,
+            revision,
+            attributes: from_json(&attributes)?,
+            created_at: parse_time(&created_at)?,
+            updated_at: parse_time(&updated_at)?,
+        })
+    })())
+}
+
+fn row_to_ledger_entry(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<LedgerEntry, DomainError>> {
+    let id = row.get::<_, String>(0)?;
+    let business_object_id = row.get::<_, String>(1)?;
+    let direction = row.get::<_, String>(2)?;
+    let category = row.get::<_, String>(3)?;
+    let amount_minor = row.get::<_, i64>(4)?;
+    let currency = row.get::<_, String>(5)?;
+    let occurred_at = row.get::<_, String>(6)?;
+    let approval_status = row.get::<_, String>(7)?;
+    let counterparty = row.get::<_, Option<String>>(8)?;
+    let reference = row.get::<_, Option<String>>(9)?;
+    let description = row.get::<_, Option<String>>(10)?;
+    let created_at = row.get::<_, String>(11)?;
+    Ok((|| {
+        Ok(LedgerEntry {
+            id,
+            business_object_id,
+            direction: LedgerDirection::from_db(&direction)?,
+            category,
+            amount_minor,
+            currency,
+            occurred_at: parse_time(&occurred_at)?,
+            approval_status: ApprovalStatus::from_db(&approval_status)?,
+            counterparty,
+            reference,
+            description,
+            created_at: parse_time(&created_at)?,
+        })
+    })())
+}
+
+fn row_to_content_attribution(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<ContentAttribution, DomainError>> {
+    let business_object_id = row.get::<_, String>(0)?;
+    let history_id = row.get::<_, String>(1)?;
+    let created_at = row.get::<_, String>(2)?;
+    Ok(
+        parse_time(&created_at).map(|created_at| ContentAttribution {
+            business_object_id,
+            history_id,
+            created_at,
+        }),
+    )
+}
+
+fn validate_business_object(object: &BusinessObject) -> Result<(), DomainError> {
+    validate_non_empty("business object id", &object.id)?;
+    validate_non_empty("business object kind", &object.kind)?;
+    validate_non_empty("business object display name", &object.display_name)?;
+    if object.revision != 0 {
+        return Err(DomainError::InvalidInitialBusinessObjectRevision(
+            object.revision,
+        ));
+    }
+    if let Some(external_id) = &object.external_id {
+        validate_non_empty("business object external id", external_id)?;
+    }
+    for (key, value) in &object.attributes {
+        if key.trim().is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(DomainError::InvalidBusinessObjectAttributeKey(key.clone()));
+        }
+        if contains_credential_like_term(key) {
+            return Err(DomainError::SensitiveBusinessObjectAttributeKey(
+                key.clone(),
+            ));
+        }
+        if value.trim().is_empty() {
+            return Err(DomainError::InvalidBusinessObjectAttributeValue(
+                key.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ledger_entry(entry: &LedgerEntry) -> Result<(), DomainError> {
+    validate_non_empty("ledger entry id", &entry.id)?;
+    validate_non_empty("ledger entry business object id", &entry.business_object_id)?;
+    validate_non_empty("ledger entry category", &entry.category)?;
+    if entry.amount_minor <= 0 {
+        return Err(DomainError::InvalidLedgerAmount(entry.amount_minor));
+    }
+    if entry.currency.len() != 3 || !entry.currency.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return Err(DomainError::InvalidCurrency(entry.currency.clone()));
+    }
+    for (name, value) in [
+        ("ledger counterparty", entry.counterparty.as_deref()),
+        ("ledger reference", entry.reference.as_deref()),
+        ("ledger description", entry.description.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_non_empty(name, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_non_empty(field: &'static str, value: &str) -> Result<(), DomainError> {
+    if value.trim().is_empty() {
+        return Err(DomainError::EmptyLifecycleField(field));
+    }
+    Ok(())
+}
+
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ScheduledJob, DomainError>> {
     let id = row.get::<_, String>(0)?;
     let request = row.get::<_, String>(1)?;
@@ -2332,6 +2959,59 @@ pub enum DomainError {
     DisallowedContentType(String),
     #[error("remote media is too large: {actual} bytes exceeds {limit}")]
     RemoteMediaTooLarge { limit: u64, actual: u64 },
+    #[error("lifecycle field must not be empty: {0}")]
+    EmptyLifecycleField(&'static str),
+    #[error("business object attribute key is invalid: {0}")]
+    InvalidBusinessObjectAttributeKey(String),
+    #[error("business object attribute key is sensitive and must not be stored: {0}")]
+    SensitiveBusinessObjectAttributeKey(String),
+    #[error("business object attribute value must not be empty: {0}")]
+    InvalidBusinessObjectAttributeValue(String),
+    #[error("ledger amount must be positive minor units: {0}")]
+    InvalidLedgerAmount(i64),
+    #[error("currency must be a three-letter uppercase ISO code: {0}")]
+    InvalidCurrency(String),
+    #[error("business object already exists: {0}")]
+    DuplicateBusinessObjectId(String),
+    #[error("business object external id already exists for {kind}: {external_id}")]
+    DuplicateBusinessObjectExternalId { kind: String, external_id: String },
+    #[error("unknown business object: {0}")]
+    UnknownBusinessObject(String),
+    #[error("business object must be inserted at revision zero, received: {0}")]
+    InvalidInitialBusinessObjectRevision(u64),
+    #[error("invalid business object lifecycle transition from {from:?} to {to:?}")]
+    InvalidBusinessObjectLifecycleTransition {
+        from: BusinessObjectStatus,
+        to: BusinessObjectStatus,
+    },
+    #[error("invalid business object approval transition from {from:?} to {to:?}")]
+    InvalidBusinessObjectApprovalTransition {
+        from: ApprovalStatus,
+        to: ApprovalStatus,
+    },
+    #[error("business object transition does not change any status: {0}")]
+    BusinessObjectTransitionNoop(String),
+    #[error("stale business object revision for {id}: expected {expected}, actual {actual}")]
+    StaleBusinessObjectRevision {
+        id: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("concurrent business object update: {0}")]
+    ConcurrentBusinessObjectUpdate(String),
+    #[error("business object revision overflow: {0}")]
+    BusinessObjectRevisionOverflow(String),
+    #[error("ledger entry already exists: {0}")]
+    DuplicateLedgerEntryId(String),
+    #[error("unknown publication history record: {0}")]
+    UnknownHistoryRecord(String),
+    #[error(
+        "content attribution already exists for business object {business_object_id} and history {history_id}"
+    )]
+    DuplicateContentAttribution {
+        business_object_id: String,
+        history_id: String,
+    },
 }
 impl DomainError {
     fn database(error: rusqlite::Error) -> Self {
@@ -2888,6 +3568,504 @@ mod tests {
         repository.save_article_account(&account).unwrap();
         assert_eq!(repository.article_accounts().unwrap(), vec![account]);
     }
+
+    fn business_object(id: &str, kind: &str, external_id: Option<&str>) -> BusinessObject {
+        let now = Utc::now();
+        BusinessObject {
+            id: id.into(),
+            kind: kind.into(),
+            external_id: external_id.map(str::to_owned),
+            display_name: "Example object".into(),
+            lifecycle_status: BusinessObjectStatus::Active,
+            approval_status: ApprovalStatus::Approved,
+            revision: 0,
+            attributes: BTreeMap::from([("source".into(), "manual".into())]),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn approved_ledger_entry(id: &str, business_object_id: &str) -> LedgerEntry {
+        LedgerEntry {
+            id: id.into(),
+            business_object_id: business_object_id.into(),
+            direction: LedgerDirection::Expense,
+            category: "service".into(),
+            amount_minor: 35_000,
+            currency: "CNY".into(),
+            occurred_at: Utc::now(),
+            approval_status: ApprovalStatus::Approved,
+            counterparty: Some("Example supplier".into()),
+            reference: Some("receipt-1".into()),
+            description: Some("Approved service cost".into()),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn lifecycle_repository_round_trips_an_object_ledger_and_content_attribution() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let object = business_object("object-1", "asset", Some("external-1"));
+        let ledger_entry = approved_ledger_entry("ledger-1", &object.id);
+        let history = HistoryRecord {
+            id: "history-lifecycle-1".into(),
+            request: request(),
+            state: PublishState::Published,
+            recorded_at: Utc::now(),
+            detail: None,
+        };
+        let attribution = ContentAttribution {
+            business_object_id: object.id.clone(),
+            history_id: history.id.clone(),
+            created_at: Utc::now(),
+        };
+
+        repository.insert_business_object(&object).unwrap();
+        repository.insert_ledger_entry(&ledger_entry).unwrap();
+        repository.append_history(&history).unwrap();
+        repository.insert_content_attribution(&attribution).unwrap();
+
+        assert_eq!(
+            repository.business_object(&object.id).unwrap(),
+            Some(object)
+        );
+        assert_eq!(
+            repository.ledger_entries("object-1").unwrap(),
+            vec![ledger_entry]
+        );
+        assert_eq!(
+            repository.content_attributions("object-1").unwrap(),
+            vec![attribution]
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_duplicate_external_ids_within_the_same_kind() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        repository
+            .insert_business_object(&business_object("object-1", "asset", Some("same")))
+            .unwrap();
+
+        assert_eq!(
+            repository.insert_business_object(&business_object("object-2", "asset", Some("same"))),
+            Err(DomainError::DuplicateBusinessObjectExternalId {
+                kind: "asset".into(),
+                external_id: "same".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_sensitive_attribute_keys_case_insensitively() {
+        let repository = SqliteRepository::in_memory().unwrap();
+
+        for key in [
+            "token",
+            "COOKIE",
+            "Api_Secret",
+            "sessionId",
+            "authorization",
+        ] {
+            let mut object = business_object(&format!("object-{key}"), "asset", None);
+            object.attributes = BTreeMap::from([(key.into(), "value".into())]);
+
+            assert_eq!(
+                repository.insert_business_object(&object),
+                Err(DomainError::SensitiveBusinessObjectAttributeKey(key.into()))
+            );
+            assert_eq!(repository.business_object(&object.id).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn lifecycle_repository_does_not_content_scan_non_sensitive_attribute_values() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let mut object = business_object("object-generic-text", "campaign", None);
+        object.attributes = BTreeMap::from([(
+            "notes".into(),
+            "Explain the token and cookie terms in the customer onboarding guide.".into(),
+        )]);
+
+        repository.insert_business_object(&object).unwrap();
+
+        assert_eq!(
+            repository.business_object(&object.id).unwrap(),
+            Some(object)
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_accepts_non_sensitive_generic_attributes() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let mut object = business_object("object-safe-attributes", "campaign", None);
+        object.attributes = BTreeMap::from([
+            ("customer_segment".into(), "returning".into()),
+            ("content_topic".into(), "summer promotion".into()),
+        ]);
+
+        repository.insert_business_object(&object).unwrap();
+
+        assert_eq!(
+            repository.business_object(&object.id).unwrap(),
+            Some(object)
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_requires_new_objects_to_start_at_revision_zero() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let mut object = business_object("object-invalid-revision", "project", None);
+        object.revision = 1;
+
+        assert_eq!(
+            repository.insert_business_object(&object),
+            Err(DomainError::InvalidInitialBusinessObjectRevision(1))
+        );
+    }
+
+    #[test]
+    fn lifecycle_transition_updates_status_timestamp_and_revision() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let mut object = business_object("object-transition-1", "project", None);
+        object.lifecycle_status = BusinessObjectStatus::Draft;
+        object.approval_status = ApprovalStatus::Pending;
+        repository.insert_business_object(&object).unwrap();
+        let updated_at = object.updated_at + ChronoDuration::minutes(1);
+
+        let transitioned = repository
+            .transition_business_object(
+                &object.id,
+                0,
+                BusinessObjectStatus::Active,
+                ApprovalStatus::Pending,
+                updated_at,
+            )
+            .unwrap();
+
+        assert_eq!(transitioned.lifecycle_status, BusinessObjectStatus::Active);
+        assert_eq!(transitioned.approval_status, ApprovalStatus::Pending);
+        assert_eq!(transitioned.revision, 1);
+        assert_eq!(transitioned.updated_at, updated_at);
+        assert_eq!(
+            repository.business_object(&object.id).unwrap(),
+            Some(transitioned)
+        );
+    }
+
+    #[test]
+    fn lifecycle_transition_allows_approval_resubmission() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let mut object = business_object("object-transition-2", "project", None);
+        object.approval_status = ApprovalStatus::Pending;
+        repository.insert_business_object(&object).unwrap();
+        let rejected_at = object.updated_at + ChronoDuration::minutes(1);
+        let rejected = repository
+            .transition_business_object(
+                &object.id,
+                0,
+                BusinessObjectStatus::Active,
+                ApprovalStatus::Rejected,
+                rejected_at,
+            )
+            .unwrap();
+        let resubmitted_at = rejected_at + ChronoDuration::minutes(1);
+
+        let resubmitted = repository
+            .transition_business_object(
+                &object.id,
+                rejected.revision,
+                BusinessObjectStatus::Active,
+                ApprovalStatus::Pending,
+                resubmitted_at,
+            )
+            .unwrap();
+
+        assert_eq!(resubmitted.approval_status, ApprovalStatus::Pending);
+        assert_eq!(resubmitted.revision, 2);
+        assert_eq!(resubmitted.updated_at, resubmitted_at);
+    }
+
+    #[test]
+    fn lifecycle_transition_rejects_terminal_and_noop_statuses() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let mut object = business_object("object-transition-3", "project", None);
+        object.lifecycle_status = BusinessObjectStatus::Archived;
+        object.approval_status = ApprovalStatus::Approved;
+        repository.insert_business_object(&object).unwrap();
+
+        assert_eq!(
+            repository.transition_business_object(
+                &object.id,
+                0,
+                BusinessObjectStatus::Active,
+                ApprovalStatus::Approved,
+                Utc::now(),
+            ),
+            Err(DomainError::InvalidBusinessObjectLifecycleTransition {
+                from: BusinessObjectStatus::Archived,
+                to: BusinessObjectStatus::Active,
+            })
+        );
+        assert_eq!(
+            repository.transition_business_object(
+                &object.id,
+                0,
+                BusinessObjectStatus::Archived,
+                ApprovalStatus::Pending,
+                Utc::now(),
+            ),
+            Err(DomainError::InvalidBusinessObjectApprovalTransition {
+                from: ApprovalStatus::Approved,
+                to: ApprovalStatus::Pending,
+            })
+        );
+        assert_eq!(
+            repository.transition_business_object(
+                &object.id,
+                0,
+                BusinessObjectStatus::Archived,
+                ApprovalStatus::Approved,
+                Utc::now(),
+            ),
+            Err(DomainError::BusinessObjectTransitionNoop(
+                "object-transition-3".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn lifecycle_transition_rejects_stale_revision() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let mut object = business_object("object-transition-4", "project", None);
+        object.approval_status = ApprovalStatus::Pending;
+        repository.insert_business_object(&object).unwrap();
+        repository
+            .transition_business_object(
+                &object.id,
+                0,
+                BusinessObjectStatus::Active,
+                ApprovalStatus::Approved,
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            repository.transition_business_object(
+                &object.id,
+                0,
+                BusinessObjectStatus::Completed,
+                ApprovalStatus::Approved,
+                Utc::now(),
+            ),
+            Err(DomainError::StaleBusinessObjectRevision {
+                id: "object-transition-4".into(),
+                expected: 0,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_ledger_entries_for_missing_objects() {
+        let repository = SqliteRepository::in_memory().unwrap();
+
+        assert_eq!(
+            repository.insert_ledger_entry(&approved_ledger_entry("ledger-1", "missing")),
+            Err(DomainError::UnknownBusinessObject("missing".into()))
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_distinguishes_missing_objects_from_empty_child_lists() {
+        let repository = SqliteRepository::in_memory().unwrap();
+
+        assert_eq!(
+            repository.ledger_entries("missing-object"),
+            Err(DomainError::UnknownBusinessObject("missing-object".into()))
+        );
+        assert_eq!(
+            repository.content_attributions("missing-object"),
+            Err(DomainError::UnknownBusinessObject("missing-object".into()))
+        );
+
+        repository
+            .insert_business_object(&business_object("empty-object", "asset", None))
+            .unwrap();
+        assert!(
+            repository
+                .ledger_entries("empty-object")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .content_attributions("empty-object")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_attributions_for_missing_history() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        repository
+            .insert_business_object(&business_object("object-1", "asset", None))
+            .unwrap();
+        let attribution = ContentAttribution {
+            business_object_id: "object-1".into(),
+            history_id: "missing-history".into(),
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            repository.insert_content_attribution(&attribution),
+            Err(DomainError::UnknownHistoryRecord("missing-history".into()))
+        );
+    }
+
+    #[test]
+    fn lifecycle_schema_rejects_direct_attributions_for_missing_history() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        repository
+            .insert_business_object(&business_object("object-1", "asset", None))
+            .unwrap();
+        let connection = repository.locked().unwrap();
+
+        let error = connection
+            .execute(
+                "INSERT INTO content_attributions(business_object_id, history_id, created_at) VALUES (?1, ?2, ?3)",
+                params!["object-1", "missing-history", Utc::now().to_rfc3339()],
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "FOREIGN KEY constraint failed");
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_attributions_for_missing_objects() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let history = HistoryRecord {
+            id: "history-lifecycle-1".into(),
+            request: request(),
+            state: PublishState::Published,
+            recorded_at: Utc::now(),
+            detail: None,
+        };
+        repository.append_history(&history).unwrap();
+        let attribution = ContentAttribution {
+            business_object_id: "missing-object".into(),
+            history_id: history.id,
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            repository.insert_content_attribution(&attribution),
+            Err(DomainError::UnknownBusinessObject("missing-object".into()))
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_allows_one_history_record_for_multiple_objects() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        repository
+            .insert_business_object(&business_object("object-1", "asset", None))
+            .unwrap();
+        repository
+            .insert_business_object(&business_object("object-2", "asset", None))
+            .unwrap();
+        let history = HistoryRecord {
+            id: "history-lifecycle-1".into(),
+            request: request(),
+            state: PublishState::Published,
+            recorded_at: Utc::now(),
+            detail: None,
+        };
+        repository.append_history(&history).unwrap();
+        repository
+            .insert_content_attribution(&ContentAttribution {
+                business_object_id: "object-1".into(),
+                history_id: history.id.clone(),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+
+        assert!(
+            repository
+                .insert_content_attribution(&ContentAttribution {
+                    business_object_id: "object-2".into(),
+                    history_id: history.id,
+                    created_at: Utc::now(),
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_duplicate_content_attribution_pairs() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        repository
+            .insert_business_object(&business_object("object-1", "asset", None))
+            .unwrap();
+        let history = HistoryRecord {
+            id: "history-lifecycle-1".into(),
+            request: request(),
+            state: PublishState::Published,
+            recorded_at: Utc::now(),
+            detail: None,
+        };
+        let attribution = ContentAttribution {
+            business_object_id: "object-1".into(),
+            history_id: history.id.clone(),
+            created_at: Utc::now(),
+        };
+        repository.append_history(&history).unwrap();
+        repository.insert_content_attribution(&attribution).unwrap();
+
+        assert_eq!(
+            repository.insert_content_attribution(&attribution),
+            Err(DomainError::DuplicateContentAttribution {
+                business_object_id: "object-1".into(),
+                history_id: "history-lifecycle-1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_migration_adds_tables_to_a_version_four_database() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations(version) VALUES (4);",
+            )
+            .unwrap();
+        SqliteRepository::migrate(&connection).unwrap();
+
+        let version_five: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(version_five);
+        let ledger_entries_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_entries')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ledger_entries_exists);
+        let columns = connection
+            .prepare("PRAGMA table_info(business_objects)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"revision".into()));
+    }
+
     #[test]
     fn migration_adds_safe_account_routes_to_a_version_three_database() {
         let connection = Connection::open_in_memory().unwrap();

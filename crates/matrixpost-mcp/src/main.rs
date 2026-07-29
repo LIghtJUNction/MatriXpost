@@ -4,14 +4,16 @@
 //! integration. It can inspect local account/history metadata and record a
 //! validated video job, but never reports remote publication success.
 
-use std::{ffi::OsStr, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{collections::BTreeMap, ffi::OsStr, path::PathBuf, process::ExitCode, sync::Arc};
 
-use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use matrixpost_core::{
-    Account, AccountSelection, ArticleAccount, ArticleDispatchOutcome, ArticleRunner,
-    HistoryFilter, HistoryRecord, HistoryStatus, LocalSchedule, MediaSource, Platform,
-    PlatformOverride, PublicationQueue, PublishArticleRequest, PublishRequest, PublishState,
-    Repository, ScheduledJob, SqliteRepository, WechatLink,
+    Account, AccountSelection, ApprovalStatus, ArticleAccount, ArticleDispatchOutcome,
+    ArticleRunner, BusinessObject, BusinessObjectStatus, ContentAttribution, DomainError,
+    HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry, LifecycleRepository,
+    LocalSchedule, MediaSource, Platform, PlatformOverride, PublicationQueue,
+    PublishArticleRequest, PublishRequest, PublishState, Repository, ScheduledJob,
+    SqliteRepository, WechatLink,
 };
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
@@ -186,6 +188,132 @@ struct PublishArticleInput {
     show: Option<bool>,
 }
 
+/// Generic lifecycle state accepted at the MCP boundary.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum LifecycleStatusInput {
+    Draft,
+    Active,
+    Completed,
+    Archived,
+}
+
+impl From<LifecycleStatusInput> for BusinessObjectStatus {
+    fn from(value: LifecycleStatusInput) -> Self {
+        match value {
+            LifecycleStatusInput::Draft => Self::Draft,
+            LifecycleStatusInput::Active => Self::Active,
+            LifecycleStatusInput::Completed => Self::Completed,
+            LifecycleStatusInput::Archived => Self::Archived,
+        }
+    }
+}
+
+/// Shared approval state accepted at the MCP boundary.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ApprovalStatusInput {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl From<ApprovalStatusInput> for ApprovalStatus {
+    fn from(value: ApprovalStatusInput) -> Self {
+        match value {
+            ApprovalStatusInput::Pending => Self::Pending,
+            ApprovalStatusInput::Approved => Self::Approved,
+            ApprovalStatusInput::Rejected => Self::Rejected,
+        }
+    }
+}
+
+/// Ledger direction accepted at the MCP boundary.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum LedgerDirectionInput {
+    Expense,
+    Revenue,
+}
+
+impl From<LedgerDirectionInput> for LedgerDirection {
+    fn from(value: LedgerDirectionInput) -> Self {
+        match value {
+            LedgerDirectionInput::Expense => Self::Expense,
+            LedgerDirectionInput::Revenue => Self::Revenue,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetBusinessObjectInput {
+    id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListBusinessObjectsInput {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateBusinessObjectInput {
+    id: String,
+    kind: String,
+    display_name: String,
+    external_id: Option<String>,
+    lifecycle_status: Option<LifecycleStatusInput>,
+    approval_status: Option<ApprovalStatusInput>,
+    #[schemars(with = "Option<BTreeMap<String, String>>")]
+    attributes: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListLedgerEntriesInput {
+    business_object_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AppendLedgerEntryInput {
+    id: String,
+    business_object_id: String,
+    direction: LedgerDirectionInput,
+    category: String,
+    amount_minor: i64,
+    currency: String,
+    approval_status: Option<ApprovalStatusInput>,
+    occurred_at: Option<DateTime<Utc>>,
+    counterparty: Option<String>,
+    reference: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListContentAttributionsInput {
+    business_object_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AddContentAttributionInput {
+    business_object_id: String,
+    history_id: String,
+    created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TransitionBusinessObjectInput {
+    id: String,
+    expected_revision: u64,
+    lifecycle_status: LifecycleStatusInput,
+    approval_status: ApprovalStatusInput,
+    updated_at: Option<DateTime<Utc>>,
+}
+
 /// Exact upstream account-list item contract.
 #[derive(Debug, Serialize)]
 struct ListedAccount {
@@ -281,9 +409,210 @@ impl MatrixpostMcp {
             Err(message) => tool_error("invalid_input", message),
         })
     }
+
+    #[tool(description = "List generic lifecycle business objects from local MatriXpost state.")]
+    async fn list_business_objects(
+        &self,
+        Parameters(_input): Parameters<ListBusinessObjectsInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.list_business_objects_result() {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(description = "Get one generic lifecycle business object by its stable identifier.")]
+    async fn get_business_object(
+        &self,
+        Parameters(input): Parameters<GetBusinessObjectInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.get_business_object_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(description = "Create a generic lifecycle business object in local MatriXpost state.")]
+    async fn create_business_object(
+        &self,
+        Parameters(input): Parameters<CreateBusinessObjectInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.create_business_object_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(description = "List immutable ledger entries for a generic business object.")]
+    async fn list_ledger_entries(
+        &self,
+        Parameters(input): Parameters<ListLedgerEntriesInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.list_ledger_entries_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(
+        description = "Append an immutable expense or revenue ledger entry to a generic business object."
+    )]
+    async fn append_ledger_entry(
+        &self,
+        Parameters(input): Parameters<AppendLedgerEntryInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.append_ledger_entry_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(description = "List local content-attribution links for a generic business object.")]
+    async fn list_content_attributions(
+        &self,
+        Parameters(input): Parameters<ListContentAttributionsInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.list_content_attributions_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(
+        description = "Link an existing local publication-history record to a generic business object."
+    )]
+    async fn add_content_attribution(
+        &self,
+        Parameters(input): Parameters<AddContentAttributionInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.add_content_attribution_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(
+        description = "Transition a generic business object's lifecycle and approval state using optimistic revision control."
+    )]
+    async fn transition_business_object(
+        &self,
+        Parameters(input): Parameters<TransitionBusinessObjectInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.transition_business_object_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
 }
 
 impl MatrixpostMcp {
+    fn list_business_objects_result(&self) -> Result<Vec<BusinessObject>, DomainError> {
+        self.repository.business_objects()
+    }
+
+    fn get_business_object_result(
+        &self,
+        input: GetBusinessObjectInput,
+    ) -> Result<BusinessObject, DomainError> {
+        self.repository
+            .business_object(&input.id)?
+            .ok_or(DomainError::UnknownBusinessObject(input.id))
+    }
+
+    fn create_business_object_result(
+        &self,
+        input: CreateBusinessObjectInput,
+    ) -> Result<BusinessObject, DomainError> {
+        let now = Utc::now();
+        let object = BusinessObject {
+            id: input.id,
+            kind: input.kind,
+            external_id: input.external_id,
+            display_name: input.display_name,
+            lifecycle_status: input
+                .lifecycle_status
+                .unwrap_or(LifecycleStatusInput::Draft)
+                .into(),
+            approval_status: input
+                .approval_status
+                .unwrap_or(ApprovalStatusInput::Pending)
+                .into(),
+            revision: 0,
+            attributes: input.attributes.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.repository.insert_business_object(&object)?;
+        Ok(object)
+    }
+
+    fn list_ledger_entries_result(
+        &self,
+        input: ListLedgerEntriesInput,
+    ) -> Result<Vec<LedgerEntry>, DomainError> {
+        self.repository.ledger_entries(&input.business_object_id)
+    }
+
+    fn append_ledger_entry_result(
+        &self,
+        input: AppendLedgerEntryInput,
+    ) -> Result<LedgerEntry, DomainError> {
+        let now = Utc::now();
+        let entry = LedgerEntry {
+            id: input.id,
+            business_object_id: input.business_object_id,
+            direction: input.direction.into(),
+            category: input.category,
+            amount_minor: input.amount_minor,
+            currency: input.currency,
+            occurred_at: input.occurred_at.unwrap_or(now),
+            approval_status: input
+                .approval_status
+                .unwrap_or(ApprovalStatusInput::Pending)
+                .into(),
+            counterparty: input.counterparty,
+            reference: input.reference,
+            description: input.description,
+            created_at: now,
+        };
+        self.repository.insert_ledger_entry(&entry)?;
+        Ok(entry)
+    }
+
+    fn list_content_attributions_result(
+        &self,
+        input: ListContentAttributionsInput,
+    ) -> Result<Vec<ContentAttribution>, DomainError> {
+        self.repository
+            .content_attributions(&input.business_object_id)
+    }
+
+    fn add_content_attribution_result(
+        &self,
+        input: AddContentAttributionInput,
+    ) -> Result<ContentAttribution, DomainError> {
+        let attribution = ContentAttribution {
+            business_object_id: input.business_object_id,
+            history_id: input.history_id,
+            created_at: input.created_at.unwrap_or_else(Utc::now),
+        };
+        self.repository.insert_content_attribution(&attribution)?;
+        Ok(attribution)
+    }
+
+    fn transition_business_object_result(
+        &self,
+        input: TransitionBusinessObjectInput,
+    ) -> Result<BusinessObject, DomainError> {
+        self.repository.transition_business_object(
+            &input.id,
+            input.expected_revision,
+            input.lifecycle_status.into(),
+            input.approval_status.into(),
+            input.updated_at.unwrap_or_else(Utc::now),
+        )
+    }
+
     fn list_accounts_result(&self, input: ListAccountsInput) -> Result<Vec<ListedAccount>, String> {
         let video_filter = input.platform.and_then(accounts_video_platform);
         let include_articles = input
@@ -623,6 +952,26 @@ fn structured<T: Serialize>(value: T) -> CallToolResult {
         Ok(value) => CallToolResult::structured(value),
         Err(error) => tool_error("serialization_failure", error.to_string()),
     }
+}
+
+fn lifecycle_tool_error(error: DomainError) -> CallToolResult {
+    let code = match error {
+        DomainError::UnknownBusinessObject(_) | DomainError::UnknownHistoryRecord(_) => "not_found",
+        DomainError::Database(_)
+        | DomainError::Serialization(_)
+        | DomainError::Io(_)
+        | DomainError::RepositoryPoisoned
+        | DomainError::CorruptState(_)
+        | DomainError::ConcurrentBusinessObjectUpdate(_)
+        | DomainError::BusinessObjectRevisionOverflow(_) => "failed",
+        _ => "invalid_input",
+    };
+    let message = match code {
+        "not_found" => "the requested lifecycle record does not exist".into(),
+        "failed" => "the lifecycle operation could not be completed".into(),
+        _ => "the lifecycle input is invalid or conflicts with existing state".into(),
+    };
+    tool_error(code, message)
 }
 
 fn tool_error(code: &'static str, message: String) -> CallToolResult {
@@ -1171,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn macro_generated_router_lists_exactly_the_four_upstream_tools_with_closed_schemas() {
+    fn macro_generated_router_preserves_upstream_tools_and_exposes_closed_lifecycle_schemas() {
         let router = MatrixpostMcp::tool_router();
         let tools = router.list_all();
         let names = tools
@@ -1181,10 +1530,18 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "add_content_attribution",
+                "append_ledger_entry",
+                "create_business_object",
+                "get_business_object",
                 "list_accounts",
+                "list_business_objects",
+                "list_content_attributions",
                 "list_history",
+                "list_ledger_entries",
                 "publish_article",
-                "publish_video"
+                "publish_video",
+                "transition_business_object",
             ]
         );
         let publish_video = router.get("publish_video").unwrap();
@@ -1238,6 +1595,28 @@ mod tests {
             history_schema["$defs"]["HistoryStatusInput"]["enum"],
             serde_json::json!(["success", "failed", "publishing", "scheduled"])
         );
+        let create_object = router.get("create_business_object").unwrap();
+        let create_schema = serde_json::to_value(&create_object.input_schema).unwrap();
+        assert_eq!(create_schema["additionalProperties"], false);
+        assert_eq!(
+            create_schema["properties"]["displayName"]["type"],
+            serde_json::json!("string")
+        );
+        let list_objects = router.get("list_business_objects").unwrap();
+        let list_schema = serde_json::to_value(&list_objects.input_schema).unwrap();
+        assert_eq!(list_schema["additionalProperties"], false);
+        for name in [
+            "get_business_object",
+            "create_business_object",
+            "list_ledger_entries",
+            "append_ledger_entry",
+            "list_content_attributions",
+            "add_content_attribution",
+            "transition_business_object",
+        ] {
+            let schema = serde_json::to_value(&router.get(name).unwrap().input_schema).unwrap();
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+        }
     }
 
     #[tokio::test]
@@ -1268,6 +1647,303 @@ mod tests {
             .map(|content| content.text.as_str())
             .unwrap();
         assert!(message.contains("unknown field `cookie`"));
+        disconnect(client, server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_router_rejects_unknown_fields_and_creates_then_lists_objects() {
+        let (client, server_handle) = connect(service()).await;
+        let rejected = client
+            .call_tool(
+                CallToolRequestParams::new("list_business_objects").with_arguments(
+                    serde_json::json!({"unexpected": true})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.is_error, Some(true));
+
+        let created = client
+            .call_tool(
+                CallToolRequestParams::new("create_business_object").with_arguments(
+                    serde_json::json!({
+                        "id": "campaign-1",
+                        "kind": "campaign",
+                        "displayName": "Launch campaign",
+                        "externalId": "external-1",
+                        "attributes": {"region": "east"}
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.is_error, Some(false));
+        assert_eq!(
+            created.structured_content.as_ref().unwrap()["lifecycle_status"],
+            "draft"
+        );
+        assert_eq!(
+            created.structured_content.as_ref().unwrap()["approval_status"],
+            "pending"
+        );
+
+        let listed = client
+            .call_tool(CallToolRequestParams::new("list_business_objects"))
+            .await
+            .unwrap();
+        assert_eq!(listed.is_error, Some(false));
+        assert_eq!(
+            listed.structured_content,
+            Some(serde_json::json!([{
+                "id": "campaign-1",
+                "kind": "campaign",
+                "external_id": "external-1",
+                "display_name": "Launch campaign",
+                "lifecycle_status": "draft",
+                "approval_status": "pending",
+                "revision": 0,
+                "attributes": {"region": "east"},
+                "created_at": created.structured_content.as_ref().unwrap()["created_at"],
+                "updated_at": created.structured_content.as_ref().unwrap()["updated_at"]
+            }]))
+        );
+        disconnect(client, server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_router_appends_ledger_entries_and_hides_missing_object_details() {
+        let (client, server_handle) = connect(service()).await;
+        let missing = client
+            .call_tool(
+                CallToolRequestParams::new("append_ledger_entry").with_arguments(
+                    serde_json::json!({
+                        "id": "entry-missing",
+                        "businessObjectId": "missing",
+                        "direction": "expense",
+                        "category": "service",
+                        "amountMinor": 1250,
+                        "currency": "CNY"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(
+            missing.structured_content,
+            Some(serde_json::json!({
+                "outcome": "rejected",
+                "code": "not_found",
+                "message": "the requested lifecycle record does not exist"
+            }))
+        );
+        disconnect(client, server_handle).await;
+
+        let service = service();
+        service
+            .create_business_object_result(CreateBusinessObjectInput {
+                id: "asset-1".into(),
+                kind: "asset".into(),
+                display_name: "Asset".into(),
+                external_id: None,
+                lifecycle_status: None,
+                approval_status: None,
+                attributes: None,
+            })
+            .unwrap();
+        let (client, server_handle) = connect(service).await;
+        let appended = client
+            .call_tool(
+                CallToolRequestParams::new("append_ledger_entry").with_arguments(
+                    serde_json::json!({
+                        "id": "entry-1",
+                        "businessObjectId": "asset-1",
+                        "direction": "revenue",
+                        "category": "sale",
+                        "amountMinor": 4500,
+                        "currency": "CNY",
+                        "approvalStatus": "approved"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(appended.is_error, Some(false));
+        let listed = client
+            .call_tool(
+                CallToolRequestParams::new("list_ledger_entries").with_arguments(
+                    serde_json::json!({"businessObjectId": "asset-1"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.is_error, Some(false));
+        assert_eq!(
+            listed
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            listed.structured_content.as_ref().unwrap()[0]["amount_minor"],
+            4500
+        );
+        disconnect(client, server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_child_lists_reject_missing_objects_instead_of_returning_empty_arrays() {
+        let (client, server_handle) = connect(service()).await;
+
+        for tool_name in ["list_ledger_entries", "list_content_attributions"] {
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new(tool_name).with_arguments(
+                        serde_json::json!({"businessObjectId": "missing-object"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.is_error, Some(true), "{tool_name}");
+            assert_eq!(
+                response.structured_content,
+                Some(serde_json::json!({
+                    "outcome": "rejected",
+                    "code": "not_found",
+                    "message": "the requested lifecycle record does not exist"
+                })),
+                "{tool_name}"
+            );
+        }
+
+        disconnect(client, server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_router_rejects_attribution_to_missing_history() {
+        let service = service();
+        service
+            .create_business_object_result(CreateBusinessObjectInput {
+                id: "project-1".into(),
+                kind: "project".into(),
+                display_name: "Project".into(),
+                external_id: None,
+                lifecycle_status: None,
+                approval_status: None,
+                attributes: None,
+            })
+            .unwrap();
+        let (client, server_handle) = connect(service).await;
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("add_content_attribution").with_arguments(
+                    serde_json::json!({
+                        "businessObjectId": "project-1",
+                        "historyId": "missing-history"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({
+                "outcome": "rejected",
+                "code": "not_found",
+                "message": "the requested lifecycle record does not exist"
+            }))
+        );
+        disconnect(client, server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_router_transitions_legally_and_rejects_stale_revisions() {
+        let service = service();
+        service
+            .create_business_object_result(CreateBusinessObjectInput {
+                id: "project-2".into(),
+                kind: "project".into(),
+                display_name: "Project".into(),
+                external_id: None,
+                lifecycle_status: None,
+                approval_status: None,
+                attributes: None,
+            })
+            .unwrap();
+        let (client, server_handle) = connect(service).await;
+        let transitioned = client
+            .call_tool(
+                CallToolRequestParams::new("transition_business_object").with_arguments(
+                    serde_json::json!({
+                        "id": "project-2",
+                        "expectedRevision": 0,
+                        "lifecycleStatus": "active",
+                        "approvalStatus": "pending"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(transitioned.is_error, Some(false));
+        assert_eq!(
+            transitioned.structured_content.as_ref().unwrap()["revision"],
+            1
+        );
+
+        let stale = client
+            .call_tool(
+                CallToolRequestParams::new("transition_business_object").with_arguments(
+                    serde_json::json!({
+                        "id": "project-2",
+                        "expectedRevision": 0,
+                        "lifecycleStatus": "completed",
+                        "approvalStatus": "approved"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.is_error, Some(true));
+        assert_eq!(
+            stale.structured_content,
+            Some(serde_json::json!({
+                "outcome": "rejected",
+                "code": "invalid_input",
+                "message": "the lifecycle input is invalid or conflicts with existing state"
+            }))
+        );
         disconnect(client, server_handle).await;
     }
 

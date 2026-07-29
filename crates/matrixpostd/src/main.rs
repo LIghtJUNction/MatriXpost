@@ -5,15 +5,17 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use clap::Parser;
 use matrixpost_core::{
-    DispatchOutcome, Platform, ProviderDispatchReport, ProviderRegistry, ProviderRunner,
-    PublishRequest, Repository, SqliteRepository, UpstreamPublishDto,
+    ApprovalStatus, BusinessObject, BusinessObjectStatus, ContentAttribution, DispatchOutcome,
+    DomainError, LedgerEntry, LifecycleRepository, Platform, ProviderDispatchReport,
+    ProviderRegistry, ProviderRunner, PublishRequest, Repository, SqliteRepository,
+    UpstreamPublishDto,
 };
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +163,259 @@ fn parse_publish(body: Bytes) -> Result<PublishRequest, Box<Response>> {
     PublishRequest::try_from(dto).map_err(|error| Box::new(invalid(error.to_string())))
 }
 
+/// Parses a lifecycle payload while rejecting fields the public daemon contract
+/// does not recognise. `attributes` remains an opaque map owned by the core.
+fn parse_lifecycle_json<T: serde::de::DeserializeOwned>(
+    body: Bytes,
+    allowed_fields: &[&str],
+    resource: &str,
+) -> Result<T, Box<Response>> {
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| Box::new(invalid(format!("invalid JSON {resource} request: {error}"))))?;
+    let fields = value
+        .as_object()
+        .ok_or_else(|| Box::new(invalid(format!("{resource} request must be a JSON object"))))?;
+    if let Some(field) = fields
+        .keys()
+        .find(|field| !allowed_fields.contains(&field.as_str()))
+    {
+        return Err(Box::new(invalid(format!(
+            "unknown {resource} field: {field}"
+        ))));
+    }
+    serde_json::from_value(value)
+        .map_err(|error| Box::new(invalid(format!("invalid JSON {resource} request: {error}"))))
+}
+
+fn lifecycle_error() -> Response {
+    invalid("lifecycle request could not be completed")
+}
+
+/// State changes require the current revision so stale callers cannot overwrite
+/// a newer lifecycle or approval decision.
+#[derive(Deserialize)]
+struct TransitionBusinessObjectRequest {
+    expected_revision: u64,
+    lifecycle_status: BusinessObjectStatus,
+    approval_status: ApprovalStatus,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn object_not_found() -> Response {
+    response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        serde_json::Value::Null,
+        "business object was not found",
+    )
+}
+
+fn require_business_object(state: &AppState, id: &str) -> Result<(), Box<Response>> {
+    match state.repository.business_object(id) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(Box::new(object_not_found())),
+        Err(_) => Err(Box::new(lifecycle_error())),
+    }
+}
+
+async fn list_business_objects(State(state): State<AppState>) -> Response {
+    match state.repository.business_objects() {
+        Ok(objects) => response(
+            StatusCode::OK,
+            "ok",
+            serde_json::json!(objects),
+            "business objects listed",
+        ),
+        Err(_) => lifecycle_error(),
+    }
+}
+
+async fn create_business_object(State(state): State<AppState>, body: Bytes) -> Response {
+    let object = match parse_lifecycle_json::<BusinessObject>(
+        body,
+        &[
+            "id",
+            "kind",
+            "external_id",
+            "display_name",
+            "lifecycle_status",
+            "approval_status",
+            "attributes",
+            "created_at",
+            "updated_at",
+        ],
+        "business object",
+    ) {
+        Ok(object) => object,
+        Err(response) => return *response,
+    };
+    match state.repository.insert_business_object(&object) {
+        Ok(()) => response(
+            StatusCode::CREATED,
+            "created",
+            serde_json::json!(object),
+            "business object created",
+        ),
+        Err(_) => lifecycle_error(),
+    }
+}
+
+async fn get_business_object(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.repository.business_object(&id) {
+        Ok(Some(object)) => response(
+            StatusCode::OK,
+            "ok",
+            serde_json::json!(object),
+            "business object retrieved",
+        ),
+        Ok(None) => object_not_found(),
+        Err(_) => lifecycle_error(),
+    }
+}
+
+async fn transition_business_object(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let request = match parse_lifecycle_json::<TransitionBusinessObjectRequest>(
+        body,
+        &[
+            "expected_revision",
+            "lifecycle_status",
+            "approval_status",
+            "updated_at",
+        ],
+        "business object transition",
+    ) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+
+    match state.repository.transition_business_object(
+        &id,
+        request.expected_revision,
+        request.lifecycle_status,
+        request.approval_status,
+        request.updated_at,
+    ) {
+        Ok(object) => response(
+            StatusCode::OK,
+            "ok",
+            serde_json::json!(object),
+            "business object transitioned",
+        ),
+        Err(DomainError::UnknownBusinessObject(_)) => object_not_found(),
+        Err(_) => lifecycle_error(),
+    }
+}
+
+async fn list_ledger_entries(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if let Err(response) = require_business_object(&state, &id) {
+        return *response;
+    }
+    match state.repository.ledger_entries(&id) {
+        Ok(entries) => response(
+            StatusCode::OK,
+            "ok",
+            serde_json::json!(entries),
+            "ledger entries listed",
+        ),
+        Err(_) => lifecycle_error(),
+    }
+}
+
+async fn create_ledger_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let entry = match parse_lifecycle_json::<LedgerEntry>(
+        body,
+        &[
+            "id",
+            "business_object_id",
+            "direction",
+            "category",
+            "amount_minor",
+            "currency",
+            "occurred_at",
+            "approval_status",
+            "counterparty",
+            "reference",
+            "description",
+            "created_at",
+        ],
+        "ledger entry",
+    ) {
+        Ok(entry) => entry,
+        Err(response) => return *response,
+    };
+    if entry.business_object_id != id {
+        return invalid("ledger entry business_object_id must match the path");
+    }
+    if let Err(response) = require_business_object(&state, &id) {
+        return *response;
+    }
+    match state.repository.insert_ledger_entry(&entry) {
+        Ok(()) => response(
+            StatusCode::CREATED,
+            "created",
+            serde_json::json!(entry),
+            "ledger entry created",
+        ),
+        Err(_) => lifecycle_error(),
+    }
+}
+
+async fn list_content_attributions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = require_business_object(&state, &id) {
+        return *response;
+    }
+    match state.repository.content_attributions(&id) {
+        Ok(attributions) => response(
+            StatusCode::OK,
+            "ok",
+            serde_json::json!(attributions),
+            "content attributions listed",
+        ),
+        Err(_) => lifecycle_error(),
+    }
+}
+
+async fn create_content_attribution(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let attribution = match parse_lifecycle_json::<ContentAttribution>(
+        body,
+        &["business_object_id", "history_id", "created_at"],
+        "content attribution",
+    ) {
+        Ok(attribution) => attribution,
+        Err(response) => return *response,
+    };
+    if attribution.business_object_id != id {
+        return invalid("content attribution business_object_id must match the path");
+    }
+    if let Err(response) = require_business_object(&state, &id) {
+        return *response;
+    }
+    match state.repository.insert_content_attribution(&attribution) {
+        Ok(()) => response(
+            StatusCode::CREATED,
+            "created",
+            serde_json::json!(attribution),
+            "content attribution created",
+        ),
+        Err(_) => lifecycle_error(),
+    }
+}
+
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true, "service": "matrixpostd", "status": "healthy" }))
 }
@@ -283,6 +538,23 @@ fn app(state: AppState) -> Router {
         .route("/creative-statements", get(creative_statements))
         .route("/changeData", post(change_data))
         .route("/publish", post(publish))
+        .route(
+            "/lifecycle/objects",
+            get(list_business_objects).post(create_business_object),
+        )
+        .route("/lifecycle/objects/{id}", get(get_business_object))
+        .route(
+            "/lifecycle/objects/{id}/transition",
+            post(transition_business_object),
+        )
+        .route(
+            "/lifecycle/objects/{id}/ledger",
+            get(list_ledger_entries).post(create_ledger_entry),
+        )
+        .route(
+            "/lifecycle/objects/{id}/attributions",
+            get(list_content_attributions).post(create_content_attribution),
+        )
         .with_state(state)
 }
 
@@ -363,6 +635,36 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(payload.to_string()))
             .expect("changeData request must be valid")
+    }
+
+    fn lifecycle_request(method: &str, uri: &str, payload: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("lifecycle request must be valid")
+    }
+
+    fn lifecycle_object_payload(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "kind": "asset",
+            "external_id": "external-1",
+            "display_name": "Example object",
+            "lifecycle_status": "active",
+            "approval_status": "approved",
+            "attributes": { "source": "manual" },
+            "created_at": "2026-07-29T00:00:00Z",
+            "updated_at": "2026-07-29T00:00:00Z"
+        })
+    }
+
+    fn lifecycle_router() -> Router {
+        app(AppState {
+            repository: Arc::new(SqliteRepository::in_memory().unwrap()),
+            providers: Arc::new(ProviderRegistry::new()),
+        })
     }
 
     #[test]
@@ -684,5 +986,262 @@ mod tests {
                 .unwrap()
                 .contains("invalid JSON publish request")
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_object_routes_create_list_and_get() {
+        let router = lifecycle_router();
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects",
+                lifecycle_object_payload("object-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["outcome"], "created");
+        assert_eq!(body["data"]["id"], "object-1");
+
+        let (status, body) = json_response(
+            router.clone(),
+            Request::get("/lifecycle/objects")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+
+        let (status, body) = json_response(
+            router,
+            Request::get("/lifecycle/objects/object-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["display_name"], "Example object");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transition_route_updates_an_object_and_rejects_stale_revisions() {
+        let router = lifecycle_router();
+        let (status, _) = json_response(
+            router.clone(),
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects",
+                lifecycle_object_payload("object-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let transition = serde_json::json!({
+            "expected_revision": 0,
+            "lifecycle_status": "completed",
+            "approval_status": "approved",
+            "updated_at": "2026-07-29T01:00:00Z"
+        });
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects/object-1/transition",
+                transition.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "ok");
+        assert_eq!(body["data"]["lifecycle_status"], "completed");
+        assert_eq!(body["data"]["revision"], 1);
+
+        let (status, body) = json_response(
+            router,
+            lifecycle_request("POST", "/lifecycle/objects/object-1/transition", transition),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["outcome"], "rejected");
+        assert_eq!(body["message"], "lifecycle request could not be completed");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transition_route_rejects_unknown_fields_and_missing_objects() {
+        let router = lifecycle_router();
+        let mut unknown_field = serde_json::json!({
+            "expected_revision": 0,
+            "lifecycle_status": "completed",
+            "approval_status": "approved",
+            "updated_at": "2026-07-29T01:00:00Z"
+        });
+        unknown_field["unexpected"] = serde_json::json!(true);
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects/missing/transition",
+                unknown_field,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["outcome"], "rejected");
+        assert!(body["message"].as_str().unwrap().contains("unknown"));
+
+        let (status, body) = json_response(
+            router,
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects/missing/transition",
+                serde_json::json!({
+                    "expected_revision": 0,
+                    "lifecycle_status": "completed",
+                    "approval_status": "approved",
+                    "updated_at": "2026-07-29T01:00:00Z"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["outcome"], "not_found");
+        assert_eq!(body["message"], "business object was not found");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_rejects_unknown_fields_and_unknown_objects_are_404() {
+        let router = lifecycle_router();
+        let mut payload = lifecycle_object_payload("object-1");
+        payload["unexpected"] = serde_json::json!(true);
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request("POST", "/lifecycle/objects", payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["outcome"], "rejected");
+        assert!(body["message"].as_str().unwrap().contains("unknown"));
+
+        let (status, body) = json_response(
+            router.clone(),
+            Request::get("/lifecycle/objects/missing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["outcome"], "not_found");
+
+        let (status, _) = json_response(
+            router,
+            Request::get("/lifecycle/objects/missing/ledger")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ledger_route_rejects_path_mismatch_and_appends_entries() {
+        let router = lifecycle_router();
+        let (status, _) = json_response(
+            router.clone(),
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects",
+                lifecycle_object_payload("object-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let mismatched = serde_json::json!({
+            "id": "ledger-1", "business_object_id": "other", "direction": "expense",
+            "category": "service", "amount_minor": 35000, "currency": "CNY",
+            "occurred_at": "2026-07-29T00:00:00Z", "approval_status": "approved",
+            "counterparty": null, "reference": null, "description": null,
+            "created_at": "2026-07-29T00:00:00Z"
+        });
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request("POST", "/lifecycle/objects/object-1/ledger", mismatched),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"].as_str().unwrap().contains("must match"));
+
+        let entry = serde_json::json!({
+            "id": "ledger-1", "business_object_id": "object-1", "direction": "expense",
+            "category": "service", "amount_minor": 35000, "currency": "CNY",
+            "occurred_at": "2026-07-29T00:00:00Z", "approval_status": "approved",
+            "counterparty": null, "reference": null, "description": null,
+            "created_at": "2026-07-29T00:00:00Z"
+        });
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request("POST", "/lifecycle/objects/object-1/ledger", entry),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["data"]["id"], "ledger-1");
+
+        let (status, body) = json_response(
+            router,
+            Request::get("/lifecycle/objects/object-1/ledger")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_attribution_route_rejects_path_mismatch_and_missing_history() {
+        let router = lifecycle_router();
+        let (status, _) = json_response(
+            router.clone(),
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects",
+                lifecycle_object_payload("object-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects/object-1/attributions",
+                serde_json::json!({
+                    "business_object_id": "other", "history_id": "history-1",
+                    "created_at": "2026-07-29T00:00:00Z"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"].as_str().unwrap().contains("must match"));
+
+        let (status, body) = json_response(
+            router,
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects/object-1/attributions",
+                serde_json::json!({
+                    "business_object_id": "object-1", "history_id": "missing-history",
+                    "created_at": "2026-07-29T00:00:00Z"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["outcome"], "rejected");
     }
 }

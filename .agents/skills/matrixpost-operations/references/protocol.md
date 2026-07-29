@@ -88,18 +88,37 @@ credential/session path.
 | `list_history` | Applies the same local seven-day/default, platform, status, and all-history filtering as the CLI. |
 | `publish_video` | Validates and persists a local video draft/queued job for `dy`, `ks`, `blbl`, `bjh`, `tt`, or `sph`; it does not invoke video automation. |
 | `publish_article` | Accepts only Juejin. Without `--article-runner tcp:127.0.0.1:PORT`, returns unavailable with no runner attempt. With it, forwards only through the same local runner contract and reports queued, unavailable, or rejected truthfully. |
+| `list_business_objects` | Lists generic local business objects; accepts an empty object only. |
+| `get_business_object` | Returns one local business object for `{id}`. |
+| `create_business_object` | Persists `{id, kind, displayName, externalId?, lifecycleStatus?, approvalStatus?, attributes?}` with server UTC timestamps and revision zero. |
+| `list_ledger_entries` | Lists immutable local ledger entries for `{businessObjectId}`. |
+| `append_ledger_entry` | Appends a validated local expense or revenue entry from `{id, businessObjectId, direction, category, amountMinor, currency, ...}`; it never changes an existing entry. |
+| `list_content_attributions` | Lists local publication-history links for `{businessObjectId}`. |
+| `add_content_attribution` | Persists a local `{businessObjectId, historyId, createdAt?}` link only when both records already exist. |
+| `transition_business_object` | Applies a guarded local state update from `{id, expectedRevision, lifecycleStatus, approvalStatus, updatedAt?}`; stale or invalid transitions are rejected. |
 
 MCP article scheduling is rejected by the runner before browser work. Its
 `queued` output only describes local runner completion. Inputs reject unknown
-fields; cookies, passwords, tokens, sessions, and credentials are never
-accepted or returned.
+fields. Generic lifecycle `attributes` reject sensitive **key names** (such as
+`token`, `cookie`, `password`, and `session`); values are not scanned
+heuristically, so ordinary business text may contain those words. Cookies,
+passwords, tokens, sessions, and credentials are never accepted as named
+fields or returned. The eight lifecycle tools are SQLite-only generic state
+management: they do not create a browser session, invoke a provider, or claim
+remote publication.
 
 ## Desktop and delivery artifacts
 
 `matrixpost-desktop` is an implemented Tauri v2 shell for Linux, macOS, and
-Windows. It opens application-data `matrixpost.db` and exposes only
-`desktop_snapshot`, `save_local_draft`, `save_account`, `save_article_account`,
-and `local_history`. Account snapshot entries are display metadata; history
+Windows. It opens application-data `matrixpost.db` and exposes twelve typed
+IPC commands: `desktop_snapshot`, `save_local_draft`, `save_account`,
+`save_article_account`, `local_history`, `lifecycle_objects`,
+`create_lifecycle_object`, `lifecycle_ledger_entries`,
+`append_lifecycle_ledger_entry`, `lifecycle_content_attributions`,
+`add_lifecycle_content_attribution`, and `transition_lifecycle_object`. The
+lifecycle IPC uses the same generic local SQLite object, immutable-ledger,
+attribution, and revision-guarded transition contracts as the other adapters.
+Account snapshot entries are display metadata; history
 entries are id, state, timestamp, title, targets, and local intent. Media
 paths, phone/partition routing, serialized requests, sessions, and credentials
 are not projected to the frontend. The desktop starts no daemon, shell,
@@ -115,11 +134,11 @@ The only desktop bundle evidence is a locally generated and inspected Linux
 amd64 `.deb`; it was not installed or launched. CI run 30376876522 passed
 native macOS and Windows desktop compilation, but neither platform has bundle
 or runtime evidence.
-The first Cargo release publishes core first, then package-verifies/publishes
-CLI, daemon, and MCP serially. The systemd unit is supplied but never installed
-or enabled automatically. The PKGBUILD is an unreleased tag-based AUR recipe.
-The four public crates are prepared for Cargo packaging; desktop and WebDriver
-runner crates are not published. GitHub commits/pushes and CI run 30376876522
-have occurred; no GitHub release, crates.io publication, AUR upload, server
-install/enablement, or authenticated live-platform draft acceptance has been
-performed. No `.cursor` directory is used.
+Version 0.1.0 of the four public crates was published after core-first,
+then dependent-crates serial verification. The lifecycle API is the next
+coordinated 0.2.0 release and is not published yet. The systemd unit is
+supplied but never installed or enabled automatically. The PKGBUILD is a
+checksum-pinned 0.1.0 commit archive recipe and has not been uploaded to AUR.
+Desktop and WebDriver runner crates are not published. A GitHub v0.1.0 release
+exists; server installation/enablement and authenticated live-platform draft
+acceptance have not occurred. No `.cursor` directory is used.

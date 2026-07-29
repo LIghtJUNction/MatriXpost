@@ -4,13 +4,15 @@
 //! application-data directory. It never starts the daemon, a shell, a browser,
 //! or a provider adapter.
 
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc};
 
 use chrono::Utc;
 use matrixpost_core::{
-    Account, AccountStatus, ArticleAccount, ArticleAccountStatus, ArticlePlatform, DomainError,
-    HistoryFilter, HistoryRecord, HistoryStatus, LocalSchedule, MediaSource, Platform,
-    PlatformMetadata, PublicationQueue, PublishRequest, PublishState, Repository, SqliteRepository,
+    Account, AccountStatus, ApprovalStatus, ArticleAccount, ArticleAccountStatus, ArticlePlatform,
+    BusinessObject, BusinessObjectStatus, ContentAttribution, DomainError, HistoryFilter,
+    HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry, LifecycleRepository, LocalSchedule,
+    MediaSource, Platform, PlatformMetadata, PublicationQueue, PublishRequest, PublishState,
+    Repository, SqliteRepository,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -122,12 +124,167 @@ pub struct HistoryEntry {
     pub scheduled: bool,
 }
 
+/// Strict, generic lifecycle-object creation input accepted through local IPC.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateLifecycleObjectInput {
+    pub id: String,
+    pub kind: String,
+    pub external_id: Option<String>,
+    pub display_name: String,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// Strict object identifier input used by object-scoped lifecycle reads.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleObjectIdInput {
+    pub business_object_id: String,
+}
+
+/// Lifecycle and approval states accepted from the desktop UI.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleStatusInput {
+    Draft,
+    Active,
+    Completed,
+    Archived,
+}
+
+impl From<LifecycleStatusInput> for BusinessObjectStatus {
+    fn from(value: LifecycleStatusInput) -> Self {
+        match value {
+            LifecycleStatusInput::Draft => Self::Draft,
+            LifecycleStatusInput::Active => Self::Active,
+            LifecycleStatusInput::Completed => Self::Completed,
+            LifecycleStatusInput::Archived => Self::Archived,
+        }
+    }
+}
+
+/// Approval states accepted from the desktop UI.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleApprovalStatusInput {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl From<LifecycleApprovalStatusInput> for ApprovalStatus {
+    fn from(value: LifecycleApprovalStatusInput) -> Self {
+        match value {
+            LifecycleApprovalStatusInput::Pending => Self::Pending,
+            LifecycleApprovalStatusInput::Approved => Self::Approved,
+            LifecycleApprovalStatusInput::Rejected => Self::Rejected,
+        }
+    }
+}
+
+/// Ledger direction accepted from the desktop UI.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleLedgerDirectionInput {
+    Expense,
+    Revenue,
+}
+
+impl From<LifecycleLedgerDirectionInput> for LedgerDirection {
+    fn from(value: LifecycleLedgerDirectionInput) -> Self {
+        match value {
+            LifecycleLedgerDirectionInput::Expense => Self::Expense,
+            LifecycleLedgerDirectionInput::Revenue => Self::Revenue,
+        }
+    }
+}
+
+/// Strict input for appending one immutable local ledger entry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppendLifecycleLedgerEntryInput {
+    pub id: String,
+    pub business_object_id: String,
+    pub direction: LifecycleLedgerDirectionInput,
+    pub category: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub approval_status: Option<LifecycleApprovalStatusInput>,
+    pub counterparty: Option<String>,
+    pub reference: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Strict input for linking existing local publication history to an object.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AddLifecycleContentAttributionInput {
+    pub business_object_id: String,
+    pub history_id: String,
+}
+
+/// Strict input for an optimistic lifecycle/approval state transition.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransitionLifecycleObjectInput {
+    pub id: String,
+    pub expected_revision: u64,
+    pub lifecycle_status: LifecycleStatusInput,
+    pub approval_status: LifecycleApprovalStatusInput,
+}
+
+/// Credential-free projection of a generic lifecycle object.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleObjectEntry {
+    pub id: String,
+    pub kind: String,
+    pub external_id: Option<String>,
+    pub display_name: String,
+    pub lifecycle_status: &'static str,
+    pub approval_status: &'static str,
+    pub revision: u64,
+    pub attributes: BTreeMap<String, String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Credential-free projection of one immutable lifecycle ledger entry.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleLedgerEntry {
+    pub id: String,
+    pub business_object_id: String,
+    pub direction: &'static str,
+    pub category: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub occurred_at: String,
+    pub approval_status: &'static str,
+    pub counterparty: Option<String>,
+    pub reference: Option<String>,
+    pub description: Option<String>,
+    pub created_at: String,
+}
+
+/// Credential-free projection of a publication-history attribution.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleContentAttributionEntry {
+    pub business_object_id: String,
+    pub history_id: String,
+    pub created_at: String,
+}
+
 /// IPC-safe error returned to the static frontend.
 #[derive(Debug, Error, Serialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum DesktopError {
     #[error("invalid local draft: {0}")]
     InvalidRequest(String),
+    #[error("local lifecycle record was not found: {0}")]
+    NotFound(String),
     #[error("local state is unavailable: {0}")]
     Storage(String),
 }
@@ -298,6 +455,193 @@ impl DesktopService {
             .map(HistoryEntry::from)
             .collect())
     }
+
+    /// Lists generic lifecycle objects from the same local SQLite state as the
+    /// publishing history. This deliberately has no provider or browser path.
+    pub fn lifecycle_objects(&self) -> Result<Vec<LifecycleObjectEntry>, DesktopError> {
+        self.repository
+            .business_objects()
+            .map_err(lifecycle_error)
+            .map(|objects| {
+                objects
+                    .into_iter()
+                    .map(LifecycleObjectEntry::from)
+                    .collect()
+            })
+    }
+
+    /// Creates a generic lifecycle object at revision zero with system time.
+    pub fn create_lifecycle_object(
+        &self,
+        input: CreateLifecycleObjectInput,
+    ) -> Result<LifecycleObjectEntry, DesktopError> {
+        let now = Utc::now();
+        let object = BusinessObject {
+            id: input.id,
+            kind: input.kind,
+            external_id: input.external_id,
+            display_name: input.display_name,
+            lifecycle_status: BusinessObjectStatus::Draft,
+            approval_status: ApprovalStatus::Pending,
+            revision: 0,
+            attributes: input.attributes,
+            created_at: now,
+            updated_at: now,
+        };
+        self.repository
+            .insert_business_object(&object)
+            .map_err(lifecycle_error)?;
+        Ok(LifecycleObjectEntry::from(object))
+    }
+
+    /// Lists immutable ledger entries for a generic lifecycle object.
+    pub fn lifecycle_ledger_entries(
+        &self,
+        business_object_id: String,
+    ) -> Result<Vec<LifecycleLedgerEntry>, DesktopError> {
+        self.repository
+            .ledger_entries(&business_object_id)
+            .map_err(lifecycle_error)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(LifecycleLedgerEntry::from)
+                    .collect()
+            })
+    }
+
+    /// Appends an immutable ledger entry using the system UTC clock.
+    pub fn append_lifecycle_ledger_entry(
+        &self,
+        input: AppendLifecycleLedgerEntryInput,
+    ) -> Result<LifecycleLedgerEntry, DesktopError> {
+        let now = Utc::now();
+        let entry = LedgerEntry {
+            id: input.id,
+            business_object_id: input.business_object_id,
+            direction: input.direction.into(),
+            category: input.category,
+            amount_minor: input.amount_minor,
+            currency: input.currency,
+            occurred_at: now,
+            approval_status: input
+                .approval_status
+                .unwrap_or(LifecycleApprovalStatusInput::Pending)
+                .into(),
+            counterparty: input.counterparty,
+            reference: input.reference,
+            description: input.description,
+            created_at: now,
+        };
+        self.repository
+            .insert_ledger_entry(&entry)
+            .map_err(lifecycle_error)?;
+        Ok(LifecycleLedgerEntry::from(entry))
+    }
+
+    /// Lists existing local publication-history links for a lifecycle object.
+    pub fn lifecycle_content_attributions(
+        &self,
+        business_object_id: String,
+    ) -> Result<Vec<LifecycleContentAttributionEntry>, DesktopError> {
+        self.repository
+            .content_attributions(&business_object_id)
+            .map_err(lifecycle_error)
+            .map(|attributions| {
+                attributions
+                    .into_iter()
+                    .map(LifecycleContentAttributionEntry::from)
+                    .collect()
+            })
+    }
+
+    /// Links an existing local history record to an object using system UTC time.
+    pub fn add_lifecycle_content_attribution(
+        &self,
+        input: AddLifecycleContentAttributionInput,
+    ) -> Result<LifecycleContentAttributionEntry, DesktopError> {
+        let attribution = ContentAttribution {
+            business_object_id: input.business_object_id,
+            history_id: input.history_id,
+            created_at: Utc::now(),
+        };
+        self.repository
+            .insert_content_attribution(&attribution)
+            .map_err(lifecycle_error)?;
+        Ok(LifecycleContentAttributionEntry::from(attribution))
+    }
+
+    /// Performs an optimistic lifecycle and approval transition using system UTC time.
+    pub fn transition_lifecycle_object(
+        &self,
+        input: TransitionLifecycleObjectInput,
+    ) -> Result<LifecycleObjectEntry, DesktopError> {
+        self.repository
+            .transition_business_object(
+                &input.id,
+                input.expected_revision,
+                input.lifecycle_status.into(),
+                input.approval_status.into(),
+                Utc::now(),
+            )
+            .map_err(lifecycle_error)
+            .map(LifecycleObjectEntry::from)
+    }
+}
+
+fn lifecycle_error(error: DomainError) -> DesktopError {
+    match error {
+        DomainError::UnknownBusinessObject(_) | DomainError::UnknownHistoryRecord(_) => {
+            DesktopError::NotFound("the requested lifecycle record does not exist".into())
+        }
+        _ => DesktopError::InvalidRequest("lifecycle request could not be completed".into()),
+    }
+}
+
+impl From<BusinessObject> for LifecycleObjectEntry {
+    fn from(object: BusinessObject) -> Self {
+        Self {
+            id: object.id,
+            kind: object.kind,
+            external_id: object.external_id,
+            display_name: object.display_name,
+            lifecycle_status: lifecycle_status_label(object.lifecycle_status),
+            approval_status: approval_status_label(object.approval_status),
+            revision: object.revision,
+            attributes: object.attributes,
+            created_at: object.created_at.to_rfc3339(),
+            updated_at: object.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+impl From<LedgerEntry> for LifecycleLedgerEntry {
+    fn from(entry: LedgerEntry) -> Self {
+        Self {
+            id: entry.id,
+            business_object_id: entry.business_object_id,
+            direction: ledger_direction_label(entry.direction),
+            category: entry.category,
+            amount_minor: entry.amount_minor,
+            currency: entry.currency,
+            occurred_at: entry.occurred_at.to_rfc3339(),
+            approval_status: approval_status_label(entry.approval_status),
+            counterparty: entry.counterparty,
+            reference: entry.reference,
+            description: entry.description,
+            created_at: entry.created_at.to_rfc3339(),
+        }
+    }
+}
+
+impl From<ContentAttribution> for LifecycleContentAttributionEntry {
+    fn from(attribution: ContentAttribution) -> Self {
+        Self {
+            business_object_id: attribution.business_object_id,
+            history_id: attribution.history_id,
+            created_at: attribution.created_at.to_rfc3339(),
+        }
+    }
 }
 
 impl From<HistoryRecord> for HistoryEntry {
@@ -383,6 +727,30 @@ const fn publish_state_label(state: PublishState) -> &'static str {
     }
 }
 
+const fn lifecycle_status_label(status: BusinessObjectStatus) -> &'static str {
+    match status {
+        BusinessObjectStatus::Draft => "draft",
+        BusinessObjectStatus::Active => "active",
+        BusinessObjectStatus::Completed => "completed",
+        BusinessObjectStatus::Archived => "archived",
+    }
+}
+
+const fn approval_status_label(status: ApprovalStatus) -> &'static str {
+    match status {
+        ApprovalStatus::Pending => "pending",
+        ApprovalStatus::Approved => "approved",
+        ApprovalStatus::Rejected => "rejected",
+    }
+}
+
+const fn ledger_direction_label(direction: LedgerDirection) -> &'static str {
+    match direction {
+        LedgerDirection::Expense => "expense",
+        LedgerDirection::Revenue => "revenue",
+    }
+}
+
 fn account_id(platform: Platform, display_name: &str) -> String {
     format!("{}-{}", platform.as_str(), account_slug(display_name))
 }
@@ -454,6 +822,65 @@ fn local_history(
     state.service.history_entries(input, Utc::now())
 }
 
+#[tauri::command]
+fn lifecycle_objects(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Vec<LifecycleObjectEntry>, DesktopError> {
+    state.service.lifecycle_objects()
+}
+
+#[tauri::command]
+fn create_lifecycle_object(
+    state: tauri::State<'_, DesktopState>,
+    input: CreateLifecycleObjectInput,
+) -> Result<LifecycleObjectEntry, DesktopError> {
+    state.service.create_lifecycle_object(input)
+}
+
+#[tauri::command]
+fn lifecycle_ledger_entries(
+    state: tauri::State<'_, DesktopState>,
+    input: LifecycleObjectIdInput,
+) -> Result<Vec<LifecycleLedgerEntry>, DesktopError> {
+    state
+        .service
+        .lifecycle_ledger_entries(input.business_object_id)
+}
+
+#[tauri::command]
+fn append_lifecycle_ledger_entry(
+    state: tauri::State<'_, DesktopState>,
+    input: AppendLifecycleLedgerEntryInput,
+) -> Result<LifecycleLedgerEntry, DesktopError> {
+    state.service.append_lifecycle_ledger_entry(input)
+}
+
+#[tauri::command]
+fn lifecycle_content_attributions(
+    state: tauri::State<'_, DesktopState>,
+    input: LifecycleObjectIdInput,
+) -> Result<Vec<LifecycleContentAttributionEntry>, DesktopError> {
+    state
+        .service
+        .lifecycle_content_attributions(input.business_object_id)
+}
+
+#[tauri::command]
+fn add_lifecycle_content_attribution(
+    state: tauri::State<'_, DesktopState>,
+    input: AddLifecycleContentAttributionInput,
+) -> Result<LifecycleContentAttributionEntry, DesktopError> {
+    state.service.add_lifecycle_content_attribution(input)
+}
+
+#[tauri::command]
+fn transition_lifecycle_object(
+    state: tauri::State<'_, DesktopState>,
+    input: TransitionLifecycleObjectInput,
+) -> Result<LifecycleObjectEntry, DesktopError> {
+    state.service.transition_lifecycle_object(input)
+}
+
 /// Starts the platform-native shell. All UI access is through Tauri IPC.
 pub fn run() {
     tauri::Builder::default()
@@ -471,7 +898,14 @@ pub fn run() {
             save_local_draft,
             save_account,
             save_article_account,
-            local_history
+            local_history,
+            lifecycle_objects,
+            create_lifecycle_object,
+            lifecycle_ledger_entries,
+            append_lifecycle_ledger_entry,
+            lifecycle_content_attributions,
+            add_lifecycle_content_attribution,
+            transition_lifecycle_object
         ])
         .run(tauri::generate_context!())
         .expect("error while running MatriXpost desktop");
@@ -479,7 +913,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use chrono::{Duration, TimeZone, Utc};
     use matrixpost_core::{
@@ -492,8 +926,11 @@ mod tests {
     };
 
     use super::{
-        DesktopService, HistoryQueryInput, SaveAccountInput, SaveArticleAccountInput,
-        SaveDraftInput,
+        AddLifecycleContentAttributionInput, AppendLifecycleLedgerEntryInput,
+        CreateLifecycleObjectInput, DesktopService, HistoryQueryInput,
+        LifecycleApprovalStatusInput, LifecycleLedgerDirectionInput, LifecycleObjectIdInput,
+        LifecycleStatusInput, SaveAccountInput, SaveArticleAccountInput, SaveDraftInput,
+        TransitionLifecycleObjectInput,
     };
 
     fn service() -> DesktopService {
@@ -897,5 +1334,150 @@ mod tests {
         assert!(!rendered.contains("private detail"));
         assert!(entry.draft);
         assert!(!entry.scheduled);
+    }
+
+    #[test]
+    fn lifecycle_input_rejects_unknown_fields() {
+        let input = [("businessObjectId", "object-1"), ("unexpected", "value")]
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    StringDeserializer::<ValueError>::new(key.to_owned()),
+                    StringDeserializer::<ValueError>::new(value.to_owned()),
+                )
+            });
+        let error = LifecycleObjectIdInput::deserialize(MapDeserializer::new(input))
+            .expect_err("unknown lifecycle field must fail");
+
+        assert!(error.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn lifecycle_child_lists_reject_missing_objects_without_exposing_the_identifier() {
+        let service = service();
+
+        for result in [
+            service
+                .lifecycle_ledger_entries("missing-object".into())
+                .map(|_| ()),
+            service
+                .lifecycle_content_attributions("missing-object".into())
+                .map(|_| ()),
+        ] {
+            assert_eq!(
+                result
+                    .expect_err("missing object must not look like an empty list")
+                    .to_string(),
+                "local lifecycle record was not found: the requested lifecycle record does not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_service_round_trips_object_ledger_and_content_attribution() {
+        let service = service();
+        let object = service
+            .create_lifecycle_object(CreateLifecycleObjectInput {
+                id: "project-1".into(),
+                kind: "project".into(),
+                external_id: Some("external-1".into()),
+                display_name: "Launch plan".into(),
+                attributes: BTreeMap::from([("region".into(), "north".into())]),
+            })
+            .expect("lifecycle object");
+        assert_eq!(object.lifecycle_status, "draft");
+        assert_eq!(object.approval_status, "pending");
+        assert_eq!(object.revision, 0);
+        assert_eq!(service.lifecycle_objects().expect("objects"), vec![object]);
+
+        let entry = service
+            .append_lifecycle_ledger_entry(AppendLifecycleLedgerEntryInput {
+                id: "entry-1".into(),
+                business_object_id: "project-1".into(),
+                direction: LifecycleLedgerDirectionInput::Expense,
+                category: "materials".into(),
+                amount_minor: 1250,
+                currency: "CNY".into(),
+                approval_status: Some(LifecycleApprovalStatusInput::Approved),
+                counterparty: Some("Supplier".into()),
+                reference: None,
+                description: Some("Sample purchase".into()),
+            })
+            .expect("ledger entry");
+        assert_eq!(entry.direction, "expense");
+        assert_eq!(entry.amount_minor, 1250);
+        assert_eq!(
+            service
+                .lifecycle_ledger_entries("project-1".into())
+                .expect("ledger entries"),
+            vec![entry]
+        );
+
+        let recorded_at = Utc
+            .with_ymd_and_hms(2030, 1, 10, 12, 0, 0)
+            .single()
+            .expect("fixed clock");
+        service
+            .repository
+            .append_history(&history_record(
+                "history-1",
+                "Local draft",
+                matrixpost_core::Platform::Douyin,
+                PublishState::Draft,
+                recorded_at,
+                true,
+                false,
+            ))
+            .expect("seeded history");
+        let attribution = service
+            .add_lifecycle_content_attribution(AddLifecycleContentAttributionInput {
+                business_object_id: "project-1".into(),
+                history_id: "history-1".into(),
+            })
+            .expect("content attribution");
+        assert_eq!(attribution.history_id, "history-1");
+        assert_eq!(
+            service
+                .lifecycle_content_attributions("project-1".into())
+                .expect("attributions"),
+            vec![attribution]
+        );
+    }
+
+    #[test]
+    fn lifecycle_transition_increments_revision_and_rejects_stale_updates() {
+        let service = service();
+        service
+            .create_lifecycle_object(CreateLifecycleObjectInput {
+                id: "asset-1".into(),
+                kind: "asset".into(),
+                external_id: None,
+                display_name: "Reusable asset".into(),
+                attributes: BTreeMap::new(),
+            })
+            .expect("lifecycle object");
+        let transitioned = service
+            .transition_lifecycle_object(TransitionLifecycleObjectInput {
+                id: "asset-1".into(),
+                expected_revision: 0,
+                lifecycle_status: LifecycleStatusInput::Active,
+                approval_status: LifecycleApprovalStatusInput::Pending,
+            })
+            .expect("transition");
+        assert_eq!(transitioned.lifecycle_status, "active");
+        assert_eq!(transitioned.revision, 1);
+
+        let error = service
+            .transition_lifecycle_object(TransitionLifecycleObjectInput {
+                id: "asset-1".into(),
+                expected_revision: 0,
+                lifecycle_status: LifecycleStatusInput::Completed,
+                approval_status: LifecycleApprovalStatusInput::Pending,
+            })
+            .expect_err("stale transition must fail");
+        assert_eq!(
+            error.to_string(),
+            "invalid local draft: lifecycle request could not be completed"
+        );
     }
 }

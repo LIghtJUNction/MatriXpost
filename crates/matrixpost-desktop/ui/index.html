@@ -173,6 +173,136 @@
         </form>
         <ul id="article-accounts" class="accounts" aria-live="polite" aria-label="Saved local Juejin article metadata"></ul>
       </section>
+
+      <section aria-labelledby="lifecycle-title">
+        <div class="section-heading">
+          <h2 id="lifecycle-title">Lifecycle management</h2>
+          <button id="refresh-lifecycle" type="button">Refresh lifecycle data</button>
+        </div>
+        <p class="hint">Track any local business object and its append-only financial entries. This is generic by design: choose your own kind and optional external identifier.</p>
+        <form id="lifecycle-object-form">
+          <label>
+            Object kind
+            <input name="kind" required maxlength="80" autocomplete="off" placeholder="project, asset, campaign" />
+          </label>
+          <label>
+            Display name
+            <input name="displayName" required maxlength="200" autocomplete="off" />
+          </label>
+          <label>
+            External ID (optional)
+            <input name="externalId" maxlength="160" autocomplete="off" />
+          </label>
+          <label>
+            Attributes JSON object (optional)
+            <textarea name="attributes" rows="3" placeholder='{"region":"north"}' aria-describedby="attributes-help"></textarea>
+          </label>
+          <p id="attributes-help" class="hint">Use a simple object of string keys and string values. No credentials or session data.</p>
+          <button type="submit">Create local object</button>
+          <p id="lifecycle-object-result" role="status" aria-live="polite"></p>
+        </form>
+
+        <label class="lifecycle-selection">
+          Selected object
+          <select id="lifecycle-object-select" aria-describedby="lifecycle-selection-help"></select>
+        </label>
+        <p id="lifecycle-selection-help" class="hint">Select an object to view its ledger, content links, and controlled state transitions.</p>
+        <ul id="lifecycle-objects" class="accounts" aria-live="polite" aria-label="Local lifecycle objects"></ul>
+
+        <div class="lifecycle-grid">
+          <form id="lifecycle-ledger-form">
+            <h3>Append ledger entry</h3>
+            <p class="hint">Entries are immutable. Record corrections as a new entry.</p>
+            <label>
+              Direction
+              <select name="direction" required>
+                <option value="expense">Expense</option>
+                <option value="revenue">Revenue</option>
+              </select>
+            </label>
+            <label>
+              Category
+              <input name="category" required maxlength="120" autocomplete="off" />
+            </label>
+            <label>
+              Amount (minor units)
+              <input name="amountMinor" type="number" min="1" step="1" required inputmode="numeric" />
+            </label>
+            <label>
+              Currency
+              <input name="currency" required minlength="3" maxlength="3" value="CNY" autocapitalize="characters" autocomplete="off" />
+            </label>
+            <label>
+              Approval
+              <select name="approvalStatus" required>
+                <option value="pending" selected>Pending</option>
+                <option value="approved">Approved</option>
+                <option value="rejected">Rejected</option>
+              </select>
+            </label>
+            <label>
+              Counterparty (optional)
+              <input name="counterparty" maxlength="160" autocomplete="off" />
+            </label>
+            <label>
+              Reference (optional)
+              <input name="reference" maxlength="160" autocomplete="off" />
+            </label>
+            <label>
+              Description (optional)
+              <textarea name="description" rows="2" maxlength="800"></textarea>
+            </label>
+            <button type="submit">Append immutable entry</button>
+            <p id="lifecycle-ledger-result" role="status" aria-live="polite"></p>
+          </form>
+
+          <form id="lifecycle-attribution-form">
+            <h3>Attach published content</h3>
+            <p class="hint">Use an existing local publication history ID. This records attribution only; it never sends or publishes content.</p>
+            <label>
+              Local history ID
+              <input name="historyId" required maxlength="160" autocomplete="off" />
+            </label>
+            <button type="submit">Attach history entry</button>
+            <p id="lifecycle-attribution-result" role="status" aria-live="polite"></p>
+          </form>
+
+          <form id="lifecycle-transition-form">
+            <h3>Transition state</h3>
+            <p class="hint">The current revision is sent automatically. If another local change wins first, refresh and decide again.</p>
+            <label>
+              Lifecycle state
+              <select name="lifecycleStatus" required>
+                <option value="draft">Draft</option>
+                <option value="active">Active</option>
+                <option value="completed">Completed</option>
+                <option value="archived">Archived</option>
+              </select>
+            </label>
+            <label>
+              Approval state
+              <select name="approvalStatus" required>
+                <option value="pending">Pending</option>
+                <option value="approved">Approved</option>
+                <option value="rejected">Rejected</option>
+              </select>
+            </label>
+            <button type="submit">Apply controlled transition</button>
+            <p id="lifecycle-transition-result" role="status" aria-live="polite"></p>
+          </form>
+        </div>
+
+        <div class="lifecycle-grid lifecycle-results">
+          <div>
+            <h3>Selected ledger</h3>
+            <ul id="lifecycle-ledger" class="accounts" aria-live="polite" aria-label="Selected object ledger entries"></ul>
+          </div>
+          <div>
+            <h3>Selected content attribution</h3>
+            <ul id="lifecycle-attributions" class="accounts" aria-live="polite" aria-label="Selected object content attribution"></ul>
+          </div>
+        </div>
+      </section>
     </main>
   </body>
 </html>

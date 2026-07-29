@@ -15,7 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 chrono.workspace = true
-matrixpost-core = { version = "0.1.0", path = "../matrixpost-core" }
+matrixpost-core = { version = "0.2.0", path = "../matrixpost-core" }
 serde.workspace = true
 tauri = { version = "2", features = [] }
 thiserror.workspace = true

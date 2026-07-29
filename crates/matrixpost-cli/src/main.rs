@@ -1,13 +1,15 @@
 //! JSON-first command-line adapter for the portable MatriXpost core.
 
-use std::{path::PathBuf, process::ExitCode, str::FromStr};
+use std::{collections::BTreeMap, path::PathBuf, process::ExitCode, str::FromStr};
 
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use matrixpost_core::{
-    AccountSelection, ArticleDispatchOutcome, ArticleRunner, HistoryFilter, HistoryStatus,
-    LocalSchedule, MediaSource, Platform, PlatformOverride, ProviderDispatchReport,
-    ProviderRegistry, ProviderRunner, PublishArticleRequest, PublishRequest, Repository,
-    SqliteRepository, WechatLink,
+    AccountSelection, ApprovalStatus, ArticleDispatchOutcome, ArticleRunner, BusinessObject,
+    BusinessObjectStatus, ContentAttribution, HistoryFilter, HistoryStatus, LedgerDirection,
+    LedgerEntry, LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformOverride,
+    ProviderDispatchReport, ProviderRegistry, ProviderRunner, PublishArticleRequest,
+    PublishRequest, Repository, SqliteRepository, WechatLink,
 };
 use serde::Serialize;
 
@@ -70,6 +72,148 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage generic objects, immutable financial entries, and content attribution.
+    Lifecycle(LifecycleArgs),
+}
+
+#[derive(Debug, Args)]
+struct LifecycleArgs {
+    #[command(subcommand)]
+    command: LifecycleCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum LifecycleCommand {
+    /// List all generic business objects.
+    Objects,
+    /// Create or inspect a generic business object.
+    Object(ObjectArgs),
+    /// List or append immutable ledger entries.
+    Ledger(LedgerArgs),
+    /// List or create links from published content to an object.
+    Attribution(AttributionArgs),
+    /// Change controlled object lifecycle and approval states.
+    Transition(TransitionArgs),
+}
+
+#[derive(Debug, Args)]
+struct ObjectArgs {
+    #[command(subcommand)]
+    command: ObjectCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ObjectCommand {
+    /// Read one object by stable ID.
+    Get {
+        #[arg(long)]
+        id: String,
+    },
+    /// Create an object from a caller-defined template kind.
+    Create(ObjectCreateArgs),
+}
+
+#[derive(Debug, Args)]
+struct ObjectCreateArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    kind: String,
+    #[arg(long)]
+    display_name: String,
+    #[arg(long)]
+    external_id: Option<String>,
+    #[arg(long, default_value = "draft", value_parser = parse_business_object_status)]
+    lifecycle_status: BusinessObjectStatus,
+    #[arg(long, default_value = "pending", value_parser = parse_approval_status)]
+    approval_status: ApprovalStatus,
+    /// Object metadata as KEY=VALUE. Repeat the flag for multiple attributes.
+    #[arg(long = "attribute", value_name = "KEY=VALUE")]
+    attributes: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct LedgerArgs {
+    #[command(subcommand)]
+    command: LedgerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum LedgerCommand {
+    /// List immutable ledger entries for an object.
+    List {
+        #[arg(long = "object")]
+        business_object_id: String,
+    },
+    /// Append an immutable cost or income entry.
+    Add(LedgerAddArgs),
+}
+
+#[derive(Debug, Args)]
+struct LedgerAddArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long = "object")]
+    business_object_id: String,
+    #[arg(long, value_parser = parse_ledger_direction)]
+    direction: LedgerDirection,
+    #[arg(long)]
+    category: String,
+    #[arg(long, value_parser = parse_positive_minor_amount)]
+    amount_minor: i64,
+    #[arg(long, value_parser = parse_currency)]
+    currency: String,
+    #[arg(long, default_value = "pending", value_parser = parse_approval_status)]
+    approval_status: ApprovalStatus,
+    #[arg(long, value_parser = parse_rfc3339)]
+    occurred_at: Option<DateTime<Utc>>,
+    #[arg(long)]
+    counterparty: Option<String>,
+    #[arg(long)]
+    reference: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AttributionArgs {
+    #[command(subcommand)]
+    command: AttributionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AttributionCommand {
+    /// List publication-history links for an object.
+    List {
+        #[arg(long = "object")]
+        business_object_id: String,
+    },
+    /// Link one existing publication-history record to an object.
+    Add(AttributionAddArgs),
+}
+
+#[derive(Debug, Args)]
+struct AttributionAddArgs {
+    #[arg(long = "object")]
+    business_object_id: String,
+    #[arg(long = "history")]
+    history_id: String,
+    #[arg(long, value_parser = parse_rfc3339)]
+    created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Args)]
+struct TransitionArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    expected_revision: u64,
+    #[arg(long, value_parser = parse_business_object_status)]
+    lifecycle_status: BusinessObjectStatus,
+    #[arg(long, value_parser = parse_approval_status)]
+    approval_status: ApprovalStatus,
+    #[arg(long, value_parser = parse_rfc3339)]
+    updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Args)]
@@ -264,6 +408,279 @@ fn parse_history_platform(value: &str) -> Result<Platform, String> {
     }
     Ok(platform)
 }
+
+fn parse_business_object_status(value: &str) -> Result<BusinessObjectStatus, String> {
+    match value {
+        "draft" => Ok(BusinessObjectStatus::Draft),
+        "active" => Ok(BusinessObjectStatus::Active),
+        "completed" => Ok(BusinessObjectStatus::Completed),
+        "archived" => Ok(BusinessObjectStatus::Archived),
+        _ => Err("lifecycle status must be draft, active, completed, or archived".into()),
+    }
+}
+
+fn parse_approval_status(value: &str) -> Result<ApprovalStatus, String> {
+    match value {
+        "pending" => Ok(ApprovalStatus::Pending),
+        "approved" => Ok(ApprovalStatus::Approved),
+        "rejected" => Ok(ApprovalStatus::Rejected),
+        _ => Err("approval status must be pending, approved, or rejected".into()),
+    }
+}
+
+fn parse_ledger_direction(value: &str) -> Result<LedgerDirection, String> {
+    match value {
+        "expense" => Ok(LedgerDirection::Expense),
+        "revenue" => Ok(LedgerDirection::Revenue),
+        _ => Err("ledger direction must be expense or revenue".into()),
+    }
+}
+
+fn parse_positive_minor_amount(value: &str) -> Result<i64, String> {
+    let amount = value
+        .parse::<i64>()
+        .map_err(|_| "amount minor must be a positive integer".to_owned())?;
+    if amount <= 0 {
+        return Err("amount minor must be a positive integer".into());
+    }
+    Ok(amount)
+}
+
+fn parse_currency(value: &str) -> Result<String, String> {
+    if value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        Ok(value.to_owned())
+    } else {
+        Err("currency must be a three-letter uppercase ISO code".into())
+    }
+}
+
+fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| "timestamp must use RFC3339 format".into())
+}
+
+fn parse_attributes(values: Vec<String>) -> Result<BTreeMap<String, String>, String> {
+    let mut attributes = BTreeMap::new();
+    for value in values {
+        let Some((key, value)) = value.split_once('=') else {
+            return Err("attribute must use KEY=VALUE".into());
+        };
+        if key.trim().is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(format!("attribute key is invalid: {key}"));
+        }
+        if value.trim().is_empty() {
+            return Err(format!("attribute value must not be empty: {key}"));
+        }
+        if attributes
+            .insert(key.to_owned(), value.to_owned())
+            .is_some()
+        {
+            return Err(format!("attribute key is repeated: {key}"));
+        }
+    }
+    Ok(attributes)
+}
+
+fn require_non_empty(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{field} must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_optional_non_empty(field: &str, value: &Option<String>) -> Result<(), String> {
+    if let Some(value) = value {
+        require_non_empty(field, value)?;
+    }
+    Ok(())
+}
+
+fn lifecycle_input_error(error: String) -> ExitCode {
+    emit(2, serde_json::Value::Null, Some(&error))
+}
+
+fn lifecycle_repository_error(error: impl ToString) -> ExitCode {
+    let error = error.to_string();
+    emit(4, serde_json::Value::Null, Some(&error))
+}
+
+fn object_or_not_found(
+    repository: &impl LifecycleRepository,
+    id: &str,
+) -> Result<BusinessObject, ExitCode> {
+    require_non_empty("object id", id).map_err(lifecycle_input_error)?;
+    match repository.business_object(id) {
+        Ok(Some(object)) => Ok(object),
+        Ok(None) => Err(emit(
+            4,
+            serde_json::Value::Null,
+            Some("business object was not found"),
+        )),
+        Err(error) => Err(lifecycle_repository_error(error)),
+    }
+}
+
+fn execute_lifecycle(command: LifecycleCommand, repository: &impl LifecycleRepository) -> ExitCode {
+    match command {
+        LifecycleCommand::Objects => match repository.business_objects() {
+            Ok(objects) => emit(0, serde_json::json!({ "objects": objects }), None),
+            Err(error) => lifecycle_repository_error(error),
+        },
+        LifecycleCommand::Object(args) => match args.command {
+            ObjectCommand::Get { id } => match object_or_not_found(repository, &id) {
+                Ok(object) => emit(0, serde_json::json!({ "object": object }), None),
+                Err(exit_code) => exit_code,
+            },
+            ObjectCommand::Create(args) => {
+                for (field, value) in [
+                    ("object id", &args.id),
+                    ("object kind", &args.kind),
+                    ("object display name", &args.display_name),
+                ] {
+                    if let Err(error) = require_non_empty(field, value) {
+                        return lifecycle_input_error(error);
+                    }
+                }
+                if let Err(error) =
+                    require_optional_non_empty("object external id", &args.external_id)
+                {
+                    return lifecycle_input_error(error);
+                }
+                let attributes = match parse_attributes(args.attributes) {
+                    Ok(attributes) => attributes,
+                    Err(error) => return lifecycle_input_error(error),
+                };
+                let now = Utc::now();
+                let object = BusinessObject {
+                    id: args.id,
+                    kind: args.kind,
+                    external_id: args.external_id,
+                    display_name: args.display_name,
+                    lifecycle_status: args.lifecycle_status,
+                    approval_status: args.approval_status,
+                    revision: 0,
+                    attributes,
+                    created_at: now,
+                    updated_at: now,
+                };
+                match repository.insert_business_object(&object) {
+                    Ok(()) => emit(0, serde_json::json!({ "object": object }), None),
+                    Err(error) => lifecycle_repository_error(error),
+                }
+            }
+        },
+        LifecycleCommand::Ledger(args) => match args.command {
+            LedgerCommand::List { business_object_id } => {
+                if let Err(exit_code) = object_or_not_found(repository, &business_object_id) {
+                    return exit_code;
+                }
+                match repository.ledger_entries(&business_object_id) {
+                    Ok(entries) => emit(0, serde_json::json!({ "ledger_entries": entries }), None),
+                    Err(error) => lifecycle_repository_error(error),
+                }
+            }
+            LedgerCommand::Add(args) => {
+                for (field, value) in [
+                    ("ledger entry id", &args.id),
+                    ("object id", &args.business_object_id),
+                    ("ledger category", &args.category),
+                ] {
+                    if let Err(error) = require_non_empty(field, value) {
+                        return lifecycle_input_error(error);
+                    }
+                }
+                for (field, value) in [
+                    ("ledger counterparty", &args.counterparty),
+                    ("ledger reference", &args.reference),
+                    ("ledger description", &args.description),
+                ] {
+                    if let Err(error) = require_optional_non_empty(field, value) {
+                        return lifecycle_input_error(error);
+                    }
+                }
+                let now = Utc::now();
+                let entry = LedgerEntry {
+                    id: args.id,
+                    business_object_id: args.business_object_id,
+                    direction: args.direction,
+                    category: args.category,
+                    amount_minor: args.amount_minor,
+                    currency: args.currency,
+                    occurred_at: args.occurred_at.unwrap_or(now),
+                    approval_status: args.approval_status,
+                    counterparty: args.counterparty,
+                    reference: args.reference,
+                    description: args.description,
+                    created_at: now,
+                };
+                match repository.insert_ledger_entry(&entry) {
+                    Ok(()) => emit(0, serde_json::json!({ "ledger_entry": entry }), None),
+                    Err(error) => lifecycle_repository_error(error),
+                }
+            }
+        },
+        LifecycleCommand::Attribution(args) => match args.command {
+            AttributionCommand::List { business_object_id } => {
+                if let Err(exit_code) = object_or_not_found(repository, &business_object_id) {
+                    return exit_code;
+                }
+                match repository.content_attributions(&business_object_id) {
+                    Ok(attributions) => emit(
+                        0,
+                        serde_json::json!({ "content_attributions": attributions }),
+                        None,
+                    ),
+                    Err(error) => lifecycle_repository_error(error),
+                }
+            }
+            AttributionCommand::Add(args) => {
+                for (field, value) in [
+                    ("object id", &args.business_object_id),
+                    ("history id", &args.history_id),
+                ] {
+                    if let Err(error) = require_non_empty(field, value) {
+                        return lifecycle_input_error(error);
+                    }
+                }
+                let attribution = ContentAttribution {
+                    business_object_id: args.business_object_id,
+                    history_id: args.history_id,
+                    created_at: args.created_at.unwrap_or_else(Utc::now),
+                };
+                match repository.insert_content_attribution(&attribution) {
+                    Ok(()) => emit(
+                        0,
+                        serde_json::json!({ "content_attribution": attribution }),
+                        None,
+                    ),
+                    Err(error) => lifecycle_repository_error(error),
+                }
+            }
+        },
+        LifecycleCommand::Transition(args) => {
+            if let Err(error) = require_non_empty("object id", &args.id) {
+                return lifecycle_input_error(error);
+            }
+            match repository.transition_business_object(
+                &args.id,
+                args.expected_revision,
+                args.lifecycle_status,
+                args.approval_status,
+                args.updated_at.unwrap_or_else(Utc::now),
+            ) {
+                Ok(object) => emit(0, serde_json::json!({ "object": object }), None),
+                Err(error) => lifecycle_repository_error(error),
+            }
+        }
+    }
+}
+
 fn parse_history_filter(args: &HistoryArgs) -> Result<HistoryFilter, String> {
     HistoryFilter::from_query(
         args.days,
@@ -415,6 +832,10 @@ fn main() -> ExitCode {
             Err(error) => emit(2, serde_json::Value::Null, Some(&error)),
         },
         Command::Providers { json: _ } => emit(0, registry.availability_report(), None),
+        Command::Lifecycle(args) => match open(cli.state_path) {
+            Ok(repository) => execute_lifecycle(args.command, &repository),
+            Err(error) => lifecycle_repository_error(error),
+        },
     }
 }
 
@@ -725,5 +1146,212 @@ mod tests {
             error,
             "provider runner endpoint must not contain credential-like data"
         );
+    }
+
+    #[test]
+    fn lifecycle_object_create_parses_generic_attributes_and_defaults() {
+        let parsed = Cli::try_parse_from([
+            "matrixpost",
+            "lifecycle",
+            "object",
+            "create",
+            "--id",
+            "campaign-42",
+            "--kind",
+            "campaign",
+            "--display-name",
+            "Launch",
+            "--attribute",
+            "region=cn",
+            "--attribute",
+            "channel=video",
+        ])
+        .unwrap();
+        let Command::Lifecycle(LifecycleArgs {
+            command:
+                LifecycleCommand::Object(ObjectArgs {
+                    command: ObjectCommand::Create(args),
+                }),
+        }) = parsed.command
+        else {
+            panic!("expected lifecycle object create")
+        };
+        assert_eq!(args.lifecycle_status, BusinessObjectStatus::Draft);
+        assert_eq!(args.approval_status, ApprovalStatus::Pending);
+        assert_eq!(
+            parse_attributes(args.attributes).unwrap(),
+            BTreeMap::from([
+                ("channel".to_owned(), "video".to_owned()),
+                ("region".to_owned(), "cn".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn lifecycle_ledger_parsing_rejects_invalid_direction_and_minor_amount() {
+        let valid = Cli::try_parse_from([
+            "matrixpost",
+            "lifecycle",
+            "ledger",
+            "add",
+            "--id",
+            "entry-1",
+            "--object",
+            "campaign-42",
+            "--direction",
+            "expense",
+            "--category",
+            "media",
+            "--amount-minor",
+            "1250",
+            "--currency",
+            "CNY",
+        ]);
+        assert!(valid.is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "matrixpost",
+                "lifecycle",
+                "ledger",
+                "add",
+                "--id",
+                "entry-1",
+                "--object",
+                "campaign-42",
+                "--direction",
+                "cost",
+                "--category",
+                "media",
+                "--amount-minor",
+                "1250",
+                "--currency",
+                "CNY",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "matrixpost",
+                "lifecycle",
+                "ledger",
+                "add",
+                "--id",
+                "entry-1",
+                "--object",
+                "campaign-42",
+                "--direction",
+                "expense",
+                "--category",
+                "media",
+                "--amount-minor",
+                "0",
+                "--currency",
+                "CNY",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lifecycle_attribution_and_transition_arguments_are_typed() {
+        let attribution = Cli::try_parse_from([
+            "matrixpost",
+            "lifecycle",
+            "attribution",
+            "add",
+            "--object",
+            "campaign-42",
+            "--history",
+            "publication-7",
+            "--created-at",
+            "2026-07-29T01:02:03Z",
+        ])
+        .unwrap();
+        let Command::Lifecycle(LifecycleArgs {
+            command:
+                LifecycleCommand::Attribution(AttributionArgs {
+                    command: AttributionCommand::Add(args),
+                }),
+        }) = attribution.command
+        else {
+            panic!("expected lifecycle attribution add")
+        };
+        assert_eq!(args.business_object_id, "campaign-42");
+        assert_eq!(args.history_id, "publication-7");
+        assert_eq!(
+            args.created_at.unwrap().to_rfc3339(),
+            "2026-07-29T01:02:03+00:00"
+        );
+
+        let transition = Cli::try_parse_from([
+            "matrixpost",
+            "lifecycle",
+            "transition",
+            "--id",
+            "campaign-42",
+            "--expected-revision",
+            "7",
+            "--lifecycle-status",
+            "active",
+            "--approval-status",
+            "approved",
+        ])
+        .unwrap();
+        let Command::Lifecycle(LifecycleArgs {
+            command: LifecycleCommand::Transition(args),
+        }) = transition.command
+        else {
+            panic!("expected lifecycle transition")
+        };
+        assert_eq!(args.id, "campaign-42");
+        assert_eq!(args.expected_revision, 7);
+        assert_eq!(args.lifecycle_status, BusinessObjectStatus::Active);
+        assert_eq!(args.approval_status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn lifecycle_commands_persist_a_generic_object_and_immutable_ledger_entry() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let create = LifecycleCommand::Object(ObjectArgs {
+            command: ObjectCommand::Create(ObjectCreateArgs {
+                id: "campaign-42".into(),
+                kind: "campaign".into(),
+                display_name: "Launch".into(),
+                external_id: None,
+                lifecycle_status: BusinessObjectStatus::Draft,
+                approval_status: ApprovalStatus::Pending,
+                attributes: vec!["channel=video".into()],
+            }),
+        });
+        assert_eq!(execute_lifecycle(create, &repository), ExitCode::SUCCESS);
+        let add = LifecycleCommand::Ledger(LedgerArgs {
+            command: LedgerCommand::Add(LedgerAddArgs {
+                id: "entry-1".into(),
+                business_object_id: "campaign-42".into(),
+                direction: LedgerDirection::Expense,
+                category: "media".into(),
+                amount_minor: 1250,
+                currency: "CNY".into(),
+                approval_status: ApprovalStatus::Pending,
+                occurred_at: None,
+                counterparty: None,
+                reference: None,
+                description: None,
+            }),
+        });
+        assert_eq!(execute_lifecycle(add, &repository), ExitCode::SUCCESS);
+        assert_eq!(repository.business_objects().unwrap().len(), 1);
+        assert_eq!(repository.ledger_entries("campaign-42").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_missing_object_is_a_generic_not_found_failure() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let command = LifecycleCommand::Object(ObjectArgs {
+            command: ObjectCommand::Get {
+                id: "missing-object".into(),
+            },
+        });
+        assert_eq!(execute_lifecycle(command, &repository), ExitCode::from(4));
     }
 }
