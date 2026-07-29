@@ -295,3 +295,45 @@ async fn router_platform_metadata_publish_503_and_invalid_dto_400() {
             .contains("invalid JSON publish request")
     );
 }
+
+#[tokio::test]
+async fn upstream_test_probe_and_api_success_alias_are_compatible() {
+    let router = app(AppState {
+        repository: Arc::new(SqliteRepository::in_memory().unwrap()),
+        providers: Arc::new(ProviderRegistry::new()),
+    });
+
+    let (status, body) = json_response(
+        router.clone(),
+        Request::get("/test").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        serde_json::json!({ "success": true, "message": "ok" })
+    );
+
+    let (status, body) = json_response(
+        router.clone(),
+        change_data_request(serde_json::json!({
+            "fileName": "config",
+            "type": "get",
+            "item": { "id": "dy" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], body["ok"]);
+
+    let (status, body) = json_response(
+        router,
+        Request::post("/publish")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["success"], body["ok"]);
+}

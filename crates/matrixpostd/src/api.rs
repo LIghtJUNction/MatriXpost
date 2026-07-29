@@ -18,6 +18,7 @@ use crate::state::AppState;
 #[derive(Serialize)]
 struct ApiResponse<T: Serialize> {
     ok: bool,
+    success: bool,
     outcome: &'static str,
     data: T,
     message: String,
@@ -29,10 +30,12 @@ fn response(
     data: serde_json::Value,
     message: impl Into<String>,
 ) -> Response {
+    let ok = status.is_success();
     (
         status,
         Json(ApiResponse {
-            ok: status.is_success(),
+            ok,
+            success: ok,
             outcome,
             data,
             message: message.into(),
@@ -431,6 +434,10 @@ async fn create_business_relation(
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true, "service": "matrixpostd", "status": "healthy" }))
 }
+/// Preserves the upstream MatrixMedia liveness probe exactly.
+async fn upstream_test_probe() -> impl IntoResponse {
+    Json(serde_json::json!({ "success": true, "message": "ok" }))
+}
 async fn platforms() -> impl IntoResponse {
     Json(
         Platform::ALL
@@ -545,6 +552,7 @@ pub(crate) fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(health))
         .route("/health", get(health))
+        .route("/test", get(upstream_test_probe))
         .route("/platforms", get(platforms))
         .route("/providers", get(providers))
         .route("/creative-statements", get(creative_statements))
