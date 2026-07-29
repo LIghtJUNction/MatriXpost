@@ -64,6 +64,21 @@ jobs:
           cargo +$RUST_VERSION package --allow-dirty --locked --no-verify
           --package matrixpost-core
 
+      - name: Create independently publishable CLI archive
+        run: >-
+          cargo +$RUST_VERSION package --allow-dirty --locked --no-verify
+          --package matrixpost-cli
+
+      - name: Create independently publishable daemon archive
+        run: >-
+          cargo +$RUST_VERSION package --allow-dirty --locked --no-verify
+          --package matrixpostd
+
+      - name: Create independently publishable MCP archive
+        run: >-
+          cargo +$RUST_VERSION package --allow-dirty --locked --no-verify
+          --package matrixpost-mcp
+
   desktop-compile:
     name: ${{ matrix.os }} desktop compilation
     strategy:
