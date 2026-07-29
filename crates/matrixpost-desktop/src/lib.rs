@@ -4,15 +4,21 @@
 //! application-data directory. It never starts the daemon, a shell, a browser,
 //! or a provider adapter.
 
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+};
 
 use chrono::Utc;
 use matrixpost_core::{
     Account, AccountStatus, ApprovalStatus, ArticleAccount, ArticleAccountStatus, ArticlePlatform,
-    BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution, DomainError,
-    HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry, LifecycleRepository,
-    LocalSchedule, MediaSource, Platform, PlatformMetadata, PublicationQueue, PublishRequest,
-    PublishState, Repository, SqliteRepository,
+    BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution, DispatchOutcome,
+    DomainError, HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry,
+    LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformMetadata, ProviderRegistry,
+    ProviderRunner, ProviderRunnerTransport, PublicationQueue, PublishRequest, PublishState,
+    Repository, SqliteRepository,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -53,6 +59,39 @@ pub struct DraftSaved {
     pub id: String,
     pub state: &'static str,
     pub remote_publish_attempted: bool,
+}
+
+/// Strict one-shot request for already-running, loopback-only provider runners.
+///
+/// Runner declarations are intentionally supplied for this invocation only;
+/// the desktop application neither persists them nor manages browser sessions.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DispatchToLocalRunnerInput {
+    pub title: String,
+    pub media_path: String,
+    pub targets: Vec<String>,
+    pub scheduled_at: Option<String>,
+    pub provider_runners: Vec<String>,
+    /// Explicit confirmation for this immediate, one-shot local dispatch.
+    pub confirmed: bool,
+}
+
+/// Credential-free summary of one local runner result.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRunnerDispatchOutcome {
+    pub platform: &'static str,
+    pub state: &'static str,
+    pub reason: String,
+}
+
+/// One-shot local runner result, never a claim of remote platform publication.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRunnerDispatchReport {
+    pub outcomes: Vec<LocalRunnerDispatchOutcome>,
+    pub remote_publish_confirmed: bool,
 }
 
 /// Credential-free account metadata accepted from the local desktop form.
@@ -396,6 +435,49 @@ impl DesktopService {
         })
     }
 
+    /// Dispatches once to explicitly declared local runners without storing any
+    /// runner, browser, account, or scheduling configuration.
+    pub fn dispatch_to_local_runner(
+        &self,
+        input: DispatchToLocalRunnerInput,
+    ) -> Result<LocalRunnerDispatchReport, DesktopError> {
+        if !input.confirmed {
+            return Err(DesktopError::InvalidRequest(
+                "explicit local runner confirmation is required".into(),
+            ));
+        }
+        if input.scheduled_at.is_some() {
+            return Err(DesktopError::InvalidRequest(
+                "scheduled dispatch is not available; save a local draft instead".into(),
+            ));
+        }
+
+        let request = PublishRequest {
+            source: MediaSource::LocalFile(PathBuf::from(input.media_path.trim())),
+            title: input.title,
+            short_title: None,
+            tags: Vec::new(),
+            address: None,
+            draft: false,
+            bt2: None,
+            scheduled_at: None,
+            task_name: None,
+            account: Default::default(),
+            wechat_link: Default::default(),
+            overrides: Vec::new(),
+            targets: input
+                .targets
+                .iter()
+                .map(|target| Platform::from_str(target))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        request.validate()?;
+
+        let registry = local_runner_registry(&input.provider_runners, &request.targets)?;
+
+        local_runner_dispatch_report(&registry, &request)
+    }
+
     pub fn save_account(&self, input: SaveAccountInput) -> Result<AccountSaved, DesktopError> {
         let platform = Platform::from_str(&input.platform)?;
         let display_name = input.display_name.trim();
@@ -657,6 +739,96 @@ fn lifecycle_error(error: DomainError) -> DesktopError {
     }
 }
 
+fn local_runner_registry(
+    declarations: &[String],
+    targets: &[Platform],
+) -> Result<ProviderRegistry, DesktopError> {
+    let runners = declarations
+        .iter()
+        .map(|runner| ProviderRunner::parse_cli(runner.trim()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            DesktopError::InvalidRequest(
+                "each runner must use PLATFORM=tcp:127.0.0.1:PORT and be local".into(),
+            )
+        })?;
+    let runner_platforms = runners
+        .iter()
+        .map(|runner| runner.platform)
+        .collect::<Vec<_>>();
+    let selected_platforms = targets.iter().copied().collect::<BTreeSet<_>>();
+    let declared_platforms = runner_platforms.iter().copied().collect::<BTreeSet<_>>();
+
+    if runner_platforms.len() != declared_platforms.len() {
+        return Err(DesktopError::InvalidRequest(
+            "declare each selected platform at most once".into(),
+        ));
+    }
+    if selected_platforms.len() != targets.len()
+        || declared_platforms != selected_platforms
+        || runners.len() != targets.len()
+    {
+        return Err(DesktopError::InvalidRequest(
+            "declare exactly one local runner for every selected platform".into(),
+        ));
+    }
+    if runners
+        .iter()
+        .any(|runner| !matches!(&runner.transport, ProviderRunnerTransport::Tcp { .. }))
+    {
+        return Err(DesktopError::InvalidRequest(
+            "each runner must use PLATFORM=tcp:127.0.0.1:PORT and be local".into(),
+        ));
+    }
+    ProviderRegistry::from_runners(runners).map_err(|_| {
+        DesktopError::InvalidRequest(
+            "runner declarations must be local and unique per platform".into(),
+        )
+    })
+}
+
+fn local_runner_dispatch_outcome(
+    platform: Platform,
+    outcome: DispatchOutcome,
+) -> LocalRunnerDispatchOutcome {
+    let (state, reason) = match outcome {
+        DispatchOutcome::Queued { .. } => (
+            "runner_accepted",
+            "the local runner accepted the request; remote platform processing is not confirmed",
+        ),
+        DispatchOutcome::Unavailable { .. } => (
+            "runner_unavailable",
+            "the declared local runner is unavailable for this platform",
+        ),
+        DispatchOutcome::Rejected { .. } => (
+            "runner_rejected",
+            "the local runner did not accept this request",
+        ),
+    };
+    LocalRunnerDispatchOutcome {
+        platform: platform.as_str(),
+        state,
+        reason: reason.into(),
+    }
+}
+
+fn local_runner_dispatch_report(
+    registry: &ProviderRegistry,
+    request: &PublishRequest,
+) -> Result<LocalRunnerDispatchReport, DesktopError> {
+    let report = registry.dispatch_all(request).map_err(|_| {
+        DesktopError::InvalidRequest("local runner dispatch request is invalid".into())
+    })?;
+    Ok(LocalRunnerDispatchReport {
+        outcomes: report
+            .outcomes
+            .into_iter()
+            .map(|(platform, outcome)| local_runner_dispatch_outcome(platform, outcome))
+            .collect(),
+        remote_publish_confirmed: false,
+    })
+}
+
 impl From<BusinessObject> for LifecycleObjectEntry {
     fn from(object: BusinessObject) -> Self {
         Self {
@@ -871,6 +1043,14 @@ fn save_local_draft(
 }
 
 #[tauri::command]
+fn dispatch_to_local_runner(
+    state: tauri::State<'_, DesktopState>,
+    input: DispatchToLocalRunnerInput,
+) -> Result<LocalRunnerDispatchReport, DesktopError> {
+    state.service.dispatch_to_local_runner(input)
+}
+
+#[tauri::command]
 fn save_account(
     state: tauri::State<'_, DesktopState>,
     input: SaveAccountInput,
@@ -986,6 +1166,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
             save_local_draft,
+            dispatch_to_local_runner,
             save_account,
             save_article_account,
             local_history,
@@ -1009,8 +1190,9 @@ mod tests {
 
     use chrono::{Duration, TimeZone, Utc};
     use matrixpost_core::{
-        AccountSelection, HistoryRecord, LocalSchedule, MediaSource, PublishRequest, PublishState,
-        Repository, SqliteRepository,
+        AccountSelection, DispatchOutcome, DomainError, HistoryRecord, LocalSchedule, MediaSource,
+        Platform, ProviderAvailability, ProviderRegistry, PublishProvider, PublishRequest,
+        PublishState, Repository, SqliteRepository,
     };
     use serde::Deserialize;
     use serde::de::value::{
@@ -1020,15 +1202,51 @@ mod tests {
     use super::{
         AddLifecycleBusinessRelationInput, AddLifecycleContentAttributionInput,
         AppendLifecycleLedgerEntryInput, CreateLifecycleObjectInput, DesktopService,
-        HistoryQueryInput, LifecycleApprovalStatusInput, LifecycleLedgerDirectionInput,
-        LifecycleObjectIdInput, LifecycleStatusInput, SaveAccountInput, SaveArticleAccountInput,
-        SaveDraftInput, TransitionLifecycleObjectInput,
+        DispatchToLocalRunnerInput, HistoryQueryInput, LifecycleApprovalStatusInput,
+        LifecycleLedgerDirectionInput, LifecycleObjectIdInput, LifecycleStatusInput,
+        SaveAccountInput, SaveArticleAccountInput, SaveDraftInput, TransitionLifecycleObjectInput,
     };
 
     fn service() -> DesktopService {
         DesktopService::new(Arc::new(
             SqliteRepository::in_memory().expect("in-memory state"),
         ))
+    }
+
+    struct UnavailableLocalRunner;
+
+    impl PublishProvider for UnavailableLocalRunner {
+        fn platform(&self) -> Platform {
+            Platform::Douyin
+        }
+
+        fn availability(&self) -> ProviderAvailability {
+            ProviderAvailability::Unavailable {
+                reason: "private runner endpoint must not be exposed".into(),
+            }
+        }
+
+        fn enqueue(&self, _: &PublishRequest) -> Result<DispatchOutcome, DomainError> {
+            unreachable!("unavailable providers must not receive a dispatch")
+        }
+    }
+
+    fn direct_runner_request() -> PublishRequest {
+        PublishRequest {
+            source: MediaSource::LocalFile("/media/example.mp4".into()),
+            title: "One-shot local request".into(),
+            short_title: None,
+            tags: Vec::new(),
+            address: None,
+            draft: false,
+            bt2: None,
+            scheduled_at: None,
+            task_name: None,
+            account: Default::default(),
+            wechat_link: Default::default(),
+            overrides: Vec::new(),
+            targets: vec![Platform::Douyin],
+        }
     }
 
     fn history_input(
@@ -1042,6 +1260,20 @@ mod tests {
             all,
             platform: platform.map(str::to_owned),
             status: status.map(str::to_owned),
+        }
+    }
+
+    fn local_runner_input(
+        provider_runners: Vec<&str>,
+        scheduled_at: Option<&str>,
+    ) -> DispatchToLocalRunnerInput {
+        DispatchToLocalRunnerInput {
+            title: "One-shot local request".into(),
+            media_path: "/media/example.mp4".into(),
+            targets: vec!["dy".into()],
+            scheduled_at: scheduled_at.map(str::to_owned),
+            provider_runners: provider_runners.into_iter().map(str::to_owned).collect(),
+            confirmed: true,
         }
     }
 
@@ -1111,6 +1343,159 @@ mod tests {
             .expect("job lookup")
             .expect("saved job");
         assert_eq!(job.state, PublishState::Draft);
+    }
+
+    #[test]
+    fn local_runner_dispatch_rejects_non_loopback_declarations_before_transport() {
+        let error = service()
+            .dispatch_to_local_runner(local_runner_input(vec!["dy=tcp:192.0.2.1:39001"], None))
+            .expect_err("non-loopback runner must be rejected before dispatch");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid local draft: each runner must use PLATFORM=tcp:127.0.0.1:PORT and be local"
+        );
+    }
+
+    #[test]
+    fn local_runner_dispatch_requires_confirmation_before_runner_parsing() {
+        let mut input = local_runner_input(vec!["not-a-runner"], None);
+        input.confirmed = false;
+
+        let error = service()
+            .dispatch_to_local_runner(input)
+            .expect_err("unconfirmed dispatch must stop before runner parsing");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid local draft: explicit local runner confirmation is required"
+        );
+    }
+
+    #[test]
+    fn local_runner_mapping_rejects_missing_target_before_dispatch() {
+        let error = match super::local_runner_registry(
+            &["dy=tcp:127.0.0.1:39001".into()],
+            &[Platform::Douyin, Platform::Xiaohongshu],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("every selected platform must have a runner"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "invalid local draft: declare exactly one local runner for every selected platform"
+        );
+    }
+
+    #[test]
+    fn local_runner_mapping_rejects_duplicate_platform_before_dispatch() {
+        let error = match super::local_runner_registry(
+            &[
+                "dy=tcp:127.0.0.1:39001".into(),
+                "dy=tcp:127.0.0.1:39002".into(),
+            ],
+            &[Platform::Douyin],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a target may only map to one runner"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "invalid local draft: declare each selected platform at most once"
+        );
+    }
+
+    #[test]
+    fn local_runner_mapping_accepts_complete_multi_target_loopback_declarations() {
+        let registry = super::local_runner_registry(
+            &[
+                "dy=tcp:127.0.0.1:39001".into(),
+                "xhs=tcp:127.0.0.1:39002".into(),
+            ],
+            &[Platform::Douyin, Platform::Xiaohongshu],
+        )
+        .expect("complete local runner mapping");
+
+        assert_eq!(
+            registry.availability(Platform::Douyin),
+            ProviderAvailability::Available
+        );
+        assert_eq!(
+            registry.availability(Platform::Xiaohongshu),
+            ProviderAvailability::Available
+        );
+    }
+
+    #[test]
+    fn local_runner_dispatch_rejects_schedules_before_runner_transport() {
+        let error = service()
+            .dispatch_to_local_runner(local_runner_input(
+                vec!["dy=tcp:127.0.0.1:39001"],
+                Some("2030-01-02 03:04:05"),
+            ))
+            .expect_err("direct dispatch cannot be scheduled");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid local draft: scheduled dispatch is not available; save a local draft instead"
+        );
+    }
+
+    #[test]
+    fn local_runner_dispatch_reports_unavailable_runner_without_sensitive_details() {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(Box::new(UnavailableLocalRunner))
+            .expect("registered unavailable local runner");
+        let report = super::local_runner_dispatch_report(&registry, &direct_runner_request())
+            .expect("unavailable local runner is reported without transport");
+
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].platform, "dy");
+        assert_eq!(report.outcomes[0].state, "runner_unavailable");
+        assert_eq!(
+            report.outcomes[0].reason,
+            "the declared local runner is unavailable for this platform"
+        );
+        assert!(!report.remote_publish_confirmed);
+        let rendered = format!("{report:?}");
+        assert!(!rendered.contains("private runner endpoint"));
+    }
+
+    #[test]
+    fn local_runner_rejection_projection_is_safe_and_never_confirms_remote_publication() {
+        let outcome = super::local_runner_dispatch_outcome(
+            Platform::Douyin,
+            DispatchOutcome::Rejected {
+                reason: "private runner response".into(),
+            },
+        );
+
+        assert_eq!(outcome.platform, "dy");
+        assert_eq!(outcome.state, "runner_rejected");
+        assert_eq!(
+            outcome.reason,
+            "the local runner did not accept this request"
+        );
+        assert!(!outcome.reason.contains("private runner response"));
+    }
+
+    #[test]
+    fn local_runner_input_rejects_unknown_fields() {
+        let input = [("unexpected", "not accepted")]
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    StringDeserializer::<ValueError>::new(key.to_owned()),
+                    StringDeserializer::<ValueError>::new(value.to_owned()),
+                )
+            });
+        let error = DispatchToLocalRunnerInput::deserialize(MapDeserializer::new(input))
+            .expect_err("unknown IPC input must fail");
+
+        assert!(error.to_string().contains("unknown field `unexpected`"));
     }
 
     #[test]

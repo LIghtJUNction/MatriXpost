@@ -51,6 +51,37 @@
         </form>
       </section>
 
+      <section aria-labelledby="local-runner-title" class="local-runner-workbench">
+        <h2 id="local-runner-title">Send once to a local runner</h2>
+        <p class="hint">This workbench requires a separately started <code>matrixpost-webdriver-runner</code> on this computer, attached to a browser you have manually logged into. MatriXpost does not start the runner or browser, store credentials, or confirm remote platform publication.</p>
+        <form id="local-runner-form">
+          <label>
+            Title
+            <input name="title" required maxlength="120" autocomplete="off" />
+          </label>
+          <label>
+            Media path
+            <input name="mediaPath" required autocomplete="off" placeholder="/path/to/video.mp4" />
+          </label>
+          <fieldset>
+            <legend>Targets</legend>
+            <div id="local-runner-target-options" class="targets"></div>
+          </fieldset>
+          <label>
+            Local runner declarations
+            <textarea name="providerRunners" required rows="4" spellcheck="false" placeholder="dy=tcp:127.0.0.1:39001&#10;xhs=tcp:127.0.0.1:39002" aria-describedby="local-runner-help"></textarea>
+          </label>
+          <p id="local-runner-help" class="hint">Enter one declaration per selected platform in <code>PLATFORM=tcp:127.0.0.1:PORT</code> form. Declarations are used only for this submission and are never saved.</p>
+          <label class="checkbox-label">
+            <input name="confirmed" type="checkbox" required />
+            I confirm that these are my manually started local runners and that this is an immediate one-shot request.
+          </label>
+          <button type="submit">Send to local runner</button>
+          <p id="local-runner-result" role="status" aria-live="polite"></p>
+        </form>
+        <ul id="local-runner-outcomes" class="accounts" aria-live="polite" aria-label="Local runner dispatch outcomes"></ul>
+      </section>
+
       <section aria-labelledby="accounts-title">
         <h2 id="accounts-title">Local video accounts</h2>
         <p class="hint">Save only display and routing metadata. The routing fields are required by the local account model, but this application never stores passwords, cookies, tokens, or session data.</p>

@@ -5,6 +5,9 @@ const targets = document.querySelector("#target-options");
 const summary = document.querySelector("#summary");
 const accounts = document.querySelector("#accounts");
 const result = document.querySelector("#draft-result");
+const localRunnerTargets = document.querySelector("#local-runner-target-options");
+const localRunnerResult = document.querySelector("#local-runner-result");
+const localRunnerOutcomes = document.querySelector("#local-runner-outcomes");
 const accountResult = document.querySelector("#account-result");
 const articleAccounts = document.querySelector("#article-accounts");
 const articleAccountResult = document.querySelector("#article-account-result");
@@ -52,6 +55,17 @@ function renderSnapshot(snapshot) {
   }));
 
   targets.replaceChildren(...snapshot.platforms.map((platform, index) => {
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.name = "targets";
+    checkbox.value = platform.code;
+    checkbox.checked = index === 0;
+    label.append(checkbox, ` ${platformLabel(platform)}`);
+    return label;
+  }));
+
+  localRunnerTargets.replaceChildren(...snapshot.platforms.map((platform, index) => {
     const label = document.createElement("label");
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
@@ -118,6 +132,19 @@ function renderHistory(entries) {
     empty.textContent = "No local history matches these filters.";
     history.append(empty);
   }
+}
+
+function renderLocalRunnerOutcomes(outcomes) {
+  localRunnerOutcomes.replaceChildren(...outcomes.map((outcome) => {
+    const item = document.createElement("li");
+    item.className = "account";
+    const title = document.createElement("strong");
+    title.textContent = `${outcome.platform} · ${outcome.state}`;
+    const details = document.createElement("span");
+    details.textContent = outcome.reason;
+    item.append(title, details);
+    return item;
+  }));
 }
 
 async function refreshHistory() {
@@ -342,6 +369,38 @@ document.querySelector("#draft-form").addEventListener("submit", async (event) =
     await refresh();
   } catch (error) {
     result.textContent = `Draft was not saved: ${String(error)}`;
+  }
+});
+
+document.querySelector("#local-runner-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const providerRunners = String(form.get("providerRunners") || "")
+    .split(/\r?\n/)
+    .map((runner) => runner.trim())
+    .filter(Boolean);
+  if (form.get("confirmed") !== "on") {
+    localRunnerResult.textContent = "Confirm the immediate local runner request before sending.";
+    return;
+  }
+  try {
+    const report = await invoke("dispatch_to_local_runner", {
+      input: {
+        title: form.get("title"),
+        mediaPath: form.get("mediaPath"),
+        targets: form.getAll("targets"),
+        scheduledAt: null,
+        providerRunners,
+        confirmed: true,
+      },
+    });
+    renderLocalRunnerOutcomes(report.outcomes);
+    localRunnerResult.textContent = report.remotePublishConfirmed
+      ? "Unexpected remote confirmation state."
+      : "Local runner outcomes recorded. Remote platform publication is not confirmed.";
+  } catch (error) {
+    localRunnerOutcomes.replaceChildren();
+    localRunnerResult.textContent = `Local runner request was not sent: ${String(error)}`;
   }
 });
 
