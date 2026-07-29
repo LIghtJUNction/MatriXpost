@@ -728,6 +728,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
                 "Fanqie Video does not support draft publication in the local runner".into(),
             );
         }
+        if platform == Platform::Kuaishou && request.draft {
+            return Err("Kuaishou does not support draft publication in the local runner".into());
+        }
         let creative_statement = match platform {
             Platform::WechatChannels => wechat_creative_statement_label(request),
             Platform::Douyin => douyin_autonomous_statement_label(request),
@@ -742,16 +745,20 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
         let outcome: Result<(), String> = (|| {
             self.navigate(&session, profile.upload_url)?;
             self.input(&session, profile.file, file)?;
-            self.input(&session, profile.title, Self::title(platform, request))?;
-            if platform == Platform::WechatChannels
-                && let (Some(selectors), Some(short_title)) =
-                    (profile.short_title, Self::short_title(platform, request))
-            {
-                self.input(&session, selectors, short_title)?;
-            }
-            let description = Self::description(platform, request);
-            if !description.is_empty() {
-                self.input(&session, profile.description, &description)?;
+            if platform == Platform::Kuaishou {
+                self.input_kuaishou_metadata(&session, request)?;
+            } else {
+                self.input(&session, profile.title, Self::title(platform, request))?;
+                if platform == Platform::WechatChannels
+                    && let (Some(selectors), Some(short_title)) =
+                        (profile.short_title, Self::short_title(platform, request))
+                {
+                    self.input(&session, selectors, short_title)?;
+                }
+                let description = Self::description(platform, request);
+                if !description.is_empty() {
+                    self.input(&session, profile.description, &description)?;
+                }
             }
             if let Some(product_id) = wechat_product.as_deref() {
                 self.attach_wechat_product(&session, product_id)?;
@@ -797,6 +804,8 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
                     self.publish_baijiahao_action(&session, request.draft)?;
                 } else if platform == Platform::Toutiao {
                     self.publish_toutiao_footer(&session, request.draft)?;
+                } else if platform == Platform::Kuaishou {
+                    self.publish_kuaishou_action(&session)?;
                 } else {
                     let action = if request.draft {
                         profile.draft
