@@ -278,7 +278,9 @@ declarations after confirmation.
   permits only IPv4/IPv6 loopback, which retains the daemon API and local
   runner endpoints while preventing external network access. Use the documented
   example configuration only as a starting point and keep it credential-free.
-  The recipe is checksum-pinned, but it has not been uploaded to AUR yet.
+  The checksum-pinned recipe has been uploaded to the AUR Git repository;
+  confirm the AUR package page has indexed the upload before treating it as
+  installable through an AUR helper.
 - **Cargo:** `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and
   `matrixpost-mcp` are published public crates on
   [crates.io](https://crates.io/). Use the registry entries or the
