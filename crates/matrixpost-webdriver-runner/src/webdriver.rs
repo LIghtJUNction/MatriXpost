@@ -18,6 +18,7 @@ mod douyin;
 mod fanqie;
 mod kuaishou;
 mod toutiao;
+mod wechat;
 mod xiaohongshu;
 pub(crate) trait WebDriverTransport: Send + Sync {
     fn request(&self, method: &str, path: &str, body: Value) -> Result<Value, String>;
@@ -773,6 +774,7 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             }
             if platform == Platform::WechatChannels {
                 self.try_declare_wechat_original(&session)?;
+                self.wait_for_wechat_upload_ready(&session)?;
             }
             if platform == Platform::Xiaohongshu {
                 self.normalize_xiaohongshu_pk_cover(&session)?;

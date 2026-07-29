@@ -50,6 +50,10 @@ pub(crate) const FANQIE_REVIEW_STATUS_SCRIPT: &str = r#"const n=v=>String(v||'')
 /// waits for unbounded UI activity in an attached user browser.
 pub(crate) const WECHAT_SHADOW_ACTION_POLL_ATTEMPTS: usize = 30;
 pub(crate) const WECHAT_SHADOW_ACTION_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Video Channels may transcode after the form fields are filled. Keep the
+/// upstream thirty-second upload-processing window separate from metadata UI.
+pub(crate) const WECHAT_UPLOAD_READY_POLL_ATTEMPTS: usize = 150;
+pub(crate) const WECHAT_UPLOAD_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Autonomous-statement interactions are bounded independently from generic
 /// publish acknowledgement. A visible but incomplete declaration must never
 /// be followed by a submit action.
@@ -430,6 +434,9 @@ pub(crate) const WECHAT_PRODUCT_ATTACHED_SCRIPT: &str = r#"const root=document.q
 /// boolean. They never expose page content to the runner.
 pub(crate) const WECHAT_CREATIVE_STATEMENT_OPEN_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const trigger=root?.querySelector('.post-with-mark-tag .select-display');if(!trigger)return false;trigger.click();return true;"#;
 pub(crate) const WECHAT_CREATIVE_STATEMENT_SELECT_SCRIPT: &str = r#"const expected=arguments[0];const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const option=Array.from(root?.querySelectorAll('.post-with-mark-tag .mark-tag-option')||[]).find(item=>String(item.querySelector('.option-main')?.textContent||'').trim()===expected);if(!option)return false;option.click();return true;"#;
+/// Classify only the upload-processing control inside Video Channels' shadow
+/// root. It intentionally returns a finite state token, never page text.
+pub(crate) const WECHAT_UPLOAD_READY_STATE_SCRIPT: &str = r#"const app=document.querySelector('wujie-app.wujie_iframe'),root=app?.shadowRoot;if(!root)return'invalid';const visible=item=>{const style=getComputedStyle(item),rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},tags=Array.from(root.querySelectorAll('.tag-inner')).filter(visible);if(tags.length>1)return'ambiguous';return tags.length===1&&String(tags[0].textContent||'').replace(/\s+/g,'').trim()==='删除'?'ready':'pending';"#;
 /// Original-declaration scripts deliberately return only whether each local
 /// page action is available or completed. The declaration itself is attempted
 /// only for an explicit WeChat publication request.

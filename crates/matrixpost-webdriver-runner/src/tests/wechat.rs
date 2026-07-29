@@ -15,6 +15,7 @@ fn wechat_publish_without_metadata_skips_unavailable_original_declaration() {
         element("description"),
         value(json!(null)),
         value(json!(false)),
+        value(json!("ready")),
         Err("not visible".into()),
         Err("not visible".into()),
         element("submit"),
@@ -34,7 +35,14 @@ fn wechat_publish_without_metadata_skips_unavailable_original_declaration() {
         .iter()
         .filter_map(|body| body.get("script").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    assert_eq!(scripts, vec![WECHAT_ORIGINAL_ENTRY_SCRIPT, VISIBLE_SCRIPT]);
+    assert_eq!(
+        scripts,
+        vec![
+            WECHAT_ORIGINAL_ENTRY_SCRIPT,
+            WECHAT_UPLOAD_READY_STATE_SCRIPT,
+            VISIBLE_SCRIPT,
+        ]
+    );
     assert!(!bodies.iter().any(|body| {
         body.get("value")
             == Some(&Value::String(
@@ -83,6 +91,7 @@ fn wechat_product_link_runs_shadow_root_protocol_and_closes_session() {
         value(json!(true)),
         value(json!(true)),
         value(json!(false)),
+        value(json!("ready")),
         Err("not visible".into()),
         Err("not visible".into()),
         element("submit"),
@@ -176,6 +185,7 @@ fn wechat_short_title_uses_its_explicit_profile_selector() {
         element("description"),
         value(json!(null)),
         value(json!(false)),
+        value(json!("ready")),
         Err("not visible".into()),
         Err("not visible".into()),
         element("submit"),
@@ -223,6 +233,7 @@ fn wechat_creative_statement_uses_label_without_leaking_raw_value_to_description
         value(json!(true)),
         value(json!(true)),
         value(json!(false)),
+        value(json!("ready")),
         Err("not visible".into()),
         Err("not visible".into()),
         element("submit"),
@@ -274,6 +285,7 @@ fn wechat_none_or_unknown_creative_statement_skips_metadata_actions() {
             element("description"),
             value(json!(null)),
             value(json!(false)),
+            value(json!("ready")),
             Err("not visible".into()),
             Err("not visible".into()),
             element("submit"),
@@ -334,6 +346,7 @@ fn wechat_original_protocol_then_declaration_confirms_before_submit() {
         value(json!(true)),
         value(json!(true)),
         value(json!(true)),
+        value(json!("ready")),
         Err("not visible".into()),
         Err("not visible".into()),
         element("submit"),
@@ -396,6 +409,7 @@ fn wechat_original_protocol_without_declaration_dialog_continues_to_publish() {
     ];
     replies.extend((0..WECHAT_SHADOW_ACTION_POLL_ATTEMPTS).map(|_| value(json!(false))));
     replies.extend([
+        value(json!("ready")),
         Err("not visible".into()),
         Err("not visible".into()),
         element("submit"),
@@ -592,6 +606,10 @@ fn wechat_shadow_action_deadline_is_fixed_and_finite() {
     );
     assert!(WECHAT_ORIGINAL_PROTOCOL_CONFIRM_SCRIPT.contains("button.disabled"));
     assert!(WECHAT_ORIGINAL_CONFIRM_SCRIPT.contains("button.disabled"));
+    assert_eq!(
+        (WECHAT_UPLOAD_READY_POLL_ATTEMPTS as u128) * WECHAT_UPLOAD_READY_POLL_INTERVAL.as_millis(),
+        std::time::Duration::from_secs(30).as_millis()
+    );
 }
 
 #[test]
@@ -653,4 +671,173 @@ fn wechat_product_failure_still_closes_the_temporary_session() {
             .unwrap()
             .ends_with("/session/s")
     );
+}
+
+fn wechat_field_replies() -> Vec<Result<Value, String>> {
+    vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+    ]
+}
+
+fn wechat_success_replies() -> [Result<Value, String>; 6] {
+    [
+        Err("not visible".into()),
+        Err("not visible".into()),
+        element("submit"),
+        value(json!(null)),
+        element("success"),
+        value(json!(true)),
+    ]
+}
+
+fn assert_wechat_failed_before_final_action(publisher: &WebDriverPublisher<MockWebDriver>) {
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert!(
+        !bodies.iter().any(|body| {
+            body.get("value") == Some(&Value::String("button[type='submit']".into()))
+        })
+    );
+    drop(bodies);
+    let paths = publisher.transport.paths.lock().unwrap();
+    assert!(
+        paths
+            .last()
+            .is_some_and(|path| path.ends_with("/session/s"))
+    );
+    assert!(!paths.iter().any(|path| path.ends_with("/click")));
+}
+
+#[test]
+fn wechat_upload_pending_then_ready_precedes_the_final_action() {
+    let mut replies = wechat_field_replies();
+    replies.extend([
+        value(json!(false)),
+        value(json!("pending")),
+        value(json!("ready")),
+    ]);
+    replies.extend(wechat_success_replies());
+    replies.push(value(json!(null)));
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    publisher
+        .publish(Platform::WechatChannels, &request())
+        .unwrap();
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    let ready = bodies
+        .iter()
+        .rposition(|body| {
+            body.get("script") == Some(&Value::String(WECHAT_UPLOAD_READY_STATE_SCRIPT.into()))
+        })
+        .unwrap();
+    let submit = bodies
+        .iter()
+        .position(|body| body.get("value") == Some(&Value::String("button[type='submit']".into())))
+        .unwrap();
+    assert!(ready < submit);
+}
+
+#[test]
+fn wechat_permanently_pending_upload_uses_the_complete_bounded_poll_budget() {
+    let mut replies = wechat_field_replies();
+    replies.push(value(json!(false)));
+    replies.extend((0..WECHAT_UPLOAD_READY_POLL_ATTEMPTS).map(|_| value(json!("pending"))));
+    replies.push(value(json!(null)));
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    assert!(
+        publisher
+            .publish(Platform::WechatChannels, &request())
+            .is_err()
+    );
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|body| {
+                body.get("script") == Some(&Value::String(WECHAT_UPLOAD_READY_STATE_SCRIPT.into()))
+            })
+            .count(),
+        WECHAT_UPLOAD_READY_POLL_ATTEMPTS
+    );
+    drop(bodies);
+    assert_wechat_failed_before_final_action(&publisher);
+}
+
+#[test]
+fn wechat_ambiguous_upload_fails_closed_before_final_action() {
+    let mut replies = wechat_field_replies();
+    replies.extend([
+        value(json!(false)),
+        value(json!("ambiguous")),
+        value(json!(null)),
+    ]);
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    assert!(
+        publisher
+            .publish(Platform::WechatChannels, &request())
+            .is_err()
+    );
+    assert_wechat_failed_before_final_action(&publisher);
+}
+
+#[test]
+fn wechat_metadata_and_original_declaration_complete_before_upload_readiness() {
+    let mut replies = wechat_field_replies();
+    replies.extend([
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!("ready")),
+    ]);
+    replies.extend(wechat_success_replies());
+    replies.push(value(json!(null)));
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    let mut request = request();
+    request.overrides.push(PlatformOverride {
+        platform: Platform::WechatChannels,
+        title: None,
+        short_title: None,
+        tags: None,
+        creative_statement: Some("marketing".into()),
+        account: None,
+        wechat_link: None,
+    });
+    publisher
+        .publish(Platform::WechatChannels, &request)
+        .unwrap();
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    let metadata = bodies
+        .iter()
+        .position(|body| {
+            body.get("script")
+                == Some(&Value::String(
+                    WECHAT_CREATIVE_STATEMENT_SELECT_SCRIPT.into(),
+                ))
+        })
+        .unwrap();
+    let original = bodies
+        .iter()
+        .position(|body| {
+            body.get("script") == Some(&Value::String(WECHAT_ORIGINAL_CONFIRM_SCRIPT.into()))
+        })
+        .unwrap();
+    let readiness = bodies
+        .iter()
+        .position(|body| {
+            body.get("script") == Some(&Value::String(WECHAT_UPLOAD_READY_STATE_SCRIPT.into()))
+        })
+        .unwrap();
+    assert!(metadata < original && original < readiness);
 }
