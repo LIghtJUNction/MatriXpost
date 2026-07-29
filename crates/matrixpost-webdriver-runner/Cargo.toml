@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 axum.workspace = true
 clap.workspace = true
-matrixpost-core = { version = "0.2.0", path = "../matrixpost-core" }
+matrixpost-core = { version = "0.3.0", path = "../matrixpost-core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

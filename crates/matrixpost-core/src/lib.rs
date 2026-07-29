@@ -985,6 +985,22 @@ pub struct ContentAttribution {
     pub created_at: DateTime<Utc>,
 }
 
+/// An immutable, directed link between two generic business objects.
+///
+/// `relation_type` is caller-defined, allowing applications to model links
+/// such as an asset's customer interest or a supplier's service without
+/// hard-coding any vertical-specific relationship. Attribute keys follow the
+/// same credential-safe policy as [`BusinessObject`] attributes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BusinessRelation {
+    pub id: String,
+    pub source_business_object_id: String,
+    pub target_business_object_id: String,
+    pub relation_type: String,
+    pub attributes: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// The publication states accepted by the upstream history query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HistoryStatus {
@@ -1160,6 +1176,17 @@ pub trait LifecycleRepository: Send + Sync {
         &self,
         business_object_id: &str,
     ) -> Result<Vec<ContentAttribution>, DomainError>;
+    /// Inserts an immutable directed relation between two existing objects.
+    fn insert_business_relation(&self, relation: &BusinessRelation) -> Result<(), DomainError>;
+    /// Lists both incoming and outgoing relations for an existing object.
+    ///
+    /// Returns [`DomainError::UnknownBusinessObject`] when the requested
+    /// object does not exist; an empty result therefore means that an existing
+    /// object has no relations.
+    fn business_relations(
+        &self,
+        business_object_id: &str,
+    ) -> Result<Vec<BusinessRelation>, DomainError>;
 }
 
 /// Queue semantics separated from persistence so schedulers are replaceable.
@@ -1220,6 +1247,16 @@ impl SqliteRepository {
             .map_err(DomainError::database)?;
         if !version_five {
             connection.execute_batch("BEGIN; CREATE TABLE business_objects (id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, external_id TEXT, display_name TEXT NOT NULL, lifecycle_status TEXT NOT NULL, approval_status TEXT NOT NULL, revision INTEGER NOT NULL, attributes_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE UNIQUE INDEX business_objects_kind_external_id_unique ON business_objects(kind, external_id) WHERE external_id IS NOT NULL; CREATE TABLE ledger_entries (id TEXT PRIMARY KEY NOT NULL, business_object_id TEXT NOT NULL REFERENCES business_objects(id), direction TEXT NOT NULL, category TEXT NOT NULL, amount_minor INTEGER NOT NULL, currency TEXT NOT NULL, occurred_at TEXT NOT NULL, approval_status TEXT NOT NULL, counterparty TEXT, reference TEXT, description TEXT, created_at TEXT NOT NULL); CREATE TABLE content_attributions (business_object_id TEXT NOT NULL REFERENCES business_objects(id), history_id TEXT NOT NULL REFERENCES history(id), created_at TEXT NOT NULL, PRIMARY KEY(business_object_id, history_id)); INSERT INTO schema_migrations(version) VALUES (5); COMMIT;").map_err(DomainError::database)?;
+        }
+        let version_six: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if !version_six {
+            connection.execute_batch("BEGIN; CREATE TABLE business_relations (id TEXT PRIMARY KEY NOT NULL, source_business_object_id TEXT NOT NULL REFERENCES business_objects(id), target_business_object_id TEXT NOT NULL REFERENCES business_objects(id), relation_type TEXT NOT NULL, attributes_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(source_business_object_id, target_business_object_id, relation_type)); INSERT INTO schema_migrations(version) VALUES (6); COMMIT;").map_err(DomainError::database)?;
         }
         Ok(())
     }
@@ -1632,6 +1669,69 @@ impl LifecycleRepository for SqliteRepository {
             .map_err(DomainError::database)?;
         statement
             .query_map([business_object_id], row_to_content_attribution)
+            .map_err(DomainError::database)?
+            .map(|row| row.map_err(DomainError::database)?)
+            .collect()
+    }
+
+    fn insert_business_relation(&self, relation: &BusinessRelation) -> Result<(), DomainError> {
+        validate_business_relation(relation)?;
+        let connection = self.locked()?;
+        if !business_object_exists(&connection, &relation.source_business_object_id)? {
+            return Err(DomainError::UnknownBusinessObject(
+                relation.source_business_object_id.clone(),
+            ));
+        }
+        if !business_object_exists(&connection, &relation.target_business_object_id)? {
+            return Err(DomainError::UnknownBusinessObject(
+                relation.target_business_object_id.clone(),
+            ));
+        }
+        let duplicate_id: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM business_relations WHERE id=?1)",
+                [&relation.id],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if duplicate_id {
+            return Err(DomainError::DuplicateBusinessRelationId(
+                relation.id.clone(),
+            ));
+        }
+        let duplicate_pair: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM business_relations WHERE source_business_object_id=?1 AND target_business_object_id=?2 AND relation_type=?3)",
+                params![relation.source_business_object_id, relation.target_business_object_id, relation.relation_type],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if duplicate_pair {
+            return Err(DomainError::DuplicateBusinessRelation {
+                source_business_object_id: relation.source_business_object_id.clone(),
+                target_business_object_id: relation.target_business_object_id.clone(),
+                relation_type: relation.relation_type.clone(),
+            });
+        }
+        connection.execute("INSERT INTO business_relations(id, source_business_object_id, target_business_object_id, relation_type, attributes_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![relation.id, relation.source_business_object_id, relation.target_business_object_id, relation.relation_type, json(&relation.attributes)?, relation.created_at.to_rfc3339()]).map_err(DomainError::database)?;
+        Ok(())
+    }
+
+    fn business_relations(
+        &self,
+        business_object_id: &str,
+    ) -> Result<Vec<BusinessRelation>, DomainError> {
+        let connection = self.locked()?;
+        if !business_object_exists(&connection, business_object_id)? {
+            return Err(DomainError::UnknownBusinessObject(
+                business_object_id.to_owned(),
+            ));
+        }
+        let mut statement = connection
+            .prepare("SELECT id, source_business_object_id, target_business_object_id, relation_type, attributes_json, created_at FROM business_relations WHERE source_business_object_id=?1 OR target_business_object_id=?1 ORDER BY created_at, id")
+            .map_err(DomainError::database)?;
+        statement
+            .query_map([business_object_id], row_to_business_relation)
             .map_err(DomainError::database)?
             .map(|row| row.map_err(DomainError::database)?)
             .collect()
@@ -2815,6 +2915,27 @@ fn row_to_content_attribution(
     )
 }
 
+fn row_to_business_relation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<BusinessRelation, DomainError>> {
+    let id = row.get::<_, String>(0)?;
+    let source_business_object_id = row.get::<_, String>(1)?;
+    let target_business_object_id = row.get::<_, String>(2)?;
+    let relation_type = row.get::<_, String>(3)?;
+    let attributes = row.get::<_, String>(4)?;
+    let created_at = row.get::<_, String>(5)?;
+    Ok((|| {
+        Ok(BusinessRelation {
+            id,
+            source_business_object_id,
+            target_business_object_id,
+            relation_type,
+            attributes: from_json(&attributes)?,
+            created_at: parse_time(&created_at)?,
+        })
+    })())
+}
+
 fn validate_business_object(object: &BusinessObject) -> Result<(), DomainError> {
     validate_non_empty("business object id", &object.id)?;
     validate_non_empty("business object kind", &object.kind)?;
@@ -2866,6 +2987,46 @@ fn validate_ledger_entry(entry: &LedgerEntry) -> Result<(), DomainError> {
     ] {
         if let Some(value) = value {
             validate_non_empty(name, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_business_relation(relation: &BusinessRelation) -> Result<(), DomainError> {
+    validate_non_empty("business relation id", &relation.id)?;
+    validate_non_empty(
+        "business relation source business object id",
+        &relation.source_business_object_id,
+    )?;
+    validate_non_empty(
+        "business relation target business object id",
+        &relation.target_business_object_id,
+    )?;
+    validate_non_empty("business relation type", &relation.relation_type)?;
+    if relation.source_business_object_id == relation.target_business_object_id {
+        return Err(DomainError::BusinessRelationSelfReference(
+            relation.source_business_object_id.clone(),
+        ));
+    }
+    for (key, value) in &relation.attributes {
+        if key.trim().is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(DomainError::InvalidBusinessRelationAttributeKey(
+                key.clone(),
+            ));
+        }
+        if contains_credential_like_term(key) {
+            return Err(DomainError::SensitiveBusinessRelationAttributeKey(
+                key.clone(),
+            ));
+        }
+        if value.trim().is_empty() {
+            return Err(DomainError::InvalidBusinessRelationAttributeValue(
+                key.clone(),
+            ));
         }
     }
     Ok(())
@@ -3003,6 +3164,24 @@ pub enum DomainError {
     BusinessObjectRevisionOverflow(String),
     #[error("ledger entry already exists: {0}")]
     DuplicateLedgerEntryId(String),
+    #[error("business relation already exists: {0}")]
+    DuplicateBusinessRelationId(String),
+    #[error(
+        "business relation already exists from {source_business_object_id} to {target_business_object_id} with type {relation_type}"
+    )]
+    DuplicateBusinessRelation {
+        source_business_object_id: String,
+        target_business_object_id: String,
+        relation_type: String,
+    },
+    #[error("business relation cannot reference itself: {0}")]
+    BusinessRelationSelfReference(String),
+    #[error("business relation attribute key is invalid: {0}")]
+    InvalidBusinessRelationAttributeKey(String),
+    #[error("business relation attribute key is sensitive and must not be stored: {0}")]
+    SensitiveBusinessRelationAttributeKey(String),
+    #[error("business relation attribute value must not be empty: {0}")]
+    InvalidBusinessRelationAttributeValue(String),
     #[error("unknown publication history record: {0}")]
     UnknownHistoryRecord(String),
     #[error(
@@ -3602,6 +3781,22 @@ mod tests {
         }
     }
 
+    fn business_relation(
+        id: &str,
+        source_business_object_id: &str,
+        target_business_object_id: &str,
+        relation_type: &str,
+    ) -> BusinessRelation {
+        BusinessRelation {
+            id: id.into(),
+            source_business_object_id: source_business_object_id.into(),
+            target_business_object_id: target_business_object_id.into(),
+            relation_type: relation_type.into(),
+            attributes: BTreeMap::from([("source".into(), "manual".into())]),
+            created_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn lifecycle_repository_round_trips_an_object_ledger_and_content_attribution() {
         let repository = SqliteRepository::in_memory().unwrap();
@@ -3903,6 +4098,177 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            repository
+                .business_relations("empty-object")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_round_trips_directed_business_relations() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        repository
+            .insert_business_object(&business_object("asset-1", "asset", None))
+            .unwrap();
+        repository
+            .insert_business_object(&business_object("customer-1", "customer", None))
+            .unwrap();
+        let relation =
+            business_relation("relation-1", "asset-1", "customer-1", "customer_interest");
+
+        repository.insert_business_relation(&relation).unwrap();
+
+        assert_eq!(
+            repository.business_relations("asset-1").unwrap(),
+            vec![relation.clone()]
+        );
+        assert_eq!(
+            repository.business_relations("customer-1").unwrap(),
+            vec![relation]
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_invalid_or_duplicate_business_relations() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        repository
+            .insert_business_object(&business_object("source", "asset", None))
+            .unwrap();
+        repository
+            .insert_business_object(&business_object("target", "customer", None))
+            .unwrap();
+
+        let mut empty_id = business_relation("relation", "source", "target", "owner");
+        empty_id.id = " ".into();
+        assert_eq!(
+            repository.insert_business_relation(&empty_id),
+            Err(DomainError::EmptyLifecycleField("business relation id"))
+        );
+        let mut empty_source = business_relation("empty-source", "source", "target", "owner");
+        empty_source.source_business_object_id = " ".into();
+        assert_eq!(
+            repository.insert_business_relation(&empty_source),
+            Err(DomainError::EmptyLifecycleField(
+                "business relation source business object id"
+            ))
+        );
+        let mut empty_target = business_relation("empty-target", "source", "target", "owner");
+        empty_target.target_business_object_id = " ".into();
+        assert_eq!(
+            repository.insert_business_relation(&empty_target),
+            Err(DomainError::EmptyLifecycleField(
+                "business relation target business object id"
+            ))
+        );
+        let mut empty_type = business_relation("empty-type", "source", "target", "owner");
+        empty_type.relation_type = " ".into();
+        assert_eq!(
+            repository.insert_business_relation(&empty_type),
+            Err(DomainError::EmptyLifecycleField("business relation type"))
+        );
+
+        assert_eq!(
+            repository
+                .insert_business_relation(&business_relation("self", "source", "source", "owner")),
+            Err(DomainError::BusinessRelationSelfReference("source".into()))
+        );
+        assert_eq!(
+            repository.insert_business_relation(&business_relation(
+                "missing-source",
+                "missing",
+                "target",
+                "owner"
+            )),
+            Err(DomainError::UnknownBusinessObject("missing".into()))
+        );
+        assert_eq!(
+            repository.insert_business_relation(&business_relation(
+                "missing-target",
+                "source",
+                "missing",
+                "owner"
+            )),
+            Err(DomainError::UnknownBusinessObject("missing".into()))
+        );
+
+        let relation = business_relation("relation-1", "source", "target", "owner");
+        repository.insert_business_relation(&relation).unwrap();
+        assert_eq!(
+            repository.insert_business_relation(&relation),
+            Err(DomainError::DuplicateBusinessRelationId(
+                "relation-1".into()
+            ))
+        );
+        assert_eq!(
+            repository.insert_business_relation(&business_relation(
+                "relation-2",
+                "source",
+                "target",
+                "owner"
+            )),
+            Err(DomainError::DuplicateBusinessRelation {
+                source_business_object_id: "source".into(),
+                target_business_object_id: "target".into(),
+                relation_type: "owner".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_invalid_and_sensitive_relation_attributes() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        repository
+            .insert_business_object(&business_object("source", "asset", None))
+            .unwrap();
+        repository
+            .insert_business_object(&business_object("target", "customer", None))
+            .unwrap();
+
+        let mut invalid_key = business_relation("invalid-key", "source", "target", "owner");
+        invalid_key.attributes = BTreeMap::from([("invalid key".into(), "value".into())]);
+        assert_eq!(
+            repository.insert_business_relation(&invalid_key),
+            Err(DomainError::InvalidBusinessRelationAttributeKey(
+                "invalid key".into()
+            ))
+        );
+
+        let mut sensitive_key = business_relation("sensitive-key", "source", "target", "owner");
+        sensitive_key.attributes = BTreeMap::from([("TOKEN".into(), "value".into())]);
+        assert_eq!(
+            repository.insert_business_relation(&sensitive_key),
+            Err(DomainError::SensitiveBusinessRelationAttributeKey(
+                "TOKEN".into()
+            ))
+        );
+
+        let mut empty_value = business_relation("empty-value", "source", "target", "owner");
+        empty_value.attributes = BTreeMap::from([("notes".into(), " ".into())]);
+        assert_eq!(
+            repository.insert_business_relation(&empty_value),
+            Err(DomainError::InvalidBusinessRelationAttributeValue(
+                "notes".into()
+            ))
+        );
+
+        let mut generic_value = business_relation("generic-value", "source", "target", "reference");
+        generic_value.attributes = BTreeMap::from([(
+            "notes".into(),
+            "Explain the token and cookie terms in the customer guide.".into(),
+        )]);
+        assert!(repository.insert_business_relation(&generic_value).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_repository_rejects_relations_for_missing_objects_when_listing() {
+        let repository = SqliteRepository::in_memory().unwrap();
+
+        assert_eq!(
+            repository.business_relations("missing-object"),
+            Err(DomainError::UnknownBusinessObject("missing-object".into()))
+        );
     }
 
     #[test]
@@ -4064,6 +4430,35 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(columns.contains(&"revision".into()));
+    }
+
+    #[test]
+    fn lifecycle_migration_adds_relations_to_a_version_five_database() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations(version) VALUES (2); INSERT INTO schema_migrations(version) VALUES (3); INSERT INTO schema_migrations(version) VALUES (4); CREATE TABLE accounts (id TEXT PRIMARY KEY NOT NULL, platform TEXT NOT NULL, display_name TEXT NOT NULL, status TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '', partition TEXT NOT NULL DEFAULT ''); CREATE TABLE article_accounts (id TEXT PRIMARY KEY NOT NULL, platform TEXT NOT NULL, display_name TEXT NOT NULL, status TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '', partition TEXT NOT NULL DEFAULT ''); CREATE TABLE history (id TEXT PRIMARY KEY NOT NULL, request_json TEXT NOT NULL, state TEXT NOT NULL, recorded_at TEXT NOT NULL, detail TEXT); CREATE TABLE jobs (id TEXT PRIMARY KEY NOT NULL, request_json TEXT NOT NULL, state TEXT NOT NULL, due_at TEXT, revision INTEGER NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE config (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL); CREATE TABLE job_sequence (id INTEGER PRIMARY KEY AUTOINCREMENT); CREATE TABLE business_objects (id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, external_id TEXT, display_name TEXT NOT NULL, lifecycle_status TEXT NOT NULL, approval_status TEXT NOT NULL, revision INTEGER NOT NULL, attributes_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE ledger_entries (id TEXT PRIMARY KEY NOT NULL, business_object_id TEXT NOT NULL REFERENCES business_objects(id), direction TEXT NOT NULL, category TEXT NOT NULL, amount_minor INTEGER NOT NULL, currency TEXT NOT NULL, occurred_at TEXT NOT NULL, approval_status TEXT NOT NULL, counterparty TEXT, reference TEXT, description TEXT, created_at TEXT NOT NULL); CREATE TABLE content_attributions (business_object_id TEXT NOT NULL REFERENCES business_objects(id), history_id TEXT NOT NULL REFERENCES history(id), created_at TEXT NOT NULL, PRIMARY KEY(business_object_id, history_id)); INSERT INTO schema_migrations(version) VALUES (5);",
+            )
+            .unwrap();
+
+        SqliteRepository::migrate(&connection).unwrap();
+
+        let version_six: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(version_six);
+        let relation_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='business_relations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(relation_table_exists);
     }
 
     #[test]

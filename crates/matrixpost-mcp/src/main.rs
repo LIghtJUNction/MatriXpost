@@ -9,9 +9,9 @@ use std::{collections::BTreeMap, ffi::OsStr, path::PathBuf, process::ExitCode, s
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use matrixpost_core::{
     Account, AccountSelection, ApprovalStatus, ArticleAccount, ArticleDispatchOutcome,
-    ArticleRunner, BusinessObject, BusinessObjectStatus, ContentAttribution, DomainError,
-    HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry, LifecycleRepository,
-    LocalSchedule, MediaSource, Platform, PlatformOverride, PublicationQueue,
+    ArticleRunner, BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution,
+    DomainError, HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry,
+    LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformOverride, PublicationQueue,
     PublishArticleRequest, PublishRequest, PublishState, Repository, ScheduledJob,
     SqliteRepository, WechatLink,
 };
@@ -306,6 +306,23 @@ struct AddContentAttributionInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListBusinessRelationsInput {
+    business_object_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AddBusinessRelationInput {
+    id: String,
+    source_business_object_id: String,
+    target_business_object_id: String,
+    relation_type: String,
+    #[schemars(with = "Option<BTreeMap<String, String>>")]
+    attributes: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TransitionBusinessObjectInput {
     id: String,
     expected_revision: u64,
@@ -492,6 +509,32 @@ impl MatrixpostMcp {
     }
 
     #[tool(
+        description = "List incoming and outgoing immutable relations for a generic business object."
+    )]
+    async fn list_business_relations(
+        &self,
+        Parameters(input): Parameters<ListBusinessRelationsInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.list_business_relations_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(
+        description = "Create an immutable directed relation between two existing generic business objects in local MatriXpost state."
+    )]
+    async fn add_business_relation(
+        &self,
+        Parameters(input): Parameters<AddBusinessRelationInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.add_business_relation_result(input) {
+            Ok(result) => structured(result),
+            Err(error) => lifecycle_tool_error(error),
+        })
+    }
+
+    #[tool(
         description = "Transition a generic business object's lifecycle and approval state using optimistic revision control."
     )]
     async fn transition_business_object(
@@ -598,6 +641,30 @@ impl MatrixpostMcp {
         };
         self.repository.insert_content_attribution(&attribution)?;
         Ok(attribution)
+    }
+
+    fn list_business_relations_result(
+        &self,
+        input: ListBusinessRelationsInput,
+    ) -> Result<Vec<BusinessRelation>, DomainError> {
+        self.repository
+            .business_relations(&input.business_object_id)
+    }
+
+    fn add_business_relation_result(
+        &self,
+        input: AddBusinessRelationInput,
+    ) -> Result<BusinessRelation, DomainError> {
+        let relation = BusinessRelation {
+            id: input.id,
+            source_business_object_id: input.source_business_object_id,
+            target_business_object_id: input.target_business_object_id,
+            relation_type: input.relation_type,
+            attributes: input.attributes.unwrap_or_default(),
+            created_at: Utc::now(),
+        };
+        self.repository.insert_business_relation(&relation)?;
+        Ok(relation)
     }
 
     fn transition_business_object_result(
@@ -1530,12 +1597,14 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "add_business_relation",
                 "add_content_attribution",
                 "append_ledger_entry",
                 "create_business_object",
                 "get_business_object",
                 "list_accounts",
                 "list_business_objects",
+                "list_business_relations",
                 "list_content_attributions",
                 "list_history",
                 "list_ledger_entries",
@@ -1612,6 +1681,8 @@ mod tests {
             "append_ledger_entry",
             "list_content_attributions",
             "add_content_attribution",
+            "list_business_relations",
+            "add_business_relation",
             "transition_business_object",
         ] {
             let schema = serde_json::to_value(&router.get(name).unwrap().input_schema).unwrap();
@@ -1873,6 +1944,129 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         assert_eq!(
             result.structured_content,
+            Some(serde_json::json!({
+                "outcome": "rejected",
+                "code": "not_found",
+                "message": "the requested lifecycle record does not exist"
+            }))
+        );
+        disconnect(client, server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_router_creates_and_lists_safe_generic_business_relations() {
+        let service = service();
+        for (id, kind, display_name) in [
+            ("asset-1", "asset", "Asset"),
+            ("customer-1", "customer", "Customer"),
+        ] {
+            service
+                .create_business_object_result(CreateBusinessObjectInput {
+                    id: id.into(),
+                    kind: kind.into(),
+                    display_name: display_name.into(),
+                    external_id: None,
+                    lifecycle_status: None,
+                    approval_status: None,
+                    attributes: None,
+                })
+                .unwrap();
+        }
+        let (client, server_handle) = connect(service).await;
+        let created = client
+            .call_tool(
+                CallToolRequestParams::new("add_business_relation").with_arguments(
+                    serde_json::json!({
+                        "id": "interest-1",
+                        "sourceBusinessObjectId": "asset-1",
+                        "targetBusinessObjectId": "customer-1",
+                        "relationType": "customer_interest",
+                        "attributes": {"priority": "high"}
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.is_error, Some(false));
+        assert_eq!(
+            created.structured_content.as_ref().unwrap()["relation_type"],
+            "customer_interest"
+        );
+        assert_eq!(
+            created.structured_content.as_ref().unwrap()["attributes"]["priority"],
+            "high"
+        );
+
+        let listed = client
+            .call_tool(
+                CallToolRequestParams::new("list_business_relations").with_arguments(
+                    serde_json::json!({"businessObjectId": "customer-1"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.is_error, Some(false));
+        assert_eq!(
+            listed
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            listed.structured_content.as_ref().unwrap()[0]["source_business_object_id"],
+            "asset-1"
+        );
+        disconnect(client, server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_relation_tools_reject_unknown_input_and_missing_objects() {
+        let (client, server_handle) = connect(service()).await;
+        let unknown_field = client
+            .call_tool(
+                CallToolRequestParams::new("list_business_relations").with_arguments(
+                    serde_json::json!({
+                        "businessObjectId": "missing-object",
+                        "unexpected": true
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_field.is_error, Some(true));
+
+        let missing = client
+            .call_tool(
+                CallToolRequestParams::new("add_business_relation").with_arguments(
+                    serde_json::json!({
+                        "id": "interest-missing",
+                        "sourceBusinessObjectId": "missing-source",
+                        "targetBusinessObjectId": "missing-target",
+                        "relationType": "customer_interest"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(
+            missing.structured_content,
             Some(serde_json::json!({
                 "outcome": "rejected",
                 "code": "not_found",

@@ -35,6 +35,20 @@ Treat the returned `revision` as the next transition precondition. Append a cost
 
 Call `list_ledger_entries` with `{"businessObjectId":"asset-001"}`. It returns `not_found` when the object does not exist and an empty list only when the object exists without entries.
 
+Create the target object before adding a relation. For example, create `customer-001` with `create_business_object`, then call `add_business_relation` with camelCase input fields:
+
+```json
+{
+  "id": "relation-001",
+  "sourceBusinessObjectId": "asset-001",
+  "targetBusinessObjectId": "customer-001",
+  "relationType": "customer_interest",
+  "attributes": {"source": "local_inquiry"}
+}
+```
+
+Treat the stored result as a snake_case core record, including `source_business_object_id`, `target_business_object_id`, and `relation_type`. Do not use the same ID for source and target. Call `list_business_relations` with `{"businessObjectId":"asset-001"}` to retrieve both outgoing and incoming links. It returns `not_found` for a missing object and an empty list only for an existing object with no relations.
+
 Call `add_content_attribution` only after a history record exists:
 
 ```json
@@ -77,6 +91,21 @@ matrixpost --state-path ./operations.db lifecycle ledger add \
 
 matrixpost --state-path ./operations.db lifecycle ledger list --object asset-001
 ```
+
+Create the other endpoint before adding a directed relation, then inspect relations from either endpoint:
+
+```sh
+matrixpost --state-path ./operations.db lifecycle object create \
+  --id customer-001 --kind customer --display-name 'Example customer'
+
+matrixpost --state-path ./operations.db lifecycle relation add \
+  --id relation-001 --source asset-001 --target customer-001 \
+  --type customer_interest --attribute source=local_inquiry
+
+matrixpost --state-path ./operations.db lifecycle relation list --object customer-001
+```
+
+Keep source and target distinct. A relation list contains both incoming and outgoing records; an empty result means the selected object exists but has no relations.
 
 Link existing local publication history and make a revision-guarded transition:
 

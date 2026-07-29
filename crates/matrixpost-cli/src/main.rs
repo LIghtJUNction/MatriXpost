@@ -6,10 +6,10 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use matrixpost_core::{
     AccountSelection, ApprovalStatus, ArticleDispatchOutcome, ArticleRunner, BusinessObject,
-    BusinessObjectStatus, ContentAttribution, HistoryFilter, HistoryStatus, LedgerDirection,
-    LedgerEntry, LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformOverride,
-    ProviderDispatchReport, ProviderRegistry, ProviderRunner, PublishArticleRequest,
-    PublishRequest, Repository, SqliteRepository, WechatLink,
+    BusinessObjectStatus, BusinessRelation, ContentAttribution, HistoryFilter, HistoryStatus,
+    LedgerDirection, LedgerEntry, LifecycleRepository, LocalSchedule, MediaSource, Platform,
+    PlatformOverride, ProviderDispatchReport, ProviderRegistry, ProviderRunner,
+    PublishArticleRequest, PublishRequest, Repository, SqliteRepository, WechatLink,
 };
 use serde::Serialize;
 
@@ -92,6 +92,8 @@ enum LifecycleCommand {
     Ledger(LedgerArgs),
     /// List or create links from published content to an object.
     Attribution(AttributionArgs),
+    /// List or create immutable directed links between generic objects.
+    Relation(RelationArgs),
     /// Change controlled object lifecycle and approval states.
     Transition(TransitionArgs),
 }
@@ -200,6 +202,38 @@ struct AttributionAddArgs {
     history_id: String,
     #[arg(long, value_parser = parse_rfc3339)]
     created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Args)]
+struct RelationArgs {
+    #[command(subcommand)]
+    command: RelationCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RelationCommand {
+    /// List both incoming and outgoing relations for an object.
+    List {
+        #[arg(long = "object")]
+        business_object_id: String,
+    },
+    /// Add an immutable directed relation between two existing objects.
+    Add(RelationAddArgs),
+}
+
+#[derive(Debug, Args)]
+struct RelationAddArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long = "source")]
+    source_business_object_id: String,
+    #[arg(long = "target")]
+    target_business_object_id: String,
+    #[arg(long = "type")]
+    relation_type: String,
+    /// Relation metadata as KEY=VALUE. Repeat the flag for multiple attributes.
+    #[arg(long = "attribute", value_name = "KEY=VALUE")]
+    attributes: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -657,6 +691,53 @@ fn execute_lifecycle(command: LifecycleCommand, repository: &impl LifecycleRepos
                     Ok(()) => emit(
                         0,
                         serde_json::json!({ "content_attribution": attribution }),
+                        None,
+                    ),
+                    Err(error) => lifecycle_repository_error(error),
+                }
+            }
+        },
+        LifecycleCommand::Relation(args) => match args.command {
+            RelationCommand::List { business_object_id } => {
+                if let Err(exit_code) = object_or_not_found(repository, &business_object_id) {
+                    return exit_code;
+                }
+                match repository.business_relations(&business_object_id) {
+                    Ok(relations) => emit(
+                        0,
+                        serde_json::json!({ "business_relations": relations }),
+                        None,
+                    ),
+                    Err(error) => lifecycle_repository_error(error),
+                }
+            }
+            RelationCommand::Add(args) => {
+                for (field, value) in [
+                    ("business relation id", &args.id),
+                    ("source object id", &args.source_business_object_id),
+                    ("target object id", &args.target_business_object_id),
+                    ("business relation type", &args.relation_type),
+                ] {
+                    if let Err(error) = require_non_empty(field, value) {
+                        return lifecycle_input_error(error);
+                    }
+                }
+                let attributes = match parse_attributes(args.attributes) {
+                    Ok(attributes) => attributes,
+                    Err(error) => return lifecycle_input_error(error),
+                };
+                let relation = BusinessRelation {
+                    id: args.id,
+                    source_business_object_id: args.source_business_object_id,
+                    target_business_object_id: args.target_business_object_id,
+                    relation_type: args.relation_type,
+                    attributes,
+                    created_at: Utc::now(),
+                };
+                match repository.insert_business_relation(&relation) {
+                    Ok(()) => emit(
+                        0,
+                        serde_json::json!({ "business_relation": relation }),
                         None,
                     ),
                     Err(error) => lifecycle_repository_error(error),
@@ -1310,6 +1391,44 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_relation_arguments_accept_safe_generic_attributes() {
+        let parsed = Cli::try_parse_from([
+            "matrixpost",
+            "lifecycle",
+            "relation",
+            "add",
+            "--id",
+            "interest-1",
+            "--source",
+            "asset-1",
+            "--target",
+            "customer-1",
+            "--type",
+            "customer_interest",
+            "--attribute",
+            "priority=high",
+        ])
+        .unwrap();
+        let Command::Lifecycle(LifecycleArgs {
+            command:
+                LifecycleCommand::Relation(RelationArgs {
+                    command: RelationCommand::Add(args),
+                }),
+        }) = parsed.command
+        else {
+            panic!("expected lifecycle relation add")
+        };
+        assert_eq!(args.id, "interest-1");
+        assert_eq!(args.source_business_object_id, "asset-1");
+        assert_eq!(args.target_business_object_id, "customer-1");
+        assert_eq!(args.relation_type, "customer_interest");
+        assert_eq!(
+            parse_attributes(args.attributes).unwrap(),
+            BTreeMap::from([("priority".to_owned(), "high".to_owned())])
+        );
+    }
+
+    #[test]
     fn lifecycle_commands_persist_a_generic_object_and_immutable_ledger_entry() {
         let repository = SqliteRepository::in_memory().unwrap();
         let create = LifecycleCommand::Object(ObjectArgs {
@@ -1342,6 +1461,64 @@ mod tests {
         assert_eq!(execute_lifecycle(add, &repository), ExitCode::SUCCESS);
         assert_eq!(repository.business_objects().unwrap().len(), 1);
         assert_eq!(repository.ledger_entries("campaign-42").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_relation_commands_persist_and_list_directed_relations() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        for (id, kind, display_name) in [
+            ("asset-1", "asset", "Asset"),
+            ("customer-1", "customer", "Customer"),
+        ] {
+            assert_eq!(
+                execute_lifecycle(
+                    LifecycleCommand::Object(ObjectArgs {
+                        command: ObjectCommand::Create(ObjectCreateArgs {
+                            id: id.into(),
+                            kind: kind.into(),
+                            display_name: display_name.into(),
+                            external_id: None,
+                            lifecycle_status: BusinessObjectStatus::Draft,
+                            approval_status: ApprovalStatus::Pending,
+                            attributes: vec![],
+                        }),
+                    }),
+                    &repository,
+                ),
+                ExitCode::SUCCESS
+            );
+        }
+        let add = LifecycleCommand::Relation(RelationArgs {
+            command: RelationCommand::Add(RelationAddArgs {
+                id: "interest-1".into(),
+                source_business_object_id: "asset-1".into(),
+                target_business_object_id: "customer-1".into(),
+                relation_type: "customer_interest".into(),
+                attributes: vec!["priority=high".into()],
+            }),
+        });
+        assert_eq!(execute_lifecycle(add, &repository), ExitCode::SUCCESS);
+        let list = LifecycleCommand::Relation(RelationArgs {
+            command: RelationCommand::List {
+                business_object_id: "customer-1".into(),
+            },
+        });
+        assert_eq!(execute_lifecycle(list, &repository), ExitCode::SUCCESS);
+        assert_eq!(
+            repository.business_relations("customer-1").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn lifecycle_relation_list_rejects_a_missing_object() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let command = LifecycleCommand::Relation(RelationArgs {
+            command: RelationCommand::List {
+                business_object_id: "missing-object".into(),
+            },
+        });
+        assert_eq!(execute_lifecycle(command, &repository), ExitCode::from(4));
     }
 
     #[test]

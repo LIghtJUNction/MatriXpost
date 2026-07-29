@@ -34,11 +34,13 @@ Use repeatable `--provider-runner PLATFORM=tcp:127.0.0.1:PORT` declarations only
 
 ## Operate generic lifecycle records
 
-Create an object before adding ledger entries or content attribution. Use caller-defined `kind`, stable `id`, optional external identifier, and safe attributes. Keep attributes descriptive; reject sensitive key names rather than guessing from ordinary business text.
+Create an object before adding ledger entries, content attribution, or relations. Use caller-defined `kind`, stable `id`, optional external identifier, and safe attributes. Keep attributes descriptive; reject sensitive key names rather than guessing from ordinary business text.
+
+Create a relation only after both local endpoint objects exist. Model it as immutable and directed: source object, target object, caller-defined type, and safe attributes. Do not permit source and target to be the same object. List relations from either endpoint to obtain both inbound and outbound links.
 
 Append ledger entries rather than editing history. Record expense or revenue in integer minor currency units, with category and approval state. Link content only to an existing local history record. Use the returned object revision for every transition; reload after a stale-revision rejection instead of retrying blindly.
 
-Treat a missing object or history record as `not_found`. Treat an existing object with no ledger entries or attribution links as a successful empty list. Keep lifecycle work local to SQLite: it must not invoke a provider, runner, browser, remote publication, secret source, or agent framework.
+Treat a missing object or history record as `not_found`. Treat an existing object with no ledger entries, attribution links, or inbound/outbound relations as a successful empty list. Keep lifecycle work local to SQLite: it must not invoke a provider, runner, browser, remote publication, secret source, or agent framework.
 
 ## Deploy and release deliberately
 
@@ -46,7 +48,7 @@ Preserve the supplied systemd hardening model: a dedicated state directory, leas
 
 Run relevant format, tests, lint, documentation, package/build checks, and CI before a release. Treat GitHub, crates.io, AUR, and server writes as external actions requiring explicit authorization. Publish dependent public crates only after `matrixpost-core` is visible to crates.io.
 
-Version `0.2.0` is the coordinated lifecycle release: `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` are published, and the v0.2.0 GitHub Release exists. Verify each external registry or release endpoint live before making a new status claim. Validate any AUR recipe against its exact immutable source archive and checksum; a local recipe or GitHub commit is not evidence of an AUR remote upload.
+Version `0.2.0` is the latest coordinated lifecycle release: `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` are published, and the v0.2.0 GitHub Release exists. The generic relation change is prepared for the next coordinated 0.3.0 release; do not claim it is published or released until each external registry and release endpoint is verified live. Validate any AUR recipe against its exact immutable source archive and checksum; a local recipe or GitHub commit is not evidence of an AUR remote upload.
 
 ## Reference
 

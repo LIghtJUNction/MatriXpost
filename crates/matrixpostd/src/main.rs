@@ -12,10 +12,10 @@ use axum::{
 };
 use clap::Parser;
 use matrixpost_core::{
-    ApprovalStatus, BusinessObject, BusinessObjectStatus, ContentAttribution, DispatchOutcome,
-    DomainError, LedgerEntry, LifecycleRepository, Platform, ProviderDispatchReport,
-    ProviderRegistry, ProviderRunner, PublishRequest, Repository, SqliteRepository,
-    UpstreamPublishDto,
+    ApprovalStatus, BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution,
+    DispatchOutcome, DomainError, LedgerEntry, LifecycleRepository, Platform,
+    ProviderDispatchReport, ProviderRegistry, ProviderRunner, PublishRequest, Repository,
+    SqliteRepository, UpstreamPublishDto,
 };
 use serde::{Deserialize, Serialize};
 
@@ -199,6 +199,21 @@ struct TransitionBusinessObjectRequest {
     lifecycle_status: BusinessObjectStatus,
     approval_status: ApprovalStatus,
     updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Camel-case HTTP input for one immutable directed business-object relation.
+/// The stored record remains the core model and therefore serializes with its
+/// Rust field names on the response.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateBusinessRelationRequest {
+    id: String,
+    source_business_object_id: String,
+    target_business_object_id: String,
+    relation_type: String,
+    #[serde(default)]
+    attributes: std::collections::BTreeMap<String, String>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn object_not_found() -> Response {
@@ -416,6 +431,71 @@ async fn create_content_attribution(
     }
 }
 
+async fn list_business_relations(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = require_business_object(&state, &id) {
+        return *response;
+    }
+    match state.repository.business_relations(&id) {
+        Ok(relations) => response(
+            StatusCode::OK,
+            "ok",
+            serde_json::json!(relations),
+            "business relations listed",
+        ),
+        Err(DomainError::UnknownBusinessObject(_)) => object_not_found(),
+        Err(_) => lifecycle_error(),
+    }
+}
+
+async fn create_business_relation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let request = match parse_lifecycle_json::<CreateBusinessRelationRequest>(
+        body,
+        &[
+            "id",
+            "sourceBusinessObjectId",
+            "targetBusinessObjectId",
+            "relationType",
+            "attributes",
+            "createdAt",
+        ],
+        "business relation",
+    ) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    if request.source_business_object_id != id {
+        return invalid("business relation sourceBusinessObjectId must match the path");
+    }
+    if let Err(response) = require_business_object(&state, &id) {
+        return *response;
+    }
+    let relation = BusinessRelation {
+        id: request.id,
+        source_business_object_id: request.source_business_object_id,
+        target_business_object_id: request.target_business_object_id,
+        relation_type: request.relation_type,
+        attributes: request.attributes,
+        created_at: request.created_at.unwrap_or_else(chrono::Utc::now),
+    };
+    match state.repository.insert_business_relation(&relation) {
+        Ok(()) => response(
+            StatusCode::CREATED,
+            "created",
+            serde_json::json!(relation),
+            "business relation created",
+        ),
+        Err(DomainError::UnknownBusinessObject(_)) => object_not_found(),
+        Err(_) => lifecycle_error(),
+    }
+}
+
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true, "service": "matrixpostd", "status": "healthy" }))
 }
@@ -554,6 +634,10 @@ fn app(state: AppState) -> Router {
         .route(
             "/lifecycle/objects/{id}/attributions",
             get(list_content_attributions).post(create_content_attribution),
+        )
+        .route(
+            "/lifecycle/objects/{id}/relations",
+            get(list_business_relations).post(create_business_relation),
         )
         .with_state(state)
 }
@@ -1243,5 +1327,131 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["outcome"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_relation_routes_create_and_list_directed_relations() {
+        let router = lifecycle_router();
+        for (id, external_id) in [
+            ("asset-1", "asset-external"),
+            ("customer-1", "customer-external"),
+        ] {
+            let mut object = lifecycle_object_payload(id);
+            object["external_id"] = serde_json::json!(external_id);
+            let (status, _) = json_response(
+                router.clone(),
+                lifecycle_request("POST", "/lifecycle/objects", object),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let relation = serde_json::json!({
+            "id": "relation-1",
+            "sourceBusinessObjectId": "asset-1",
+            "targetBusinessObjectId": "customer-1",
+            "relationType": "customer_interest",
+            "attributes": { "priority": "high" }
+        });
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request("POST", "/lifecycle/objects/asset-1/relations", relation),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["data"]["source_business_object_id"], "asset-1");
+        assert_eq!(body["data"]["target_business_object_id"], "customer-1");
+
+        let (status, body) = json_response(
+            router.clone(),
+            Request::get("/lifecycle/objects/asset-1/relations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+
+        let (status, body) = json_response(
+            router,
+            Request::get("/lifecycle/objects/customer-1/relations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_relation_routes_reject_unknown_fields_mismatches_and_missing_objects() {
+        let router = lifecycle_router();
+        let (status, _) = json_response(
+            router.clone(),
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects",
+                lifecycle_object_payload("object-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let unknown = serde_json::json!({
+            "id": "relation-1",
+            "sourceBusinessObjectId": "object-1",
+            "targetBusinessObjectId": "missing-target",
+            "relationType": "owner",
+            "unexpected": true
+        });
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request("POST", "/lifecycle/objects/object-1/relations", unknown),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"].as_str().unwrap().contains("unknown"));
+
+        let mismatched = serde_json::json!({
+            "id": "relation-1",
+            "sourceBusinessObjectId": "other-object",
+            "targetBusinessObjectId": "missing-target",
+            "relationType": "owner"
+        });
+        let (status, body) = json_response(
+            router.clone(),
+            lifecycle_request("POST", "/lifecycle/objects/object-1/relations", mismatched),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"].as_str().unwrap().contains("must match"));
+
+        let (status, body) = json_response(
+            router.clone(),
+            Request::get("/lifecycle/objects/missing/relations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["outcome"], "not_found");
+
+        let missing_target = serde_json::json!({
+            "id": "relation-1",
+            "sourceBusinessObjectId": "object-1",
+            "targetBusinessObjectId": "missing-target",
+            "relationType": "owner"
+        });
+        let (status, body) = json_response(
+            router,
+            lifecycle_request(
+                "POST",
+                "/lifecycle/objects/object-1/relations",
+                missing_target,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["outcome"], "not_found");
     }
 }

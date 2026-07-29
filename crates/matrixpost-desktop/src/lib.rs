@@ -9,10 +9,10 @@ use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc};
 use chrono::Utc;
 use matrixpost_core::{
     Account, AccountStatus, ApprovalStatus, ArticleAccount, ArticleAccountStatus, ArticlePlatform,
-    BusinessObject, BusinessObjectStatus, ContentAttribution, DomainError, HistoryFilter,
-    HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry, LifecycleRepository, LocalSchedule,
-    MediaSource, Platform, PlatformMetadata, PublicationQueue, PublishRequest, PublishState,
-    Repository, SqliteRepository,
+    BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution, DomainError,
+    HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry, LifecycleRepository,
+    LocalSchedule, MediaSource, Platform, PlatformMetadata, PublicationQueue, PublishRequest,
+    PublishState, Repository, SqliteRepository,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -224,6 +224,18 @@ pub struct AddLifecycleContentAttributionInput {
     pub history_id: String,
 }
 
+/// Strict input for creating an immutable directed relation between local objects.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AddLifecycleBusinessRelationInput {
+    pub id: String,
+    pub source_business_object_id: String,
+    pub target_business_object_id: String,
+    pub relation_type: String,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
+
 /// Strict input for an optimistic lifecycle/approval state transition.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -274,6 +286,18 @@ pub struct LifecycleLedgerEntry {
 pub struct LifecycleContentAttributionEntry {
     pub business_object_id: String,
     pub history_id: String,
+    pub created_at: String,
+}
+
+/// Credential-free projection of one immutable, directed business relation.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleBusinessRelationEntry {
+    pub id: String,
+    pub source_business_object_id: String,
+    pub target_business_object_id: String,
+    pub relation_type: String,
+    pub attributes: BTreeMap<String, String>,
     pub created_at: String,
 }
 
@@ -571,6 +595,41 @@ impl DesktopService {
         Ok(LifecycleContentAttributionEntry::from(attribution))
     }
 
+    /// Lists both inbound and outbound immutable relations for a local object.
+    pub fn lifecycle_business_relations(
+        &self,
+        business_object_id: String,
+    ) -> Result<Vec<LifecycleBusinessRelationEntry>, DesktopError> {
+        self.repository
+            .business_relations(&business_object_id)
+            .map_err(lifecycle_error)
+            .map(|relations| {
+                relations
+                    .into_iter()
+                    .map(LifecycleBusinessRelationEntry::from)
+                    .collect()
+            })
+    }
+
+    /// Creates an immutable relation using the system UTC clock.
+    pub fn add_lifecycle_business_relation(
+        &self,
+        input: AddLifecycleBusinessRelationInput,
+    ) -> Result<LifecycleBusinessRelationEntry, DesktopError> {
+        let relation = BusinessRelation {
+            id: input.id,
+            source_business_object_id: input.source_business_object_id,
+            target_business_object_id: input.target_business_object_id,
+            relation_type: input.relation_type,
+            attributes: input.attributes,
+            created_at: Utc::now(),
+        };
+        self.repository
+            .insert_business_relation(&relation)
+            .map_err(lifecycle_error)?;
+        Ok(LifecycleBusinessRelationEntry::from(relation))
+    }
+
     /// Performs an optimistic lifecycle and approval transition using system UTC time.
     pub fn transition_lifecycle_object(
         &self,
@@ -640,6 +699,19 @@ impl From<ContentAttribution> for LifecycleContentAttributionEntry {
             business_object_id: attribution.business_object_id,
             history_id: attribution.history_id,
             created_at: attribution.created_at.to_rfc3339(),
+        }
+    }
+}
+
+impl From<BusinessRelation> for LifecycleBusinessRelationEntry {
+    fn from(relation: BusinessRelation) -> Self {
+        Self {
+            id: relation.id,
+            source_business_object_id: relation.source_business_object_id,
+            target_business_object_id: relation.target_business_object_id,
+            relation_type: relation.relation_type,
+            attributes: relation.attributes,
+            created_at: relation.created_at.to_rfc3339(),
         }
     }
 }
@@ -874,6 +946,24 @@ fn add_lifecycle_content_attribution(
 }
 
 #[tauri::command]
+fn lifecycle_business_relations(
+    state: tauri::State<'_, DesktopState>,
+    input: LifecycleObjectIdInput,
+) -> Result<Vec<LifecycleBusinessRelationEntry>, DesktopError> {
+    state
+        .service
+        .lifecycle_business_relations(input.business_object_id)
+}
+
+#[tauri::command]
+fn add_lifecycle_business_relation(
+    state: tauri::State<'_, DesktopState>,
+    input: AddLifecycleBusinessRelationInput,
+) -> Result<LifecycleBusinessRelationEntry, DesktopError> {
+    state.service.add_lifecycle_business_relation(input)
+}
+
+#[tauri::command]
 fn transition_lifecycle_object(
     state: tauri::State<'_, DesktopState>,
     input: TransitionLifecycleObjectInput,
@@ -905,6 +995,8 @@ pub fn run() {
             append_lifecycle_ledger_entry,
             lifecycle_content_attributions,
             add_lifecycle_content_attribution,
+            lifecycle_business_relations,
+            add_lifecycle_business_relation,
             transition_lifecycle_object
         ])
         .run(tauri::generate_context!())
@@ -926,11 +1018,11 @@ mod tests {
     };
 
     use super::{
-        AddLifecycleContentAttributionInput, AppendLifecycleLedgerEntryInput,
-        CreateLifecycleObjectInput, DesktopService, HistoryQueryInput,
-        LifecycleApprovalStatusInput, LifecycleLedgerDirectionInput, LifecycleObjectIdInput,
-        LifecycleStatusInput, SaveAccountInput, SaveArticleAccountInput, SaveDraftInput,
-        TransitionLifecycleObjectInput,
+        AddLifecycleBusinessRelationInput, AddLifecycleContentAttributionInput,
+        AppendLifecycleLedgerEntryInput, CreateLifecycleObjectInput, DesktopService,
+        HistoryQueryInput, LifecycleApprovalStatusInput, LifecycleLedgerDirectionInput,
+        LifecycleObjectIdInput, LifecycleStatusInput, SaveAccountInput, SaveArticleAccountInput,
+        SaveDraftInput, TransitionLifecycleObjectInput,
     };
 
     fn service() -> DesktopService {
@@ -1363,6 +1455,9 @@ mod tests {
             service
                 .lifecycle_content_attributions("missing-object".into())
                 .map(|_| ()),
+            service
+                .lifecycle_business_relations("missing-object".into())
+                .map(|_| ()),
         ] {
             assert_eq!(
                 result
@@ -1441,6 +1536,32 @@ mod tests {
                 .lifecycle_content_attributions("project-1".into())
                 .expect("attributions"),
             vec![attribution]
+        );
+
+        service
+            .create_lifecycle_object(CreateLifecycleObjectInput {
+                id: "customer-1".into(),
+                kind: "customer".into(),
+                external_id: None,
+                display_name: "Example customer".into(),
+                attributes: BTreeMap::new(),
+            })
+            .expect("related object");
+        let relation = service
+            .add_lifecycle_business_relation(AddLifecycleBusinessRelationInput {
+                id: "relation-1".into(),
+                source_business_object_id: "project-1".into(),
+                target_business_object_id: "customer-1".into(),
+                relation_type: "customer_interest".into(),
+                attributes: BTreeMap::from([("priority".into(), "high".into())]),
+            })
+            .expect("business relation");
+        assert_eq!(relation.relation_type, "customer_interest");
+        assert_eq!(
+            service
+                .lifecycle_business_relations("customer-1".into())
+                .expect("inbound relation"),
+            vec![relation]
         );
     }
 

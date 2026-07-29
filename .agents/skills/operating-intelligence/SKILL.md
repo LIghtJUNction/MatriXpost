@@ -17,30 +17,34 @@ Create the object before recording cost, revenue, reimbursement, preparation, sa
 ## Use the safe lifecycle order
 
 1. Create or retrieve the object.
-2. Append each expense or revenue event as a new immutable ledger entry.
-3. Link relevant existing publication-history records to the object.
-4. Read the current object revision.
-5. Transition lifecycle and approval status with that exact revision.
-6. Reload after a successful transition or a stale-revision rejection.
+2. Create immutable directed relations after both endpoint objects exist.
+3. Append each expense or revenue event as a new immutable ledger entry.
+4. Link relevant existing publication-history records to the object.
+5. Read the current object revision.
+6. Transition lifecycle and approval status with that exact revision.
+7. Reload after a successful transition or a stale-revision rejection.
 
 Treat `draft`, `active`, `completed`, and `archived` as controlled lifecycle values. Treat `pending`, `approved`, and `rejected` as approval values. Do not retry a revision conflict with the old revision. Do not mutate or delete ledger history to correct a business event; append a correcting entry through the approved business process.
 
 ## Use MCP for structured clients
 
-Start `matrixpost-mcp` with a local state path when necessary. Keep MCP stdout as JSON-RPC and diagnostics on stderr. Use the eight lifecycle tools only:
+Start `matrixpost-mcp` with a local state path when necessary. Keep MCP stdout as JSON-RPC and diagnostics on stderr. Use the ten lifecycle tools only:
 
 - `list_business_objects`, `get_business_object`, `create_business_object`
 - `list_ledger_entries`, `append_ledger_entry`
 - `list_content_attributions`, `add_content_attribution`
+- `list_business_relations`, `add_business_relation`
 - `transition_business_object`
 
 Use snake_case tool names and camelCase JSON input fields. Treat returned core records as snake_case JSON. Read `references/mcp-cli-workflows.md` before composing tool inputs. Reject unknown fields rather than assuming they are ignored.
 
-Treat a `not_found` result as missing parent state, not as an empty collection. Treat an empty list as valid only after confirming that the object exists and has no ledger entries or content links. Link attribution only after both the business object and history record exist.
+Create a relation from a source object to a different target object with a caller-defined type and safe attributes. Treat relations as immutable. Do not create a self relation. Treat a `not_found` result as missing parent state, not as an empty collection. Treat an empty list as valid only after confirming that the object exists and has no ledger entries, content links, or inbound/outbound relations. Link attribution only after both the business object and history record exist.
 
 ## Use CLI for deterministic local operations
 
-Pass `--state-path` before `lifecycle` to select an explicit SQLite database. Use `matrixpost lifecycle objects` to list, `matrixpost lifecycle object get` to read, and the object/ledger/attribution/transition commands in the reference for writes. Parse the JSON result and preserve returned revisions.
+Pass `--state-path` before `lifecycle` to select an explicit SQLite database. Use `matrixpost lifecycle objects` to list, `matrixpost lifecycle object get` to read, and the object/ledger/attribution/relation/transition commands in the reference for writes. Parse the JSON result and preserve returned revisions.
+
+Use `matrixpost lifecycle relation add` only after creating both endpoint objects. Use `matrixpost lifecycle relation list --object <id>` to retrieve both incoming and outgoing relations. Supply a non-self `--source`, a different existing `--target`, a caller-defined `--type`, and optional safe `--attribute KEY=VALUE` values.
 
 Use integer `--amount-minor` values with a three-letter ISO currency. Record an individual cost, reimbursement, sale, payment, or aftersales event as one append operation. Do not use a floating-point amount or a spreadsheet-style aggregate overwrite.
 

@@ -206,7 +206,7 @@
           Selected object
           <select id="lifecycle-object-select" aria-describedby="lifecycle-selection-help"></select>
         </label>
-        <p id="lifecycle-selection-help" class="hint">Select an object to view its ledger, content links, and controlled state transitions.</p>
+        <p id="lifecycle-selection-help" class="hint">Select an object to view its ledger, content links, inbound and outbound relations, and controlled state transitions.</p>
         <ul id="lifecycle-objects" class="accounts" aria-live="polite" aria-label="Local lifecycle objects"></ul>
 
         <div class="lifecycle-grid">
@@ -267,6 +267,26 @@
             <p id="lifecycle-attribution-result" role="status" aria-live="polite"></p>
           </form>
 
+          <form id="lifecycle-relation-form">
+            <h3>Connect another object</h3>
+            <p class="hint">Relations are directed and immutable. The selected object is the source; create a new relation to record another local object's role.</p>
+            <label>
+              Target object
+              <select id="lifecycle-relation-target-select" name="targetBusinessObjectId" required aria-describedby="relation-target-help"></select>
+            </label>
+            <p id="relation-target-help" class="hint">Choose another local object. Each option includes its display name, kind, and stable local ID. Self-relations are not allowed.</p>
+            <label>
+              Relation type
+              <input name="relationType" required maxlength="120" autocomplete="off" placeholder="customer_interest, service_provider" />
+            </label>
+            <label>
+              Attributes JSON object (optional)
+              <textarea name="attributes" rows="2" placeholder='{"priority":"high"}'></textarea>
+            </label>
+            <button type="submit">Add directed relation</button>
+            <p id="lifecycle-relation-result" role="status" aria-live="polite"></p>
+          </form>
+
           <form id="lifecycle-transition-form">
             <h3>Transition state</h3>
             <p class="hint">The current revision is sent automatically. If another local change wins first, refresh and decide again.</p>
@@ -300,6 +320,10 @@
           <div>
             <h3>Selected content attribution</h3>
             <ul id="lifecycle-attributions" class="accounts" aria-live="polite" aria-label="Selected object content attribution"></ul>
+          </div>
+          <div>
+            <h3>Selected object relations</h3>
+            <ul id="lifecycle-relations" class="accounts" aria-live="polite" aria-label="Inbound and outbound relations for the selected object"></ul>
           </div>
         </div>
       </section>

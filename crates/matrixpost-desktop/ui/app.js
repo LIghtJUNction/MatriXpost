@@ -18,6 +18,9 @@ const lifecycleLedger = document.querySelector("#lifecycle-ledger");
 const lifecycleLedgerResult = document.querySelector("#lifecycle-ledger-result");
 const lifecycleAttributions = document.querySelector("#lifecycle-attributions");
 const lifecycleAttributionResult = document.querySelector("#lifecycle-attribution-result");
+const lifecycleRelations = document.querySelector("#lifecycle-relations");
+const lifecycleRelationResult = document.querySelector("#lifecycle-relation-result");
+const lifecycleRelationTargetSelect = document.querySelector("#lifecycle-relation-target-select");
 const lifecycleTransitionResult = document.querySelector("#lifecycle-transition-result");
 const lifecycleTransitionForm = document.querySelector("#lifecycle-transition-form");
 let lifecycleObjects = [];
@@ -188,6 +191,7 @@ function renderLifecycleObjects(objects) {
     option.textContent = "Create an object first";
     lifecycleObjectSelect.append(option);
     lifecycleObjectSelect.disabled = true;
+    renderLifecycleRelationTargetOptions(null);
     return;
   }
 
@@ -201,6 +205,33 @@ function renderLifecycleObjects(objects) {
   lifecycleObjectSelect.value = objects.some((object) => object.id === previousId)
     ? previousId
     : objects[0].id;
+  renderLifecycleRelationTargetOptions(lifecycleObjectSelect.value);
+}
+
+function renderLifecycleRelationTargetOptions(sourceObjectId) {
+  const previousId = lifecycleRelationTargetSelect.value;
+  const targetObjects = lifecycleObjects.filter((object) => object.id !== sourceObjectId);
+  lifecycleRelationTargetSelect.replaceChildren();
+
+  if (targetObjects.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Create another object to connect it";
+    lifecycleRelationTargetSelect.append(option);
+    lifecycleRelationTargetSelect.disabled = true;
+    return;
+  }
+
+  lifecycleRelationTargetSelect.disabled = false;
+  lifecycleRelationTargetSelect.append(...targetObjects.map((object) => {
+    const option = document.createElement("option");
+    option.value = object.id;
+    option.textContent = `${object.displayName} (${object.kind}) · ${object.id}`;
+    return option;
+  }));
+  lifecycleRelationTargetSelect.value = targetObjects.some((object) => object.id === previousId)
+    ? previousId
+    : targetObjects[0].id;
 }
 
 function renderLifecycleLedger(entries) {
@@ -235,27 +266,50 @@ function renderLifecycleAttributions(entries) {
   }
 }
 
+function renderLifecycleRelations(relations, selectedObjectId) {
+  lifecycleRelations.replaceChildren(...relations.map((relation) => {
+    const item = document.createElement("li");
+    item.className = "account";
+    const title = document.createElement("strong");
+    const direction = relation.sourceBusinessObjectId === selectedObjectId ? "Outbound" : "Inbound";
+    title.textContent = `${direction} · ${relation.relationType}`;
+    const details = document.createElement("span");
+    details.textContent = `${relation.sourceBusinessObjectId} → ${relation.targetBusinessObjectId} · ${relation.createdAt}`;
+    item.append(title, details);
+    return item;
+  }));
+  if (relations.length === 0) {
+    appendEmpty(lifecycleRelations, "No inbound or outbound relations for this object.");
+  }
+}
+
 async function refreshLifecycleDetails() {
   const object = selectedLifecycleObject();
+  renderLifecycleRelationTargetOptions(object ? object.id : null);
   if (!object) {
     lifecycleLedger.replaceChildren();
     lifecycleAttributions.replaceChildren();
+    lifecycleRelations.replaceChildren();
     appendEmpty(lifecycleLedger, "Select an object to view its ledger.");
     appendEmpty(lifecycleAttributions, "Select an object to view content attribution.");
+    appendEmpty(lifecycleRelations, "Select an object to view related objects.");
     return;
   }
   lifecycleTransitionForm.elements.lifecycleStatus.value = object.lifecycleStatus;
   lifecycleTransitionForm.elements.approvalStatus.value = object.approvalStatus;
   try {
-    const [ledgerEntries, attributionEntries] = await Promise.all([
+    const [ledgerEntries, attributionEntries, relations] = await Promise.all([
       invoke("lifecycle_ledger_entries", { input: { businessObjectId: object.id } }),
       invoke("lifecycle_content_attributions", { input: { businessObjectId: object.id } }),
+      invoke("lifecycle_business_relations", { input: { businessObjectId: object.id } }),
     ]);
     renderLifecycleLedger(ledgerEntries);
     renderLifecycleAttributions(attributionEntries);
+    renderLifecycleRelations(relations, object.id);
   } catch (error) {
     lifecycleLedger.replaceChildren();
     lifecycleAttributions.replaceChildren();
+    lifecycleRelations.replaceChildren();
     lifecycleLedgerResult.textContent = `Unable to read lifecycle data: ${String(error)}`;
   }
 }
@@ -425,6 +479,50 @@ document.querySelector("#lifecycle-attribution-form").addEventListener("submit",
     await refreshLifecycleDetails();
   } catch (error) {
     lifecycleAttributionResult.textContent = `Content was not attached: ${String(error)}`;
+  }
+});
+
+document.querySelector("#lifecycle-relation-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const object = selectedLifecycleObject();
+  if (!object) {
+    lifecycleRelationResult.textContent = "Create and select an object before adding a relation.";
+    return;
+  }
+  if (!lifecycleRelationTargetSelect.value) {
+    lifecycleRelationResult.textContent = "Create another object before adding a relation.";
+    return;
+  }
+  const form = new FormData(event.currentTarget);
+  let attributes = {};
+  const rawAttributes = String(form.get("attributes") || "").trim();
+  if (rawAttributes) {
+    try {
+      attributes = JSON.parse(rawAttributes);
+      if (!attributes || Array.isArray(attributes) || typeof attributes !== "object"
+        || Object.values(attributes).some((value) => typeof value !== "string")) {
+        throw new Error("attributes must be a JSON object with string values");
+      }
+    } catch (error) {
+      lifecycleRelationResult.textContent = `Relation was not added: ${String(error)}`;
+      return;
+    }
+  }
+  try {
+    const relation = await invoke("add_lifecycle_business_relation", {
+      input: {
+        id: localId("relation"),
+        sourceBusinessObjectId: object.id,
+        targetBusinessObjectId: form.get("targetBusinessObjectId"),
+        relationType: form.get("relationType"),
+        attributes,
+      },
+    });
+    lifecycleRelationResult.textContent = `Directed relation ${relation.id} added locally.`;
+    event.currentTarget.reset();
+    await refreshLifecycleDetails();
+  } catch (error) {
+    lifecycleRelationResult.textContent = `Relation was not added: ${String(error)}`;
   }
 });
 
