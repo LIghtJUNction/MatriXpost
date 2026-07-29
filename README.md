@@ -167,7 +167,7 @@ separately started runner has also opted in with `--allow-article-publish`:
 
 `--state-path <path>` takes precedence over `MATRIXPOST_STATE_PATH`; when
 neither is supplied the server uses `matrixpost.db` in its working directory.
-The MCP server exposes twelve tools: the four upstream tool names `list_accounts`,
+The MCP server exposes fourteen tools: the four upstream tool names `list_accounts`,
 `list_history`, `publish_video`, and `publish_article`. Account and history
 tools read only credential-free SQLite metadata. `publish_video` validates and
 records a local draft/queued job only for `dy`, `ks`, `blbl`, `bjh`, `tt`, or
@@ -189,9 +189,10 @@ seconds. For video-channel links, `sphLink.type` is exactly `none` or `product`;
 the latter requires `value`, while `sphProductId` takes precedence and creates
 the effective product link.
 Neither tool accepts cookies, passwords, tokens, sessions, or credentials.
-The other eight tools are `list_business_objects`, `get_business_object`,
+The other ten tools are `list_business_objects`, `get_business_object`,
 `create_business_object`, `list_ledger_entries`, `append_ledger_entry`,
 `list_content_attributions`, `add_content_attribution`, and
+`list_business_relations`, `add_business_relation`, and
 `transition_business_object`. They operate exclusively on local SQLite state;
 they do not open a browser, invoke a provider, or claim remote publication.
 
@@ -225,11 +226,12 @@ there is no macOS or Windows bundle or runtime evidence.
 
 The static frontend uses Tauri's injected global IPC bridge
 (`withGlobalTauri:true`) because it has no Node dependency or bundler. That
-bridge reaches twelve typed Rust commands: `desktop_snapshot`,
+bridge reaches fourteen typed Rust commands: `desktop_snapshot`,
 `save_local_draft`, `save_account`, `save_article_account`, and
 `local_history`, plus `lifecycle_objects`, `create_lifecycle_object`,
 `lifecycle_ledger_entries`, `append_lifecycle_ledger_entry`,
 `lifecycle_content_attributions`, `add_lifecycle_content_attribution`, and
+`lifecycle_business_relations`, `add_lifecycle_business_relation`, and
 `transition_lifecycle_object`. The lifecycle commands use the same local
 SQLite generic-object, immutable-ledger, attribution, and revision-guarded
 transition model as the CLI, daemon, and MCP server. The snapshot projects video and Juejin accounts to safe
@@ -249,10 +251,10 @@ configured. The shell has no runner configuration or remote-dispatch UI.
 - **Arch Linux:** the release recipe is
   [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD); it builds only the
   headless binaries (`matrixpost`, `matrixpostd`, and `matrixpost-mcp`) from
-  the immutable commit archive for the already released 0.1.0 source, with
-  Cargo's locked dependency graph. It installs
+  a checksum-pinned immutable commit archive with Cargo's locked dependency
+  graph. It installs
   `matrixpostd.service` but never enables or starts it. After installing a
-  released AUR package, opt in explicitly with
+  released package, opt in explicitly with
   `sudo systemctl enable --now matrixpostd.service`. The service owns its
   state under `/var/lib/matrixpost` through `DynamicUser`; its network policy
   permits only IPv4/IPv6 loopback, which retains the daemon API and local
@@ -260,22 +262,16 @@ configured. The shell has no runner configuration or remote-dispatch UI.
   example configuration only as a starting point and keep it credential-free.
   The recipe is checksum-pinned, but it has not been uploaded to AUR yet.
 - **Cargo:** `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and
-  `matrixpost-mcp` are versioned public crates. Version 0.1.0 of all four is
-  published on crates.io. The lifecycle API expands their public surface, so
-  the workspace is now prepared for a coordinated 0.2.0 release; 0.2.0 has
-  not been published yet. The Tauri desktop shell is
-  intentionally not published to crates.io: it is a platform bundle, not a
-  reusable library or `cargo install` target. CI compiles/tests the workspace,
-  validates its locked public-package metadata, and creates only the
-  independently publishable `matrixpost-core` archive. It does not claim to
-  create normalized archives for dependent crates before their unpublished core
-  dependency exists on crates.io. The first release is staged: publish
-  `matrixpost-core`, wait for crates.io availability, then package-verify and
-  publish `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` serially. The
-  lifecycle release follows the same core-first sequence; dependent 0.2.0
-  packages cannot be package-verified until `matrixpost-core` 0.2.0 is
-  available on crates.io. The existing 0.1.0 release was published in that
-  order.
+  `matrixpost-mcp` are published public crates on
+  [crates.io](https://crates.io/). Use the registry entries or the
+  [GitHub releases](https://github.com/LIghtJUNction/MatriXpost/releases) to
+  choose the current version and read its release notes. The Tauri desktop
+  shell is intentionally not published to crates.io: it is a platform bundle,
+  not a reusable library or `cargo install` target. CI compiles and tests the
+  workspace, validates locked public-package metadata, and package-checks the
+  independently publishable core crate. Releases publish the core crate first,
+  then package-verify and publish its dependent public crates serially after
+  the registry has indexed that core version.
 
 No `.cursor` directory is used or required.
 

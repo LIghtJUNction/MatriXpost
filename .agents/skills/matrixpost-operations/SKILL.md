@@ -1,7 +1,6 @@
 ---
 name: matrixpost-operations
 description: This skill should be used when the user asks to "publish with MatriXpost", "run matrixpostd", "manage MatriXpost lifecycle objects", "add a MatriXpost MCP server", "use the MatriXpost CLI", "build the Tauri desktop app", "install the MatriXpost systemd service", "package MatriXpost for AUR", or "release MatriXpost to Cargo or GitHub".
-version: 0.2.0
 ---
 
 # MatriXpost Operations
@@ -48,7 +47,7 @@ Preserve the supplied systemd hardening model: a dedicated state directory, leas
 
 Run relevant format, tests, lint, documentation, package/build checks, and CI before a release. Treat GitHub, crates.io, AUR, and server writes as external actions requiring explicit authorization. Publish dependent public crates only after `matrixpost-core` is visible to crates.io.
 
-Version `0.2.0` is the latest coordinated lifecycle release: `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` are published, and the v0.2.0 GitHub Release exists. The generic relation change is prepared for the next coordinated 0.3.0 release; do not claim it is published or released until each external registry and release endpoint is verified live. Validate any AUR recipe against its exact immutable source archive and checksum; a local recipe or GitHub commit is not evidence of an AUR remote upload.
+Version `0.3.0` is the latest coordinated lifecycle release: `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` are published on crates.io, and the v0.3.0 GitHub Release exists. Validate any AUR recipe against its exact immutable source archive and checksum; a local recipe or GitHub commit is not evidence of an AUR remote upload.
 
 ## Reference
 
