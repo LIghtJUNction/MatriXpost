@@ -16,6 +16,7 @@ use url::Url;
 
 use crate::profiles::*;
 mod kuaishou;
+mod xiaohongshu;
 
 pub(crate) trait WebDriverTransport: Send + Sync {
     fn request(&self, method: &str, path: &str, body: Value) -> Result<Value, String>;
@@ -648,6 +649,7 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
                 | Platform::Bilibili
                 | Platform::Baijiahao
                 | Platform::Kuaishou
+                | Platform::Xiaohongshu
         ) && let Some(statement) =
             override_value.and_then(|item| item.creative_statement.as_ref())
         {
@@ -756,27 +758,19 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
         let file = file
             .to_str()
             .ok_or_else(|| "local media path is not valid Unicode".to_owned())?;
-        // Validate WeChat product input before creating an attached-browser session.
-        let wechat_product = if platform == Platform::WechatChannels {
-            Self::wechat_product_id(request)?
-        } else {
-            None
+        let wechat_product = (platform == Platform::WechatChannels)
+            .then(|| Self::wechat_product_id(request))
+            .transpose()?
+            .flatten();
+        let creative_statement = match platform {
+            Platform::WechatChannels => wechat_creative_statement_label(request),
+            Platform::Douyin => douyin_autonomous_statement_label(request),
+            Platform::Baijiahao => baijiahao_creative_statement_label(request),
+            Platform::Bilibili => bilibili_creative_statement_label(request),
+            Platform::Kuaishou => kuaishou_creative_statement_label(request),
+            Platform::Xiaohongshu => xiaohongshu_creative_statement_label(request),
+            _ => None,
         };
-        let wechat_creative_statement = (platform == Platform::WechatChannels)
-            .then(|| wechat_creative_statement_label(request))
-            .flatten();
-        let douyin_autonomous_statement = (platform == Platform::Douyin)
-            .then(|| douyin_autonomous_statement_label(request))
-            .flatten();
-        let baijiahao_creative_statement = (platform == Platform::Baijiahao)
-            .then(|| baijiahao_creative_statement_label(request))
-            .flatten();
-        let bilibili_creative_statement = (platform == Platform::Bilibili)
-            .then(|| bilibili_creative_statement_label(request))
-            .flatten();
-        let kuaishou_creative_statement = (platform == Platform::Kuaishou)
-            .then(|| kuaishou_creative_statement_label(request))
-            .flatten();
         let session = self.session()?;
         let outcome: Result<(), String> = (|| {
             self.navigate(&session, profile.upload_url)?;
@@ -795,20 +789,26 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             if let Some(product_id) = wechat_product.as_deref() {
                 self.attach_wechat_product(&session, product_id)?;
             }
-            if let Some(label) = wechat_creative_statement {
-                self.apply_wechat_creative_statement(&session, label)?;
-            }
-            if let Some(label) = douyin_autonomous_statement {
-                self.apply_douyin_autonomous_statement(&session, label)?;
-            }
-            if let Some(label) = baijiahao_creative_statement {
-                self.apply_baijiahao_creative_statement(&session, label)?;
-            }
-            if let Some(label) = bilibili_creative_statement {
-                self.apply_bilibili_creative_statement(&session, label)?;
-            }
-            if let Some(label) = kuaishou_creative_statement {
-                self.apply_kuaishou_creative_statement(&session, label)?;
+            if let Some(label) = creative_statement {
+                match platform {
+                    Platform::WechatChannels => {
+                        self.apply_wechat_creative_statement(&session, label)?
+                    }
+                    Platform::Douyin => self.apply_douyin_autonomous_statement(&session, label)?,
+                    Platform::Baijiahao => {
+                        self.apply_baijiahao_creative_statement(&session, label)?
+                    }
+                    Platform::Bilibili => {
+                        self.apply_bilibili_creative_statement(&session, label)?
+                    }
+                    Platform::Kuaishou => {
+                        self.apply_kuaishou_creative_statement(&session, label)?
+                    }
+                    Platform::Xiaohongshu => {
+                        self.apply_xiaohongshu_creative_statement(&session, label)?
+                    }
+                    _ => unreachable!("only declaration-capable platforms resolve a statement"),
+                }
             }
             if platform == Platform::WechatChannels {
                 self.try_declare_wechat_original(&session)?;

@@ -7,3 +7,4 @@ mod kuaishou;
 mod protocol;
 mod support;
 mod wechat;
+mod xiaohongshu;
