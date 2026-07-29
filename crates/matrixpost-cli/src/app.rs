@@ -1,9 +1,10 @@
 use std::{path::PathBuf, process::ExitCode, str::FromStr};
 
+use chrono::Utc;
 use clap::Parser;
 use matrixpost_core::{
-    AccountSelection, ArticlePublicationQueue, ArticleRunner, Platform, PublishArticleRequest,
-    Repository, SqliteRepository,
+    AccountSelection, ArticlePublicationQueue, ArticleRunner, Platform, PublicationHistoryEntry,
+    PublishArticleRequest, Repository, SqliteRepository,
 };
 
 use crate::{
@@ -22,11 +23,21 @@ fn open(path: PathBuf) -> Result<SqliteRepository, String> {
     SqliteRepository::open(path).map_err(|error| error.to_string())
 }
 fn dispatch_publish(
+    repository: &SqliteRepository,
     registry: &matrixpost_core::ProviderRegistry,
     request: &matrixpost_core::PublishRequest,
 ) -> ExitCode {
     match registry.dispatch_all(request) {
-        Ok(report) => emit_dispatch(report),
+        Ok(report) => {
+            match repository.record_provider_dispatch_history(request, &report, Utc::now()) {
+                Ok(_) => emit_dispatch(report),
+                Err(_) => emit(
+                    4,
+                    serde_json::Value::Null,
+                    Some("local dispatch result could not be persisted"),
+                ),
+            }
+        }
         Err(error) => emit(2, serde_json::Value::Null, Some(&error.to_string())),
     }
 }
@@ -89,12 +100,18 @@ pub(crate) fn run() -> ExitCode {
         Command::Publish(args) => {
             if args.dir.is_some() {
                 match batch::prepare(args) {
-                    Ok(plan) => batch::dispatch(&registry, plan),
+                    Ok(plan) => match open(cli.state_path) {
+                        Ok(repository) => batch::dispatch(&repository, &registry, plan),
+                        Err(error) => emit(4, serde_json::Value::Null, Some(&error)),
+                    },
                     Err(error) => emit(2, serde_json::Value::Null, Some(&error)),
                 }
             } else {
                 match parse_request(args) {
-                    Ok(request) => dispatch_publish(&registry, &request),
+                    Ok(request) => match open(cli.state_path) {
+                        Ok(repository) => dispatch_publish(&repository, &registry, &request),
+                        Err(error) => emit(4, serde_json::Value::Null, Some(&error)),
+                    },
                     Err(error) => emit(2, serde_json::Value::Null, Some(&error)),
                 }
             }
@@ -148,7 +165,13 @@ pub(crate) fn run() -> ExitCode {
             Ok(filter) => match open(cli.state_path).and_then(|repository| {
                 repository
                     .history()
-                    .map(|history| filter.filter(history))
+                    .map(|history| {
+                        filter
+                            .filter(history)
+                            .into_iter()
+                            .map(PublicationHistoryEntry::from)
+                            .collect::<Vec<_>>()
+                    })
                     .map_err(|error| error.to_string())
             }) {
                 Ok(history) => emit(0, serde_json::json!({ "history": history }), None),

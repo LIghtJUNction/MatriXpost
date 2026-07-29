@@ -11,9 +11,11 @@ use std::{
 };
 
 use calamine::{Reader, open_workbook_auto};
+use chrono::Utc;
 use matrixpost_core::{
     AccountSelection, DispatchOutcome, MediaSource, Platform, PlatformOverride,
-    ProviderDispatchReport, ProviderRegistry, PublishRequest, WechatLink,
+    ProviderDispatchReport, ProviderRegistry, PublishRequest, Repository, SqliteRepository,
+    WechatLink,
 };
 use serde::Serialize;
 
@@ -45,8 +47,8 @@ pub(crate) enum BatchItem {
 
 #[derive(Debug)]
 pub(crate) struct BatchPlan {
-    directory: PathBuf,
-    items: Vec<BatchItem>,
+    pub(crate) directory: PathBuf,
+    pub(crate) items: Vec<BatchItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -492,7 +494,11 @@ fn summary(rows: Vec<BatchRowOutcome>) -> BatchSummary {
     result
 }
 
-pub(crate) fn dispatch(registry: &ProviderRegistry, plan: BatchPlan) -> ExitCode {
+pub(crate) fn dispatch(
+    repository: &SqliteRepository,
+    registry: &ProviderRegistry,
+    plan: BatchPlan,
+) -> ExitCode {
     let mut outcomes = Vec::with_capacity(plan.items.len());
     for item in plan.items {
         let outcome = match item {
@@ -503,13 +509,25 @@ pub(crate) fn dispatch(registry: &ProviderRegistry, plan: BatchPlan) -> ExitCode
             } => match &request.source {
                 MediaSource::LocalFile(source) => {
                     match revalidate_source(&plan.directory, source) {
-                        Ok(()) => row_outcome(
-                            row,
-                            file_name,
-                            registry
+                        Ok(()) => {
+                            let report = registry
                                 .dispatch_all(&request)
-                                .map_err(|error| error.to_string()),
-                        ),
+                                .map_err(|error| error.to_string());
+                            let report = match report {
+                                Ok(report) => match repository.record_provider_dispatch_history(
+                                    &request,
+                                    &report,
+                                    Utc::now(),
+                                ) {
+                                    Ok(_) => Ok(report),
+                                    Err(_) => {
+                                        Err("local dispatch result could not be persisted".into())
+                                    }
+                                },
+                                Err(error) => Err(error),
+                            };
+                            row_outcome(row, file_name, report)
+                        }
                         Err(reason) => BatchRowOutcome {
                             row,
                             file_name,

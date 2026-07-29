@@ -19,6 +19,74 @@ pub struct HistoryRecord {
     pub detail: Option<String>,
 }
 
+/// A serialization-safe publication-history projection for public interfaces.
+///
+/// Durable history retains the original request for local lifecycle and retry
+/// handling. This view deliberately exposes only the fields safe for CLI, MCP,
+/// and desktop presentation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PublicationHistoryEntry {
+    pub id: String,
+    pub state: &'static str,
+    pub recorded_at: String,
+    pub title: String,
+    pub targets: Vec<String>,
+    pub draft: bool,
+    pub scheduled: bool,
+}
+
+impl From<&HistoryRecord> for PublicationHistoryEntry {
+    fn from(record: &HistoryRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            state: publication_state_label(record.state),
+            recorded_at: record.recorded_at.to_rfc3339(),
+            title: record.request.title.clone(),
+            targets: record
+                .request
+                .targets
+                .iter()
+                .map(|platform| platform.as_str().to_owned())
+                .collect(),
+            draft: record.request.draft,
+            scheduled: record.state == PublishState::Queued
+                && record.request.scheduled_at.is_some(),
+        }
+    }
+}
+
+impl From<HistoryRecord> for PublicationHistoryEntry {
+    fn from(record: HistoryRecord) -> Self {
+        let scheduled =
+            record.state == PublishState::Queued && record.request.scheduled_at.is_some();
+        Self {
+            id: record.id,
+            state: publication_state_label(record.state),
+            recorded_at: record.recorded_at.to_rfc3339(),
+            title: record.request.title,
+            targets: record
+                .request
+                .targets
+                .into_iter()
+                .map(|platform| platform.as_str().to_owned())
+                .collect(),
+            draft: record.request.draft,
+            scheduled,
+        }
+    }
+}
+
+const fn publication_state_label(state: PublishState) -> &'static str {
+    match state {
+        PublishState::Draft => "draft",
+        PublishState::Queued => "queued",
+        PublishState::Dispatching => "dispatching",
+        PublishState::Published => "published",
+        PublishState::Failed => "failed",
+        PublishState::Unavailable => "unavailable",
+    }
+}
+
 /// The lifecycle phase of a generic business object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

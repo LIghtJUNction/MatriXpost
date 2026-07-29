@@ -1,4 +1,5 @@
 use super::*;
+use matrixpost_core::PublicationHistoryEntry;
 
 #[test]
 fn scheduled_mcp_article_is_local_only_and_history_is_redacted() {
@@ -218,9 +219,16 @@ fn history_platform_schema_rejects_fqsp_and_filters_through_the_core_query() {
         Utc::now(),
     )
     .unwrap()
-    .filter(records);
+    .filter(records)
+    .into_iter()
+    .map(PublicationHistoryEntry::from)
+    .collect::<Vec<_>>();
     let actual = service.list_history_result(input).unwrap();
     assert_eq!(actual, expected);
+    let serialized = serde_json::to_string(&actual).unwrap();
+    for forbidden in ["/tmp/video.mp4", "13800138000"] {
+        assert!(!serialized.contains(forbidden));
+    }
     assert_eq!(
         actual
             .into_iter()
@@ -302,19 +310,23 @@ fn article_request_rejects_missing_content_and_file() {
 }
 
 #[test]
-fn immediate_video_without_a_runner_reports_unavailable_without_persisting() {
-    let result = service()
+fn immediate_video_without_a_runner_persists_the_unavailable_dispatch() {
+    let service = service();
+    let result = service
         .publish_video_result(video_input(None, None))
         .unwrap();
     assert_eq!(result.outcome, "unavailable");
     assert!(!result.provider_available);
     assert!(!result.remote_publish_attempted);
-    assert!(!result.persisted);
+    assert!(result.persisted);
     assert!(result.job.is_none());
     assert_eq!(
         serde_json::to_value(result).unwrap()["providers"]["dy"],
         "unavailable"
     );
+    let history = service.repository.history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].state, matrixpost_core::PublishState::Unavailable);
 }
 
 #[test]
@@ -326,8 +338,11 @@ fn immediate_video_dispatches_through_the_configured_provider_registry() {
     assert_eq!(result.outcome, "queued");
     assert!(result.provider_available);
     assert!(result.remote_publish_attempted);
-    assert!(!result.persisted);
+    assert!(result.persisted);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let history = service.repository.history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].state, matrixpost_core::PublishState::Published);
 }
 
 #[test]

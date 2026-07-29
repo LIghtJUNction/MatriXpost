@@ -301,6 +301,34 @@ async fn router_platform_metadata_publish_503_and_invalid_dto_400() {
 }
 
 #[tokio::test]
+async fn publish_records_a_terminal_history_entry_before_returning_queued() {
+    let (state, _) = scheduler_state(
+        matrixpost_core::ProviderAvailability::Available,
+        DispatchOutcome::Queued {
+            job_id: "local-job".into(),
+        },
+    );
+    let repository = Arc::clone(&state.repository);
+    let router = app(state);
+    let (status, body) = json_response(
+        router,
+        Request::post("/publish")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"platform":"dy","file":"movie.mp4","title":"Title"}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["outcome"], "queued");
+    let history = repository.history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].state, matrixpost_core::PublishState::Published);
+}
+
+#[tokio::test]
 async fn upstream_test_probe_and_api_success_alias_are_compatible() {
     let router = app(AppState {
         repository: Arc::new(SqliteRepository::in_memory().unwrap()),

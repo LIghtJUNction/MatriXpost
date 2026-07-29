@@ -6,7 +6,12 @@ mod lifecycle;
 pub use articles::ArticlePublicationQueue;
 pub use lifecycle::LifecycleRepository;
 
-use crate::{error::DomainError, lifecycle::*, types::*};
+use crate::{
+    error::DomainError,
+    lifecycle::*,
+    runner::{DispatchOutcome, ProviderDispatchReport},
+    types::*,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -19,6 +24,15 @@ pub trait Repository: Send + Sync {
     fn save_article_account(&self, account: &ArticleAccount) -> Result<(), DomainError>;
     fn article_accounts(&self) -> Result<Vec<ArticleAccount>, DomainError>;
     fn append_history(&self, record: &HistoryRecord) -> Result<(), DomainError>;
+    /// Atomically records the terminal local outcome of an already-completed
+    /// provider dispatch. The persisted request is stripped of account routing,
+    /// and provider diagnostics are never retained.
+    fn record_provider_dispatch_history(
+        &self,
+        request: &PublishRequest,
+        report: &ProviderDispatchReport,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<HistoryRecord, DomainError>;
     fn history(&self) -> Result<Vec<HistoryRecord>, DomainError>;
     fn insert_job(&self, job: &ScheduledJob) -> Result<(), DomainError>;
     fn job(&self, id: &str) -> Result<Option<ScheduledJob>, DomainError>;
@@ -259,6 +273,27 @@ impl Repository for SqliteRepository {
         connection.execute("INSERT INTO history(id, request_json, state, recorded_at, detail) VALUES (?1, ?2, ?3, ?4, ?5)", params![record.id, json(&record.request)?, record.state.db(), record.recorded_at.to_rfc3339(), record.detail]).map_err(DomainError::database)?;
         Ok(())
     }
+    fn record_provider_dispatch_history(
+        &self,
+        request: &PublishRequest,
+        report: &ProviderDispatchReport,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<HistoryRecord, DomainError> {
+        let (state, detail) = provider_dispatch_history_outcome(report);
+        let safe_request = request.runner_safe();
+        let mut connection = self.locked()?;
+        let transaction = connection.transaction().map_err(DomainError::database)?;
+        let record = insert_terminal_history(
+            &transaction,
+            "dispatch-history",
+            &safe_request,
+            state,
+            recorded_at,
+            Some(detail),
+        )?;
+        transaction.commit().map_err(DomainError::database)?;
+        Ok(record)
+    }
     fn history(&self) -> Result<Vec<HistoryRecord>, DomainError> {
         let connection = self.locked()?;
         let mut statement = connection.prepare("SELECT id, request_json, state, recorded_at, detail FROM history ORDER BY recorded_at, id").map_err(DomainError::database)?;
@@ -373,6 +408,7 @@ impl Repository for SqliteRepository {
         }
         let history = insert_terminal_history(
             &transaction,
+            "scheduled-history",
             &current.request.runner_safe(),
             next,
             updated_at,
@@ -652,12 +688,42 @@ fn load_job_tx(
         .transpose()
 }
 
-/// Allocates and persists terminal scheduler history in the caller's job
-/// transaction. The private sequence is durable across restarts. Although
-/// ordinary history import may use arbitrary IDs, a defensive conflict retry
-/// makes a generated scheduler ID collision-free as well.
+const LOCAL_DISPATCH_COMPLETED: &str =
+    "local provider workflow completed; remote platform processing is not confirmed";
+const LOCAL_DISPATCH_UNAVAILABLE: &str =
+    "all local providers were unavailable; no remote provider workflow was attempted";
+const LOCAL_DISPATCH_INCOMPLETE: &str =
+    "local provider workflow was incomplete; remote platform processing is not confirmed";
+
+fn provider_dispatch_history_outcome(
+    report: &ProviderDispatchReport,
+) -> (PublishState, &'static str) {
+    if !report.outcomes.is_empty()
+        && report
+            .outcomes
+            .values()
+            .all(|outcome| matches!(outcome, DispatchOutcome::Queued { .. }))
+    {
+        return (PublishState::Published, LOCAL_DISPATCH_COMPLETED);
+    }
+    if !report.outcomes.is_empty()
+        && report
+            .outcomes
+            .values()
+            .all(|outcome| matches!(outcome, DispatchOutcome::Unavailable { .. }))
+    {
+        return (PublishState::Unavailable, LOCAL_DISPATCH_UNAVAILABLE);
+    }
+    (PublishState::Failed, LOCAL_DISPATCH_INCOMPLETE)
+}
+
+/// Allocates and persists terminal history in the caller's transaction. The
+/// private sequence is durable across restarts. Although ordinary history
+/// import may use arbitrary IDs, a defensive conflict retry makes a generated
+/// ID collision-free as well.
 fn insert_terminal_history(
     transaction: &Transaction<'_>,
+    id_prefix: &str,
     request: &PublishRequest,
     state: PublishState,
     recorded_at: DateTime<Utc>,
@@ -668,7 +734,7 @@ fn insert_terminal_history(
             .execute("INSERT INTO history_sequence DEFAULT VALUES", [])
             .map_err(DomainError::database)?;
         let record = HistoryRecord {
-            id: format!("scheduled-history-{}", transaction.last_insert_rowid()),
+            id: format!("{id_prefix}-{}", transaction.last_insert_rowid()),
             request: request.clone(),
             state,
             recorded_at,

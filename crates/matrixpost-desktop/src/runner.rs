@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 
+use chrono::Utc;
 use matrixpost_core::{
     AccountReadiness, DispatchOutcome, DomainError, Platform, ProviderRegistry, ProviderRunner,
-    ProviderRunnerTransport, PublishRequest, REVIEW_STATUS_TITLE_QUERY_MAX_BYTES, ReviewStatus,
+    ProviderRunnerTransport, PublishRequest, REVIEW_STATUS_TITLE_QUERY_MAX_BYTES, Repository,
+    ReviewStatus, SqliteRepository,
 };
 
 use crate::{DesktopError, LocalRunnerDispatchOutcome, LocalRunnerDispatchReport};
@@ -139,12 +141,18 @@ pub(crate) fn local_runner_dispatch_outcome(
 }
 
 pub(crate) fn local_runner_dispatch_report(
+    repository: &SqliteRepository,
     registry: &ProviderRegistry,
     request: &PublishRequest,
 ) -> Result<LocalRunnerDispatchReport, DesktopError> {
     let report = registry.dispatch_all(request).map_err(|_| {
         DesktopError::InvalidRequest("local runner dispatch request is invalid".into())
     })?;
+    repository
+        .record_provider_dispatch_history(request, &report, Utc::now())
+        .map_err(|_| {
+            DesktopError::Storage("local dispatch result could not be persisted".into())
+        })?;
     Ok(LocalRunnerDispatchReport {
         outcomes: report
             .outcomes

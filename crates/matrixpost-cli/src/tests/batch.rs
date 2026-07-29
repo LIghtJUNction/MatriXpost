@@ -6,13 +6,17 @@ use std::{
 
 use calamine::{Reader, open_workbook_auto};
 use clap::Parser;
-use matrixpost_core::{DispatchOutcome, MediaSource, Platform, ProviderDispatchReport};
+use matrixpost_core::{
+    DispatchOutcome, DomainError, MediaSource, Platform, ProviderAvailability,
+    ProviderDispatchReport, ProviderRegistry, PublishProvider, Repository, SqliteRepository,
+};
 
 use crate::{
     args::{Cli, Command},
     batch::{
-        BatchRow, BatchRowOutcome, BatchRowState, classify_rows, direct_files, is_direct_video,
-        normalize_cell, prepare, project_rows, resolve_file, revalidate_source, row_request,
+        BatchItem, BatchPlan, BatchRow, BatchRowOutcome, BatchRowState, classify_rows,
+        direct_files, dispatch, is_direct_video, normalize_cell, prepare, project_rows,
+        resolve_file, revalidate_source, row_request,
     },
     query::parse_request,
 };
@@ -34,6 +38,24 @@ fn batch_args(extra: &[&str]) -> crate::args::PublishArgs {
         panic!("expected publish");
     };
     args
+}
+
+struct QueuedProvider;
+
+impl PublishProvider for QueuedProvider {
+    fn platform(&self) -> Platform {
+        Platform::Douyin
+    }
+
+    fn availability(&self) -> ProviderAvailability {
+        ProviderAvailability::Available
+    }
+
+    fn enqueue(&self, _: &matrixpost_core::PublishRequest) -> Result<DispatchOutcome, DomainError> {
+        Ok(DispatchOutcome::Queued {
+            job_id: "local-job".into(),
+        })
+    }
 }
 
 #[test]
@@ -361,6 +383,68 @@ fn batch_exit_classification_covers_queued_unavailable_and_mixed_rows() {
     assert_eq!(classify_rows(std::slice::from_ref(&queued)), 0);
     assert_eq!(classify_rows(&[unavailable]), 3);
     assert_eq!(classify_rows(&[queued, skipped]), 4);
+}
+
+#[test]
+fn skipped_batch_rows_do_not_create_dispatch_history() {
+    let repository = SqliteRepository::in_memory().unwrap();
+    let plan = BatchPlan {
+        directory: std::env::temp_dir(),
+        items: vec![BatchItem::Skipped {
+            row: 2,
+            file_name: "missing.mp4".into(),
+            reason: "source was not found".into(),
+        }],
+    };
+
+    assert_eq!(
+        dispatch(&repository, &ProviderRegistry::new(), plan),
+        std::process::ExitCode::from(4)
+    );
+    assert!(repository.history().unwrap().is_empty());
+}
+
+#[test]
+fn dispatched_batch_rows_record_terminal_history() {
+    let directory = std::env::temp_dir().join(format!(
+        "matrixpost-batch-history-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("movie.mp4");
+    fs::write(&source, b"video").unwrap();
+    let row = BatchRow {
+        row: 2,
+        file_name: "movie.mp4".into(),
+        title: Some("Queued title".into()),
+        tags: None,
+        creative_statement: None,
+    };
+    let request = row_request(&batch_args(&[]), Platform::Douyin, source, &row).unwrap();
+    let plan = BatchPlan {
+        directory: directory.canonicalize().unwrap(),
+        items: vec![BatchItem::Ready {
+            row: row.row,
+            file_name: row.file_name,
+            request: Box::new(request),
+        }],
+    };
+    let repository = SqliteRepository::in_memory().unwrap();
+    let mut registry = ProviderRegistry::new();
+    registry.register(Box::new(QueuedProvider)).unwrap();
+
+    assert_eq!(
+        dispatch(&repository, &registry, plan),
+        std::process::ExitCode::SUCCESS
+    );
+    let history = repository.history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].state, matrixpost_core::PublishState::Published);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

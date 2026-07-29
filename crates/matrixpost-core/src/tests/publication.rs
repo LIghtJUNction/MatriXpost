@@ -252,6 +252,121 @@
     }
 
     #[test]
+    fn provider_dispatch_history_records_all_queued_as_local_completion() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let recorded_at = Utc::now();
+        let report = ProviderDispatchReport {
+            outcomes: BTreeMap::from([(
+                Platform::Douyin,
+                DispatchOutcome::Queued {
+                    job_id: "provider-job-not-persisted".into(),
+                },
+            )]),
+        };
+
+        let history = repository
+            .record_provider_dispatch_history(&request(), &report, recorded_at)
+            .unwrap();
+        let stored = repository.history().unwrap().pop().unwrap();
+
+        assert_eq!(stored, history);
+        assert_eq!(stored.state, PublishState::Published);
+        assert_eq!(
+            stored.detail.as_deref(),
+            Some("local provider workflow completed; remote platform processing is not confirmed")
+        );
+        assert_eq!(stored.request, request().runner_safe());
+        assert!(!stored.request.has_account_routing());
+        assert!(!format!("{stored:?}").contains("provider-job-not-persisted"));
+    }
+
+    #[test]
+    fn provider_dispatch_history_records_all_unavailable_without_provider_reason() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let report = ProviderDispatchReport {
+            outcomes: BTreeMap::from([(
+                Platform::Douyin,
+                DispatchOutcome::Unavailable {
+                    reason: "provider diagnostic must not be persisted".into(),
+                },
+            )]),
+        };
+
+        let history = repository
+            .record_provider_dispatch_history(&request(), &report, Utc::now())
+            .unwrap();
+        let stored = repository.history().unwrap().pop().unwrap();
+
+        assert_eq!(stored, history);
+        assert_eq!(stored.state, PublishState::Unavailable);
+        assert_eq!(
+            stored.detail.as_deref(),
+            Some("all local providers were unavailable; no remote provider workflow was attempted")
+        );
+        assert!(!format!("{stored:?}").contains("provider diagnostic must not be persisted"));
+    }
+
+    #[test]
+    fn provider_dispatch_history_records_mixed_or_rejected_outcomes_as_incomplete() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let report = ProviderDispatchReport {
+            outcomes: BTreeMap::from([(
+                Platform::Douyin,
+                DispatchOutcome::Rejected {
+                    reason: "provider rejection must not be persisted".into(),
+                },
+            )]),
+        };
+
+        let history = repository
+            .record_provider_dispatch_history(&request(), &report, Utc::now())
+            .unwrap();
+        let stored = repository.history().unwrap().pop().unwrap();
+
+        assert_eq!(stored, history);
+        assert_eq!(stored.state, PublishState::Failed);
+        assert_eq!(
+            stored.detail.as_deref(),
+            Some("local provider workflow was incomplete; remote platform processing is not confirmed")
+        );
+        assert!(!format!("{stored:?}").contains("provider rejection must not be persisted"));
+    }
+
+    #[test]
+    fn provider_dispatch_history_allocates_unique_ids_after_a_legacy_collision() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let recorded_at = Utc::now();
+        repository
+            .append_history(&HistoryRecord {
+                id: "dispatch-history-1".into(),
+                request: request(),
+                state: PublishState::Queued,
+                recorded_at,
+                detail: None,
+            })
+            .unwrap();
+        let report = ProviderDispatchReport {
+            outcomes: BTreeMap::from([(
+                Platform::Douyin,
+                DispatchOutcome::Queued {
+                    job_id: "ignored".into(),
+                },
+            )]),
+        };
+
+        let first = repository
+            .record_provider_dispatch_history(&request(), &report, recorded_at)
+            .unwrap();
+        let second = repository
+            .record_provider_dispatch_history(&request(), &report, recorded_at)
+            .unwrap();
+
+        assert_eq!(first.id, "dispatch-history-2");
+        assert_eq!(second.id, "dispatch-history-3");
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
     fn requeue_claim_is_revision_guarded_and_due_again() {
         let repository = SqliteRepository::in_memory().unwrap();
         let now = Utc::now();
@@ -332,6 +447,60 @@
         repository.append_history(&record).unwrap();
         assert_eq!(repository.history().unwrap(), vec![record]);
     }
+
+    #[test]
+    fn publication_history_entry_serialization_excludes_request_details() {
+        let recorded_at = Utc::now();
+        let record = HistoryRecord {
+            id: "history-public-1".into(),
+            request: PublishRequest {
+                source: MediaSource::LocalFile("/private/video.mp4".into()),
+                title: "Safe title".into(),
+                short_title: None,
+                tags: vec!["private-tag".into()],
+                address: None,
+                draft: true,
+                bt2: None,
+                scheduled_at: Some(LocalSchedule::parse("2030-01-02 03:04:05").unwrap()),
+                task_name: None,
+                account: AccountSelection {
+                    phone: Some("private-route".into()),
+                    partition: Some("persist:private".into()),
+                },
+                wechat_link: WechatLink::default(),
+                overrides: vec![],
+                targets: vec![Platform::Douyin, Platform::Bilibili],
+            },
+            state: PublishState::Queued,
+            recorded_at,
+            detail: Some("private detail".into()),
+        };
+
+        let entry = PublicationHistoryEntry::from(&record);
+        let serialized = serde_json::to_value(&entry).unwrap();
+        let fields = serialized.as_object().unwrap();
+
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields["id"], "history-public-1");
+        assert_eq!(fields["state"], "queued");
+        assert_eq!(fields["recorded_at"], recorded_at.to_rfc3339());
+        assert_eq!(fields["title"], "Safe title");
+        assert_eq!(fields["targets"], serde_json::json!(["dy", "blbl"]));
+        assert_eq!(fields["draft"], true);
+        assert_eq!(fields["scheduled"], true);
+
+        let rendered = serialized.to_string();
+        for forbidden in [
+            "/private/video.mp4",
+            "private-tag",
+            "private-route",
+            "persist:private",
+            "private detail",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
     #[test]
     fn history_filter_includes_its_cutoff_and_intersects_platform_and_status() {
         let now = Utc::now();

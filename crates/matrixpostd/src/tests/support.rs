@@ -140,6 +140,16 @@ impl Repository for FailFirstCompletionRepository {
         self.inner.append_history(record)
     }
 
+    fn record_provider_dispatch_history(
+        &self,
+        request: &PublishRequest,
+        report: &ProviderDispatchReport,
+        recorded_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<matrixpost_core::HistoryRecord, DomainError> {
+        self.inner
+            .record_provider_dispatch_history(request, report, recorded_at)
+    }
+
     fn history(&self) -> Result<Vec<matrixpost_core::HistoryRecord>, DomainError> {
         self.inner.history()
     }

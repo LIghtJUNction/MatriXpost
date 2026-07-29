@@ -1,7 +1,7 @@
 use matrixpost_core::{
     Account, AccountStatus, ApprovalStatus, ArticleAccount, ArticleAccountStatus, BusinessObject,
-    BusinessObjectStatus, BusinessRelation, ContentAttribution, HistoryRecord, LedgerDirection,
-    LedgerEntry, Platform, PublishState,
+    BusinessObjectStatus, BusinessRelation, ContentAttribution, LedgerDirection, LedgerEntry,
+    Platform, PublicationHistoryEntry,
 };
 
 use crate::{
@@ -68,23 +68,16 @@ impl From<BusinessRelation> for LifecycleBusinessRelationEntry {
     }
 }
 
-impl From<HistoryRecord> for HistoryEntry {
-    fn from(record: HistoryRecord) -> Self {
-        let scheduled =
-            record.state == PublishState::Queued && record.request.scheduled_at.is_some();
+impl From<PublicationHistoryEntry> for HistoryEntry {
+    fn from(record: PublicationHistoryEntry) -> Self {
         Self {
             id: record.id,
-            state: publish_state_label(record.state),
-            recorded_at: record.recorded_at.to_rfc3339(),
-            title: record.request.title,
-            targets: record
-                .request
-                .targets
-                .into_iter()
-                .map(|platform| platform.as_str().to_owned())
-                .collect(),
-            draft: record.request.draft,
-            scheduled,
+            state: record.state,
+            recorded_at: record.recorded_at,
+            title: record.title,
+            targets: record.targets,
+            draft: record.draft,
+            scheduled: record.scheduled,
         }
     }
 }
@@ -137,17 +130,6 @@ pub(crate) const fn article_account_status_label(status: ArticleAccountStatus) -
         ArticleAccountStatus::Expired => "expired",
         ArticleAccountStatus::LoggedOut => "logged_out",
         ArticleAccountStatus::Unavailable => "unavailable",
-    }
-}
-
-const fn publish_state_label(state: PublishState) -> &'static str {
-    match state {
-        PublishState::Draft => "draft",
-        PublishState::Queued => "queued",
-        PublishState::Dispatching => "dispatching",
-        PublishState::Published => "published",
-        PublishState::Failed => "failed",
-        PublishState::Unavailable => "unavailable",
     }
 }
 

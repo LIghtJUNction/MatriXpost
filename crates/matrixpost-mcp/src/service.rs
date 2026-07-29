@@ -4,8 +4,8 @@ use chrono::Utc;
 use matrixpost_core::{
     Account, ArticleAccount, ArticleHistoryRecord, ArticlePublicationQueue, ArticleRunner,
     BusinessObject, BusinessRelation, ContentAttribution, DomainError, HistoryFilter,
-    HistoryRecord, HistoryStatus, LedgerEntry, LifecycleRepository, Platform, ProviderRegistry,
-    ProviderRunner, PublicationQueue, Repository, SqliteRepository,
+    HistoryStatus, LedgerEntry, LifecycleRepository, Platform, ProviderRegistry, ProviderRunner,
+    PublicationHistoryEntry, PublicationQueue, Repository, SqliteRepository,
 };
 use rmcp::{handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router};
 use serde::Serialize;
@@ -392,7 +392,7 @@ impl MatrixpostMcp {
     pub(crate) fn list_history_result(
         &self,
         input: ListHistoryInput,
-    ) -> Result<Vec<HistoryRecord>, String> {
+    ) -> Result<Vec<PublicationHistoryEntry>, String> {
         let filter = HistoryFilter::from_query(
             input.days,
             input.all.unwrap_or(false),
@@ -401,11 +401,15 @@ impl MatrixpostMcp {
             Utc::now(),
         )
         .map_err(|error| error.to_string())?;
-        Ok(filter.filter(
-            self.repository
-                .history()
-                .map_err(|error| error.to_string())?,
-        ))
+        Ok(filter
+            .filter(
+                self.repository
+                    .history()
+                    .map_err(|error| error.to_string())?,
+            )
+            .into_iter()
+            .map(PublicationHistoryEntry::from)
+            .collect())
     }
 
     pub(crate) fn list_article_history_result(&self) -> Result<Vec<ArticleHistoryRecord>, String> {
@@ -439,11 +443,16 @@ impl MatrixpostMcp {
         if request.draft || request.scheduled_at.is_some() {
             return self.persist_local_video_job(&request);
         }
-        Ok(video_dispatch_result(
-            self.provider_registry
-                .dispatch_all(&request)
-                .map_err(|error| error.to_string())?,
-        ))
+        let report = self
+            .provider_registry
+            .dispatch_all(&request)
+            .map_err(|error| error.to_string())?;
+        self.repository
+            .record_provider_dispatch_history(&request, &report, Utc::now())
+            .map_err(|_| "local dispatch result could not be persisted".to_owned())?;
+        let mut result = video_dispatch_result(report);
+        result.persisted = true;
+        Ok(result)
     }
 
     fn persist_local_video_job(

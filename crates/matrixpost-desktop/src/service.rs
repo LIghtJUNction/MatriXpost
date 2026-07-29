@@ -5,7 +5,8 @@ use matrixpost_core::{
     Account, AccountReadiness, AccountStatus, ApprovalStatus, ArticleAccount, ArticlePlatform,
     BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution, HistoryFilter,
     HistoryStatus, LedgerEntry, LifecycleRepository, LocalSchedule, MediaSource, Platform,
-    PublicationQueue, PublishRequest, Repository, ReviewStatus, SqliteRepository,
+    PublicationHistoryEntry, PublicationQueue, PublishRequest, Repository, ReviewStatus,
+    SqliteRepository,
 };
 
 use crate::{
@@ -146,7 +147,7 @@ impl DesktopService {
 
         let registry = local_runner_registry(&input.provider_runners, &request.targets)?;
 
-        local_runner_dispatch_report(&registry, &request)
+        local_runner_dispatch_report(self.repository.as_ref(), &registry, &request)
     }
 
     /// Probes an explicitly declared local runner once for an upload-form
@@ -287,6 +288,7 @@ impl DesktopService {
         Ok(filter
             .filter(self.repository.history()?)
             .into_iter()
+            .map(PublicationHistoryEntry::from)
             .map(HistoryEntry::from)
             .collect())
     }

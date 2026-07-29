@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::Utc;
 use matrixpost_core::{
     ApprovalStatus, BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution,
     DispatchOutcome, DomainError, LedgerEntry, LifecycleRepository, Platform,
@@ -540,7 +541,19 @@ fn contains_secret(value: &serde_json::Value) -> bool {
 async fn publish(State(state): State<AppState>, body: Bytes) -> Response {
     match parse_publish(body) {
         Ok(request) => match state.providers.dispatch_all(&request) {
-            Ok(report) => dispatch_response(request, report),
+            Ok(report) => match state.repository.record_provider_dispatch_history(
+                &request,
+                &report,
+                Utc::now(),
+            ) {
+                Ok(_) => dispatch_response(request, report),
+                Err(_) => response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed",
+                    serde_json::Value::Null,
+                    "local dispatch result could not be persisted",
+                ),
+            },
             Err(error) => invalid(error.to_string()),
         },
         Err(error) => *error,

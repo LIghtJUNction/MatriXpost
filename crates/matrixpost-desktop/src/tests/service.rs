@@ -344,8 +344,13 @@ fn local_runner_dispatch_reports_unavailable_runner_without_sensitive_details() 
     registry
         .register(Box::new(UnavailableLocalRunner))
         .expect("registered unavailable local runner");
-    let report = crate::runner::local_runner_dispatch_report(&registry, &direct_runner_request())
-        .expect("unavailable local runner is reported without transport");
+    let repository = SqliteRepository::in_memory().expect("in-memory state");
+    let report = crate::runner::local_runner_dispatch_report(
+        &repository,
+        &registry,
+        &direct_runner_request(),
+    )
+    .expect("unavailable local runner is reported without transport");
 
     assert_eq!(report.outcomes.len(), 1);
     assert_eq!(report.outcomes[0].platform, "dy");
@@ -357,6 +362,9 @@ fn local_runner_dispatch_reports_unavailable_runner_without_sensitive_details() 
     assert!(!report.remote_publish_confirmed);
     let rendered = format!("{report:?}");
     assert!(!rendered.contains("private runner endpoint"));
+    let history = repository.history().expect("local dispatch history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].state, PublishState::Unavailable);
 }
 
 #[test]
