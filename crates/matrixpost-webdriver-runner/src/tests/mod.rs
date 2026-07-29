@@ -3,6 +3,7 @@ mod baijiahao;
 mod bilibili;
 mod browser;
 mod douyin;
+mod kuaishou;
 mod protocol;
 mod support;
 mod wechat;

@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::profiles::*;
+mod kuaishou;
 
 pub(crate) trait WebDriverTransport: Send + Sync {
     fn request(&self, method: &str, path: &str, body: Value) -> Result<Value, String>;
@@ -642,7 +643,11 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         }
         if !matches!(
             platform,
-            Platform::WechatChannels | Platform::Douyin | Platform::Bilibili | Platform::Baijiahao
+            Platform::WechatChannels
+                | Platform::Douyin
+                | Platform::Bilibili
+                | Platform::Baijiahao
+                | Platform::Kuaishou
         ) && let Some(statement) =
             override_value.and_then(|item| item.creative_statement.as_ref())
         {
@@ -751,8 +756,7 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
         let file = file
             .to_str()
             .ok_or_else(|| "local media path is not valid Unicode".to_owned())?;
-        // Reject malformed product input before creating an attached-browser
-        // session. A configured link is actionable only for WeChat Channels.
+        // Validate WeChat product input before creating an attached-browser session.
         let wechat_product = if platform == Platform::WechatChannels {
             Self::wechat_product_id(request)?
         } else {
@@ -769,6 +773,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             .flatten();
         let bilibili_creative_statement = (platform == Platform::Bilibili)
             .then(|| bilibili_creative_statement_label(request))
+            .flatten();
+        let kuaishou_creative_statement = (platform == Platform::Kuaishou)
+            .then(|| kuaishou_creative_statement_label(request))
             .flatten();
         let session = self.session()?;
         let outcome: Result<(), String> = (|| {
@@ -799,6 +806,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             }
             if let Some(label) = bilibili_creative_statement {
                 self.apply_bilibili_creative_statement(&session, label)?;
+            }
+            if let Some(label) = kuaishou_creative_statement {
+                self.apply_kuaishou_creative_statement(&session, label)?;
             }
             if platform == Platform::WechatChannels {
                 self.try_declare_wechat_original(&session)?;
