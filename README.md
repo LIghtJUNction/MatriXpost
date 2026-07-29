@@ -32,9 +32,15 @@ is not invoked by any provider.
 `publish-article`, `accounts`, and `history`. Commands write one JSON document
 to stdout. Exit codes are: `0` completed local query, `2` invalid input, `3`
 provider unavailable, and `4` internal failure; `1` has no stable meaning yet.
-The initial implementation intentionally returns `unavailable` for login or
-publishing: it does **not** claim real browser publishing without a provider
-adapter. A CLI caller may declare local runner endpoints with repeated
+`login` is a manual handoff, not a login-success assertion. Use a matching,
+separately started loopback runner: `matrixpost --provider-runner
+<platform>=tcp:127.0.0.1:<port> login --platform <platform>`. It sends only a
+versioned platform request to that runner's `/v1/login`; an `opened` outcome
+means the user must finish login manually in the already user-managed browser.
+It does not confirm a completed login or any publication. An absent or non-TCP
+runner returns `unavailable`; a rejected or failed handoff is not success.
+
+A CLI caller may declare local runner endpoints with repeated
 `--provider-runner PLATFORM=tcp:127.0.0.1:PORT` (or the documented Unix-socket
 and Windows-named-pipe forms); the daemon accepts the same declarations in
 `provider_runners` TOML. These declarations are validated as local and
@@ -78,12 +84,19 @@ ChromeDriver attaches to that existing browser through
 `goog:chromeOptions.debuggerAddress`; it never starts a fresh browser profile.
 Without `--browser-debugger-address`, the runner remains healthy but every
 publish request returns `unavailable` and no WebDriver session is created.
+Manual-login navigation is separately opt-in with `--allow-login-navigation`;
+it uses that same attached browser only to open the platform page, then leaves
+the user to complete login manually. It never extracts a profile, cookie, or
+session.
 
 ```bash
 matrixpost-webdriver-runner \
   --bind 127.0.0.1:39001 \
   --webdriver-endpoint http://127.0.0.1:9515 \
-  --browser-debugger-address 127.0.0.1:9222
+  --browser-debugger-address 127.0.0.1:9222 \
+  --allow-login-navigation
+matrixpost --provider-runner dy=tcp:127.0.0.1:39001 \
+  login --platform dy
 matrixpost --provider-runner dy=tcp:127.0.0.1:39001 \
   publish -p dy -f /absolute/path/video.mp4 -t "Title"
 matrixpost-webdriver-runner \
@@ -203,8 +216,11 @@ opens `matrixpost.db` below the operating system application-data directory,
 directly through `matrixpost-core`; it does not start `matrixpostd` or any
 provider process. Its overview exposes only credential-free account/history
 metadata, and its form can save a validated **local draft**. The desktop UI
-plainly reports that provider automation is unavailable and has no remote
-publish action.
+also provides an explicit-confirmation, one-shot local-runner dispatch form.
+It accepts runner declarations only for that invocation, does not start a
+runner or browser, and persists neither runner nor browser configuration. Its
+outcomes describe only local runner results and always report remote publication
+as unconfirmed.
 
 Run the local shell during development from the workspace root:
 
@@ -226,9 +242,9 @@ there is no macOS or Windows bundle or runtime evidence.
 
 The static frontend uses Tauri's injected global IPC bridge
 (`withGlobalTauri:true`) because it has no Node dependency or bundler. That
-bridge reaches fourteen typed Rust commands: `desktop_snapshot`,
-`save_local_draft`, `save_account`, `save_article_account`, and
-`local_history`, plus `lifecycle_objects`, `create_lifecycle_object`,
+bridge reaches fifteen typed Rust commands: `desktop_snapshot`,
+`save_local_draft`, `dispatch_to_local_runner`, `save_account`,
+`save_article_account`, and `local_history`, plus `lifecycle_objects`, `create_lifecycle_object`,
 `lifecycle_ledger_entries`, `append_lifecycle_ledger_entry`,
 `lifecycle_content_attributions`, `add_lifecycle_content_attribution`, and
 `lifecycle_business_relations`, `add_lifecycle_business_relation`, and
@@ -240,7 +256,9 @@ id, state, time, title, targets, and local draft/schedule intent. It never
 exposes media paths, account routing, serialized requests, sessions, or
 credentials to the frontend. The default capability grants `core:default`
 only: no shell, filesystem, HTTP, or remote URL plugin permission is
-configured. The shell has no runner configuration or remote-dispatch UI.
+configured. The shell has no persisted runner configuration or remote-dispatch
+success state. The one-shot form sends only explicitly entered loopback runner
+declarations after confirmation.
 
 ## Delivery plan
 

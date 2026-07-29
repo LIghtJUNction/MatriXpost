@@ -7,9 +7,10 @@ use clap::{Args, Parser, Subcommand};
 use matrixpost_core::{
     AccountSelection, ApprovalStatus, ArticleDispatchOutcome, ArticleRunner, BusinessObject,
     BusinessObjectStatus, BusinessRelation, ContentAttribution, HistoryFilter, HistoryStatus,
-    LedgerDirection, LedgerEntry, LifecycleRepository, LocalSchedule, MediaSource, Platform,
-    PlatformOverride, ProviderDispatchReport, ProviderRegistry, ProviderRunner,
-    PublishArticleRequest, PublishRequest, Repository, SqliteRepository, WechatLink,
+    LedgerDirection, LedgerEntry, LifecycleRepository, LocalSchedule, ManualLoginOutcome,
+    MediaSource, Platform, PlatformOverride, ProviderDispatchReport, ProviderRegistry,
+    ProviderRunner, PublishArticleRequest, PublishRequest, Repository, SqliteRepository,
+    WechatLink,
 };
 use serde::Serialize;
 
@@ -419,12 +420,51 @@ fn emit_article_dispatch_outcome(outcome: ArticleDispatchOutcome) -> ExitCode {
 }
 
 fn provider_registry(values: &[String]) -> Result<ProviderRegistry, String> {
+    ProviderRegistry::from_runners(provider_runners(values)?).map_err(|error| error.to_string())
+}
+
+fn provider_runners(values: &[String]) -> Result<Vec<ProviderRunner>, String> {
     let runners = values
         .iter()
         .map(|value| ProviderRunner::parse_cli(value))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    ProviderRegistry::from_runners(runners).map_err(|error| error.to_string())
+    Ok(runners)
+}
+
+fn login_runner(runners: &[ProviderRunner], platform: Platform) -> Option<&ProviderRunner> {
+    runners.iter().find(|runner| runner.platform == platform)
+}
+
+fn dispatch_manual_login(runners: &[ProviderRunner], platform: Platform) -> ExitCode {
+    let Some(runner) = login_runner(runners, platform) else {
+        return emit(
+            3,
+            serde_json::json!({ "outcome": "unavailable", "platform": platform }),
+            Some("no local runner is configured for this platform; no login was attempted"),
+        );
+    };
+    match runner.request_manual_login() {
+        Ok(ManualLoginOutcome::Opened) => emit(
+            0,
+            serde_json::json!({
+                "outcome": "opened",
+                "platform": platform,
+                "manual_login_required": true,
+            }),
+            Some("local runner opened the platform page; finish login manually before publishing"),
+        ),
+        Ok(ManualLoginOutcome::Unavailable) => emit(
+            3,
+            serde_json::json!({ "outcome": "unavailable", "platform": platform }),
+            Some("local runner is unavailable; no login success is asserted"),
+        ),
+        Ok(ManualLoginOutcome::Rejected) | Err(_) => emit(
+            4,
+            serde_json::json!({ "outcome": "rejected", "platform": platform }),
+            Some("local runner login request was rejected; no login success is asserted"),
+        ),
+    }
 }
 fn article_runner(values: &[String]) -> Result<Option<ArticleRunner>, String> {
     match values {
@@ -847,6 +887,10 @@ fn open(path: PathBuf) -> Result<SqliteRepository, String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let runners = match provider_runners(&cli.provider_runner) {
+        Ok(runners) => runners,
+        Err(error) => return emit(2, serde_json::Value::Null, Some(&error)),
+    };
     let registry = match provider_registry(&cli.provider_runner) {
         Ok(registry) => registry,
         Err(error) => return emit(2, serde_json::Value::Null, Some(&error)),
@@ -857,7 +901,7 @@ fn main() -> ExitCode {
     };
     match cli.command {
         Command::Login { platform } => match Platform::from_str(&platform) {
-            Ok(value) => unavailable(vec![value]),
+            Ok(value) => dispatch_manual_login(&runners, value),
             Err(error) => emit(2, serde_json::Value::Null, Some(&error.to_string())),
         },
         Command::Publish(args) => match parse_request(args) {
@@ -1159,6 +1203,42 @@ mod tests {
         assert_eq!(
             registry.availability_report()[&Platform::Douyin],
             matrixpost_core::ProviderAvailability::Available
+        );
+    }
+
+    #[test]
+    fn login_parser_selects_only_the_runner_for_its_platform() {
+        let parsed = Cli::try_parse_from([
+            "matrixpost",
+            "--provider-runner",
+            "dy=tcp:127.0.0.1:39001",
+            "--provider-runner",
+            "ks=unix:/tmp/matrixpost-ks.sock",
+            "login",
+            "--platform",
+            "dy",
+        ])
+        .unwrap();
+        let Command::Login { platform } = parsed.command else {
+            panic!("expected login command")
+        };
+        let platform = Platform::from_str(&platform).unwrap();
+        let runners = provider_runners(&parsed.provider_runner).unwrap();
+        let selected = login_runner(&runners, platform).unwrap();
+        assert_eq!(selected.platform, Platform::Douyin);
+        assert_eq!(
+            selected.loopback_tcp_address(),
+            Some("127.0.0.1:39001".parse().unwrap())
+        );
+        assert!(login_runner(&runners, Platform::Bilibili).is_none());
+    }
+
+    #[test]
+    fn login_without_a_loopback_tcp_runner_is_safely_unavailable() {
+        let runners = provider_runners(&["dy=unix:/tmp/matrixpost-dy.sock".into()]).unwrap();
+        assert_eq!(
+            dispatch_manual_login(&runners, Platform::Douyin),
+            ExitCode::from(3)
         );
     }
 

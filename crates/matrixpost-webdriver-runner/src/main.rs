@@ -28,8 +28,9 @@ use axum::{
 use clap::Parser;
 use matrixpost_core::{
     ARTICLE_RUNNER_PROTOCOL_VERSION, ArticlePlatform, ArticleRunnerRequest, ArticleRunnerResponse,
-    MediaSource, PROVIDER_RUNNER_PROTOCOL_VERSION, Platform, ProviderRunnerRequest,
-    ProviderRunnerResponse, PublishArticleRequest, PublishRequest,
+    LOGIN_RUNNER_PROTOCOL_VERSION, LoginRunnerRequest, LoginRunnerResponse, MediaSource,
+    PROVIDER_RUNNER_PROTOCOL_VERSION, Platform, ProviderRunnerRequest, ProviderRunnerResponse,
+    PublishArticleRequest, PublishRequest,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -330,6 +331,12 @@ impl WebDriverTransport for HttpWebDriver {
 
 trait PublicationExecutor: Send + Sync {
     fn publish(&self, platform: Platform, request: &PublishRequest) -> Result<String, String>;
+}
+
+/// Opens an existing attached browser at a platform page for a user-driven
+/// login. It does not inspect session state or assert that login completed.
+trait LoginNavigationExecutor: Send + Sync {
+    fn open_manual_login(&self, platform: Platform) -> Result<(), String>;
 }
 
 #[derive(Debug)]
@@ -679,6 +686,18 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
     }
 }
 
+impl<T: WebDriverTransport> LoginNavigationExecutor for WebDriverPublisher<T> {
+    fn open_manual_login(&self, platform: Platform) -> Result<(), String> {
+        let profile = profile(platform)
+            .ok_or_else(|| "no WebDriver profile is installed for platform".to_owned())?;
+        let session = self.session()?;
+        let outcome = self.navigate(&session, profile.upload_url);
+        let cleanup = self.delete_session(&session);
+        outcome?;
+        cleanup
+    }
+}
+
 impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
     fn publish(&self, platform: Platform, request: &PublishRequest) -> Result<String, String> {
         let profile = profile(platform)
@@ -786,6 +805,7 @@ impl<T: WebDriverTransport> ArticlePublicationExecutor for WebDriverPublisher<T>
 
 struct RunnerService {
     executor: Option<Arc<dyn PublicationExecutor>>,
+    login_executor: Option<Arc<dyn LoginNavigationExecutor>>,
     article_executor: Option<Arc<dyn ArticlePublicationExecutor>>,
     browser_debugger_address: Option<SocketAddr>,
     debugger_probe: Arc<dyn BrowserDebuggerProbe>,
@@ -949,11 +969,49 @@ async fn publish_article(
     (StatusCode::OK, Json(response))
 }
 
+async fn login(
+    State(state): State<Arc<RunnerService>>,
+    Json(body): Json<LoginRunnerRequest>,
+) -> impl IntoResponse {
+    if body.version != LOGIN_RUNNER_PROTOCOL_VERSION {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(LoginRunnerResponse::Rejected {
+                version: LOGIN_RUNNER_PROTOCOL_VERSION,
+                platform: body.platform,
+                reason: "invalid manual login request version".into(),
+            }),
+        );
+    }
+    let response = match &state.login_executor {
+        None => LoginRunnerResponse::Unavailable {
+            version: LOGIN_RUNNER_PROTOCOL_VERSION,
+            platform: body.platform,
+            reason: "manual login navigation is not enabled or no browser session is attached"
+                .into(),
+        },
+        Some(executor) => match executor.open_manual_login(body.platform) {
+            Ok(()) => LoginRunnerResponse::Opened {
+                version: LOGIN_RUNNER_PROTOCOL_VERSION,
+                platform: body.platform,
+                manual_login_required: true,
+            },
+            Err(_) => LoginRunnerResponse::Rejected {
+                version: LOGIN_RUNNER_PROTOCOL_VERSION,
+                platform: body.platform,
+                reason: "manual login navigation could not be completed".into(),
+            },
+        },
+    };
+    (StatusCode::OK, Json(response))
+}
+
 fn app(service: Arc<RunnerService>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/publish", post(publish))
         .route("/v1/publish-article", post(publish_article))
+        .route("/v1/login", post(login))
         .with_state(service)
 }
 
@@ -974,6 +1032,10 @@ struct Args {
     /// Permit the irreversible article publish confirmation endpoint.
     #[arg(long)]
     allow_article_publish: bool,
+    /// Permit navigating an already-attached browser to a platform page for a
+    /// user to complete login manually. This never reads or exports login data.
+    #[arg(long)]
+    allow_login_navigation: bool,
 }
 
 fn build_executor(
@@ -1022,6 +1084,31 @@ fn build_article_executor(
     }
 }
 
+fn build_login_executor(
+    endpoint: Option<Url>,
+    debugger_address: Option<SocketAddr>,
+    allow_login_navigation: bool,
+) -> Result<Option<Arc<dyn LoginNavigationExecutor>>, String> {
+    if !allow_login_navigation {
+        return Ok(None);
+    }
+    match (endpoint, debugger_address) {
+        (Some(endpoint), Some(address)) if address.ip().is_loopback() => {
+            Ok(Some(Arc::new(WebDriverPublisher {
+                transport: HttpWebDriver { endpoint },
+                browser_debugger_address: address,
+                acknowledgement: AcknowledgementPolicy::production(),
+                next_job: AtomicU64::new(1),
+            })))
+        }
+        (Some(_), Some(_)) => Err("browser debugger address must be loopback".into()),
+        (None, Some(_)) => {
+            Err("--webdriver-endpoint is required when --browser-debugger-address is set".into())
+        }
+        (_, None) => Ok(None),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
@@ -1047,7 +1134,7 @@ async fn main() -> ExitCode {
         }
     };
     let article_executor = match build_article_executor(
-        endpoint,
+        endpoint.clone(),
         args.browser_debugger_address,
         args.allow_article_publish,
     ) {
@@ -1057,8 +1144,20 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let login_executor = match build_login_executor(
+        endpoint,
+        args.browser_debugger_address,
+        args.allow_login_navigation,
+    ) {
+        Ok(executor) => executor,
+        Err(error) => {
+            eprintln!("matrixpost-webdriver-runner configuration error: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let service = Arc::new(RunnerService {
         executor,
+        login_executor,
         article_executor,
         browser_debugger_address: args.browser_debugger_address,
         debugger_probe: Arc::new(HttpBrowserDebuggerProbe),
@@ -1229,7 +1328,20 @@ mod tests {
     ) -> RunnerService {
         RunnerService {
             executor,
+            login_executor: None,
             article_executor,
+            browser_debugger_address: None,
+            debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
+        }
+    }
+
+    fn runner_service_with_login(
+        login_executor: Option<Arc<dyn LoginNavigationExecutor>>,
+    ) -> RunnerService {
+        RunnerService {
+            executor: None,
+            login_executor,
+            article_executor: None,
             browser_debugger_address: None,
             debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
         }
@@ -1242,6 +1354,7 @@ mod tests {
     ) -> RunnerService {
         RunnerService {
             executor,
+            login_executor: None,
             article_executor: None,
             browser_debugger_address,
             debugger_probe: Arc::new(StaticBrowserDebuggerProbe(probe_ready)),
@@ -1255,6 +1368,131 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn manual_login_protocol_rejects_invalid_versions_and_unknown_fields() {
+        let router = app(Arc::new(runner_service_with_login(Some(Arc::new(
+            AcceptedLogin,
+        )))));
+        let invalid_version = json!({
+            "version": LOGIN_RUNNER_PROTOCOL_VERSION + 1,
+            "platform": "dy"
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/v1/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(invalid_version.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let unknown = json!({
+            "version": LOGIN_RUNNER_PROTOCOL_VERSION,
+            "platform": "dy",
+            "cookie": "forbidden"
+        });
+        let response = router
+            .oneshot(
+                Request::post("/v1/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(unknown.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn manual_login_protocol_is_unavailable_without_explicit_executor() {
+        let router = app(Arc::new(runner_service_with_login(None)));
+        let response = router
+            .oneshot(
+                Request::post("/v1/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&LoginRunnerRequest {
+                            version: LOGIN_RUNNER_PROTOCOL_VERSION,
+                            platform: Platform::Douyin,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<LoginRunnerResponse>(&body).unwrap(),
+            LoginRunnerResponse::Unavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn manual_login_protocol_opens_only_the_manual_login_page() {
+        let router = app(Arc::new(runner_service_with_login(Some(Arc::new(
+            AcceptedLogin,
+        )))));
+        let response = router
+            .oneshot(
+                Request::post("/v1/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&LoginRunnerRequest {
+                            version: LOGIN_RUNNER_PROTOCOL_VERSION,
+                            platform: Platform::Douyin,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<LoginRunnerResponse>(&body).unwrap(),
+            LoginRunnerResponse::Opened {
+                version: LOGIN_RUNNER_PROTOCOL_VERSION,
+                platform: Platform::Douyin,
+                manual_login_required: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_login_protocol_rejects_executor_failures_without_exposing_them() {
+        let router = app(Arc::new(runner_service_with_login(Some(Arc::new(
+            FailingLogin,
+        )))));
+        let response = router
+            .oneshot(
+                Request::post("/v1/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&LoginRunnerRequest {
+                            version: LOGIN_RUNNER_PROTOCOL_VERSION,
+                            platform: Platform::Douyin,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response = serde_json::from_slice::<LoginRunnerResponse>(&body).unwrap();
+        assert!(matches!(response, LoginRunnerResponse::Rejected { .. }));
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("raw webdriver failure")
+        );
     }
 
     #[tokio::test]
@@ -1527,6 +1765,52 @@ mod tests {
                 .is_some()
         );
     }
+    #[test]
+    fn login_executor_requires_explicit_startup_opt_in() {
+        let endpoint = local_webdriver_endpoint("http://127.0.0.1:9515").unwrap();
+        assert!(
+            build_login_executor(Some(endpoint.clone()), Some(debugger_address()), false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            build_login_executor(Some(endpoint), Some(debugger_address()), true)
+                .unwrap()
+                .is_some()
+        );
+    }
+    #[test]
+    fn manual_login_navigation_closes_the_temporary_session() {
+        let mock = MockWebDriver::new(vec![
+            value(json!({"sessionId":"login-session"})),
+            value(json!(null)),
+            value(json!(null)),
+        ]);
+        let publisher = test_publisher(mock);
+        publisher.open_manual_login(Platform::Douyin).unwrap();
+        let paths = publisher.transport.paths.lock().unwrap();
+        assert_eq!(paths[1], "/session/login-session/url");
+        assert!(paths.last().unwrap().ends_with("/session/login-session"));
+    }
+    #[test]
+    fn manual_login_navigation_failure_still_closes_the_temporary_session() {
+        let mock = MockWebDriver::new(vec![
+            value(json!({"sessionId":"login-session"})),
+            Err("navigation failed".into()),
+            value(json!(null)),
+        ]);
+        let publisher = test_publisher(mock);
+        assert!(publisher.open_manual_login(Platform::Douyin).is_err());
+        assert!(
+            publisher
+                .transport
+                .paths
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|path| path.ends_with("/session/login-session"))
+        );
+    }
     struct Accepted;
     impl PublicationExecutor for Accepted {
         fn publish(&self, _: Platform, _: &PublishRequest) -> Result<String, String> {
@@ -1539,6 +1823,22 @@ mod tests {
             _: &PublishArticleRequest,
         ) -> Result<String, ArticleExecutionError> {
             Ok("article-job-1".into())
+        }
+    }
+
+    struct AcceptedLogin;
+
+    impl LoginNavigationExecutor for AcceptedLogin {
+        fn open_manual_login(&self, _: Platform) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct FailingLogin;
+
+    impl LoginNavigationExecutor for FailingLogin {
+        fn open_manual_login(&self, _: Platform) -> Result<(), String> {
+            Err("raw webdriver failure".into())
         }
     }
 

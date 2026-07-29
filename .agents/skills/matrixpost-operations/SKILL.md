@@ -31,6 +31,8 @@ Treat `unavailable` as a correct result when no eligible loopback runner exists.
 
 Use repeatable `--provider-runner PLATFORM=tcp:127.0.0.1:PORT` declarations only for the separately started video runner. Use exactly one `--article-runner tcp:127.0.0.1:PORT` for Juejin and require that runner to have started with `--allow-article-publish`. Keep all runner addresses loopback and credential-free.
 
+For manual login, require a matching explicit loopback provider runner and a runner started with `--allow-login-navigation`. `matrixpost --provider-runner <platform>=tcp:127.0.0.1:<port> login --platform <platform>` only asks that existing runner to open the platform page in its already attached browser; the user completes login manually. Do not start a fresh browser, inspect browser state, or report `opened` as a completed login or publication.
+
 ## Operate generic lifecycle records
 
 Create an object before adding ledger entries, content attribution, or relations. Use caller-defined `kind`, stable `id`, optional external identifier, and safe attributes. Keep attributes descriptive; reject sensitive key names rather than guessing from ordinary business text.

@@ -2011,6 +2011,84 @@ pub enum DispatchOutcome {
 /// Version of the credential-free, local runner HTTP protocol.
 pub const PROVIDER_RUNNER_PROTOCOL_VERSION: u16 = 1;
 
+/// Version of the explicit, local-only manual-login navigation protocol.
+///
+/// This protocol can only ask an already-attached local runner to open a
+/// platform page. It never carries browser profiles, cookies, credentials, or
+/// a claim that a user has completed login.
+pub const LOGIN_RUNNER_PROTOCOL_VERSION: u16 = 1;
+
+/// Request sent to an explicitly configured local runner to open a platform
+/// page for a user to complete login manually.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginRunnerRequest {
+    pub version: u16,
+    pub platform: Platform,
+}
+
+/// Result returned by a local manual-login navigation request.
+///
+/// `Opened` confirms only that the runner navigated its already-attached
+/// browser to the platform page. The user must still complete login manually.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LoginRunnerResponse {
+    Opened {
+        version: u16,
+        platform: Platform,
+        /// Always true: navigation does not prove that the user completed login.
+        manual_login_required: bool,
+    },
+    Unavailable {
+        version: u16,
+        platform: Platform,
+        reason: String,
+    },
+    Rejected {
+        version: u16,
+        platform: Platform,
+        reason: String,
+    },
+}
+
+/// Validated result of asking a configured local runner to open its manual
+/// login page. None of these variants assert that the user completed login.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualLoginOutcome {
+    /// The runner opened its already-attached browser for manual login.
+    Opened,
+    /// No usable local loopback-TCP runner is configured or it is unavailable.
+    Unavailable,
+    /// The local runner response was rejected, malformed, or could not be read.
+    Rejected,
+}
+
+impl LoginRunnerResponse {
+    fn into_manual_login(self, expected_platform: Platform) -> Option<ManualLoginOutcome> {
+        match self {
+            Self::Opened {
+                version,
+                platform,
+                manual_login_required: true,
+            } if version == LOGIN_RUNNER_PROTOCOL_VERSION && platform == expected_platform => {
+                Some(ManualLoginOutcome::Opened)
+            }
+            Self::Unavailable {
+                version, platform, ..
+            } if version == LOGIN_RUNNER_PROTOCOL_VERSION && platform == expected_platform => {
+                Some(ManualLoginOutcome::Unavailable)
+            }
+            Self::Rejected {
+                version, platform, ..
+            } if version == LOGIN_RUNNER_PROTOCOL_VERSION && platform == expected_platform => {
+                Some(ManualLoginOutcome::Rejected)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Version of the credential-free local article runner HTTP protocol.
 pub const ARTICLE_RUNNER_PROTOCOL_VERSION: u16 = 1;
 
@@ -2340,6 +2418,51 @@ trait RunnerHttpTransport {
     fn post_json(&self, endpoint: &str, body: &str) -> Result<(u16, String), ()>;
 }
 
+/// HTTP boundary for the explicit local manual-login protocol.
+///
+/// Implementations must send only to the endpoint provided by
+/// [`ProviderRunner::request_manual_login_with`]. The core implementation
+/// supplies a bounded-timeout loopback HTTP client; this trait permits
+/// deterministic embedding tests without network access.
+pub trait ManualLoginHttpTransport {
+    fn post_json(
+        &self,
+        endpoint: &str,
+        body: &str,
+    ) -> Result<(u16, String), ManualLoginTransportError>;
+}
+
+/// Transport-level failure that never exposes local endpoints or runner data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualLoginTransportError {
+    RequestFailed,
+    ResponseReadFailed,
+}
+
+struct UreqManualLoginHttpTransport;
+
+impl ManualLoginHttpTransport for UreqManualLoginHttpTransport {
+    fn post_json(
+        &self,
+        endpoint: &str,
+        body: &str,
+    ) -> Result<(u16, String), ManualLoginTransportError> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(30))
+            .build();
+        let response = agent
+            .post(endpoint)
+            .set("content-type", "application/json")
+            .send_string(body)
+            .map_err(|_| ManualLoginTransportError::RequestFailed)?;
+        let status = response.status();
+        let body = response
+            .into_string()
+            .map_err(|_| ManualLoginTransportError::ResponseReadFailed)?;
+        Ok((status, body))
+    }
+}
+
 struct UreqRunnerHttpTransport;
 
 impl RunnerHttpTransport for UreqRunnerHttpTransport {
@@ -2514,6 +2637,63 @@ impl ProviderRunner {
             "{transport} runner configured for {}; no execution adapter is installed",
             self.platform.as_str()
         )
+    }
+
+    /// Returns the configured loopback TCP endpoint, if this declaration can
+    /// use the local HTTP runner protocol.
+    ///
+    /// Callers must not substitute arbitrary endpoints: this accessor enforces
+    /// loopback-only TCP even if a caller constructed the public fields
+    /// directly instead of using [`Self::validate`].
+    pub fn loopback_tcp_address(&self) -> Option<SocketAddr> {
+        match &self.transport {
+            ProviderRunnerTransport::Tcp { address } if address.ip().is_loopback() => {
+                Some(*address)
+            }
+            ProviderRunnerTransport::UnixSocket { .. }
+            | ProviderRunnerTransport::NamedPipe { .. }
+            | ProviderRunnerTransport::Tcp { .. } => None,
+        }
+    }
+
+    /// Asks this explicitly configured local runner to open a platform page
+    /// for manual login in its already-attached browser.
+    ///
+    /// This never starts a browser, reads browser state, or confirms that a
+    /// user completed login. Only a validated loopback-TCP declaration may
+    /// receive the request.
+    pub fn request_manual_login(&self) -> Result<ManualLoginOutcome, DomainError> {
+        self.request_manual_login_with(&UreqManualLoginHttpTransport)
+    }
+
+    /// Same as [`Self::request_manual_login`] with an injectable transport.
+    pub fn request_manual_login_with<T: ManualLoginHttpTransport>(
+        &self,
+        transport: &T,
+    ) -> Result<ManualLoginOutcome, DomainError> {
+        let Some(address) = self.loopback_tcp_address() else {
+            return Ok(ManualLoginOutcome::Unavailable);
+        };
+        let endpoint = format!("http://{address}/v1/login");
+        let payload = LoginRunnerRequest {
+            version: LOGIN_RUNNER_PROTOCOL_VERSION,
+            platform: self.platform,
+        };
+        let payload = serde_json::to_string(&payload).map_err(DomainError::serialization)?;
+        let (status, body) = match transport.post_json(&endpoint, &payload) {
+            Ok(response) => response,
+            Err(_) => return Ok(ManualLoginOutcome::Rejected),
+        };
+        if status != 200 {
+            return Ok(ManualLoginOutcome::Rejected);
+        }
+        let response: LoginRunnerResponse = match serde_json::from_str(&body) {
+            Ok(response) => response,
+            Err(_) => return Ok(ManualLoginOutcome::Rejected),
+        };
+        Ok(response
+            .into_manual_login(self.platform)
+            .unwrap_or(ManualLoginOutcome::Rejected))
     }
 }
 
@@ -3439,6 +3619,22 @@ mod tests {
                 200,
                 r#"{"outcome":"queued","version":1,"platform":"dy","job_id":"safe-job"}"#.into(),
             ))
+        }
+    }
+
+    struct CapturingManualLoginTransport {
+        captured: Mutex<Option<(String, String)>>,
+        response: Result<(u16, String), ManualLoginTransportError>,
+    }
+
+    impl ManualLoginHttpTransport for CapturingManualLoginTransport {
+        fn post_json(
+            &self,
+            endpoint: &str,
+            body: &str,
+        ) -> Result<(u16, String), ManualLoginTransportError> {
+            *self.captured.lock().unwrap() = Some((endpoint.into(), body.into()));
+            self.response.clone()
         }
     }
 
@@ -4970,6 +5166,117 @@ mod tests {
             .into_dispatch(Platform::Douyin)
             .is_none()
         );
+    }
+
+    #[test]
+    fn manual_login_protocol_dtos_are_versioned_and_reject_unknown_fields() {
+        let request = LoginRunnerRequest {
+            version: LOGIN_RUNNER_PROTOCOL_VERSION,
+            platform: Platform::Douyin,
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"version":1,"platform":"dy"}"#
+        );
+        assert!(
+            serde_json::from_str::<LoginRunnerRequest>(
+                r#"{"version":1,"platform":"dy","cookie":"forbidden"}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<LoginRunnerResponse>(
+                r#"{"outcome":"opened","version":1,"platform":"dy","manual_login_required":true,"extra":true}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn manual_login_uses_only_the_validated_loopback_endpoint_and_safe_payload() {
+        let runner = ProviderRunner::parse_cli("dy=tcp:127.0.0.1:39001").unwrap();
+        let transport = CapturingManualLoginTransport {
+            captured: Mutex::new(None),
+            response: Ok((
+                200,
+                r#"{"outcome":"opened","version":1,"platform":"dy","manual_login_required":true}"#
+                    .into(),
+            )),
+        };
+
+        assert_eq!(
+            runner.request_manual_login_with(&transport).unwrap(),
+            ManualLoginOutcome::Opened
+        );
+        let (endpoint, body) = transport.captured.lock().unwrap().clone().unwrap();
+        assert_eq!(endpoint, "http://127.0.0.1:39001/v1/login");
+        assert_eq!(body, r#"{"version":1,"platform":"dy"}"#);
+    }
+
+    #[test]
+    fn manual_login_rejects_malformed_and_mismatched_runner_responses() {
+        let runner = ProviderRunner::parse_cli("dy=tcp:127.0.0.1:39001").unwrap();
+        for response in [
+            Ok((200, "not-json".into())),
+            Ok((
+                200,
+                r#"{"outcome":"opened","version":1,"platform":"ks","manual_login_required":true}"#
+                    .into(),
+            )),
+            Ok((
+                200,
+                r#"{"outcome":"opened","version":1,"platform":"dy","manual_login_required":false}"#
+                    .into(),
+            )),
+            Ok((503, "service unavailable".into())),
+            Err(ManualLoginTransportError::RequestFailed),
+        ] {
+            let transport = CapturingManualLoginTransport {
+                captured: Mutex::new(None),
+                response,
+            };
+            assert_eq!(
+                runner.request_manual_login_with(&transport).unwrap(),
+                ManualLoginOutcome::Rejected
+            );
+        }
+    }
+
+    #[test]
+    fn manual_login_does_not_invoke_a_direct_nonloopback_runner() {
+        let runner = ProviderRunner {
+            platform: Platform::Douyin,
+            transport: ProviderRunnerTransport::Tcp {
+                address: "192.0.2.1:39001".parse().unwrap(),
+            },
+        };
+        let transport = CapturingManualLoginTransport {
+            captured: Mutex::new(None),
+            response: Ok((200, String::new())),
+        };
+        assert_eq!(
+            runner.request_manual_login_with(&transport).unwrap(),
+            ManualLoginOutcome::Unavailable
+        );
+        assert!(transport.captured.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn provider_runner_exposes_only_validated_loopback_tcp_addresses() {
+        let tcp = ProviderRunner::parse_cli("dy=tcp:127.0.0.1:39001").unwrap();
+        assert_eq!(
+            tcp.loopback_tcp_address(),
+            Some("127.0.0.1:39001".parse().unwrap())
+        );
+        let socket = ProviderRunner::parse_cli("dy=unix:/tmp/matrixpost.sock").unwrap();
+        assert_eq!(socket.loopback_tcp_address(), None);
+        let direct_remote = ProviderRunner {
+            platform: Platform::Douyin,
+            transport: ProviderRunnerTransport::Tcp {
+                address: "192.0.2.1:39001".parse().unwrap(),
+            },
+        };
+        assert_eq!(direct_remote.loopback_tcp_address(), None);
     }
 
     #[test]
