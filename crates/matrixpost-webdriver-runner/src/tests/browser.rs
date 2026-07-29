@@ -8,7 +8,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use matrixpost_core::*;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -266,6 +266,236 @@ fn missing_selector_fails_closed_and_still_closes_the_session() {
     ]);
     let publisher = test_publisher(mock);
     assert!(publisher.publish(Platform::Douyin, &request()).is_err());
+    assert!(
+        publisher
+            .transport
+            .paths
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .ends_with("/session/s")
+    );
+}
+
+#[test]
+fn wechat_publish_without_product_link_keeps_the_standard_protocol() {
+    let mock = MockWebDriver::new(vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+        Err("not visible".into()),
+        Err("not visible".into()),
+        element("submit"),
+        value(json!(null)),
+        element("success"),
+        value(json!(true)),
+        value(json!(null)),
+    ]);
+    let publisher = test_publisher(mock);
+    let mut request = request();
+    request.targets = vec![Platform::WechatChannels];
+    publisher
+        .publish(Platform::WechatChannels, &request)
+        .unwrap();
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert!(!bodies.iter().any(|body| {
+        body.get("script")
+            .and_then(Value::as_str)
+            .is_some_and(|script| script.contains("wujie-app"))
+    }));
+}
+
+#[test]
+fn wechat_link_type_none_disables_product_attachment_before_webdriver() {
+    let publisher = test_publisher(MockWebDriver::new(Vec::new()));
+    let mut request = request();
+    request.wechat_link.link_type = Some("NoNe".into());
+    request.wechat_link.link_value = Some("ignored-by-disabled-link".into());
+    assert_eq!(
+        WebDriverPublisher::<MockWebDriver>::wechat_product_id(&request).unwrap(),
+        None
+    );
+    assert!(publisher.transport.paths.lock().unwrap().is_empty());
+}
+
+#[test]
+fn wechat_product_link_runs_shadow_root_protocol_and_closes_session() {
+    let mock = MockWebDriver::new(vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        value(json!(true)),
+        Err("not visible".into()),
+        Err("not visible".into()),
+        element("submit"),
+        value(json!(null)),
+        element("success"),
+        value(json!(true)),
+        value(json!(null)),
+    ]);
+    let publisher = test_publisher(mock);
+    let mut request = request();
+    request.targets = vec![Platform::WechatChannels];
+    request.wechat_link.product_id = Some("product-1".into());
+    request.wechat_link.link_type = Some("none".into());
+    assert_eq!(
+        publisher
+            .publish(Platform::WechatChannels, &request)
+            .unwrap(),
+        "webdriver-sph-1"
+    );
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    let scripts = bodies
+        .iter()
+        .filter_map(|body| body.get("script").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let product_scripts = scripts
+        .iter()
+        .filter(|script| script.contains("wujie-app"))
+        .collect::<Vec<_>>();
+    assert_eq!(product_scripts.len(), 9);
+    assert!(
+        product_scripts
+            .iter()
+            .all(|script| script.contains("shadowRoot"))
+    );
+    for script in [
+        WECHAT_PRODUCT_SEARCH_SCRIPT,
+        WECHAT_PRODUCT_EXACT_ROW_SCRIPT,
+        WECHAT_PRODUCT_SELECT_EXACT_SCRIPT,
+    ] {
+        assert!(bodies.iter().any(|body| {
+            body.get("script") == Some(&Value::String(script.into()))
+                && body.get("args") == Some(&json!(["product-1"]))
+        }));
+    }
+    assert!(
+        publisher
+            .transport
+            .paths
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .ends_with("/session/s")
+    );
+}
+
+#[test]
+fn non_wechat_product_metadata_never_runs_wechat_shadow_scripts() {
+    let mock = MockWebDriver::new(vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+        Err("not visible".into()),
+        Err("not visible".into()),
+        element("submit"),
+        value(json!(null)),
+        element("success"),
+        value(json!(true)),
+        value(json!(null)),
+    ]);
+    let publisher = test_publisher(mock);
+    let mut request = request();
+    request.wechat_link.product_id = Some("product-1".into());
+    publisher.publish(Platform::Douyin, &request).unwrap();
+    assert!(
+        !publisher
+            .transport
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|body| {
+                body.get("script")
+                    .and_then(Value::as_str)
+                    .is_some_and(|script| script.contains("wujie-app"))
+            })
+    );
+}
+
+#[test]
+fn wechat_product_deadline_is_fixed_and_finite() {
+    assert_eq!(WECHAT_PRODUCT_POLL_ATTEMPTS, 30);
+    assert_eq!(
+        WECHAT_PRODUCT_POLL_INTERVAL,
+        std::time::Duration::from_millis(200)
+    );
+}
+
+#[test]
+fn malformed_wechat_product_link_fails_before_creating_session() {
+    for link in [
+        matrixpost_core::WechatLink {
+            link_type: Some("url".into()),
+            link_value: Some("https://example.invalid".into()),
+            ..Default::default()
+        },
+        matrixpost_core::WechatLink {
+            link_type: Some("product".into()),
+            link_value: Some("   ".into()),
+            ..Default::default()
+        },
+    ] {
+        let publisher = test_publisher(MockWebDriver::new(Vec::new()));
+        let mut request = request();
+        request.wechat_link = link;
+        assert!(
+            publisher
+                .publish(Platform::WechatChannels, &request)
+                .is_err()
+        );
+        assert!(publisher.transport.paths.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn wechat_product_failure_still_closes_the_temporary_session() {
+    let mock = MockWebDriver::new(vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+        value(json!(true)),
+        value(json!(false)),
+        value(json!(null)),
+    ]);
+    let publisher = test_publisher(mock);
+    let mut request = request();
+    request.wechat_link.product_id = Some("product-1".into());
+    assert!(
+        publisher
+            .publish(Platform::WechatChannels, &request)
+            .is_err()
+    );
     assert!(
         publisher
             .transport

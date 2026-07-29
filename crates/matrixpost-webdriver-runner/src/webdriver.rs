@@ -194,6 +194,93 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         .map(|_| ())
     }
 
+    fn execute_bool(&self, session: &str, script: &str, args: Value) -> Result<bool, String> {
+        Self::webdriver_value(self.transport.request(
+            "POST",
+            &format!("/session/{session}/execute/sync"),
+            json!({"script":script,"args":args}),
+        )?)?
+        .as_bool()
+        .ok_or_else(|| "WebDriver product action did not return a boolean".into())
+    }
+
+    fn wait_for_product_action(
+        &self,
+        session: &str,
+        script: &str,
+        args: Value,
+    ) -> Result<(), String> {
+        for attempt in 0..WECHAT_PRODUCT_POLL_ATTEMPTS {
+            if self.execute_bool(session, script, args.clone())? {
+                return Ok(());
+            }
+            if attempt + 1 < WECHAT_PRODUCT_POLL_ATTEMPTS {
+                std::thread::sleep(WECHAT_PRODUCT_POLL_INTERVAL);
+            }
+        }
+        Err("WeChat product action did not complete before its deadline".into())
+    }
+
+    pub(crate) fn wechat_product_id(request: &PublishRequest) -> Result<Option<String>, String> {
+        let link = &request.wechat_link;
+        let product_id = link.product_id.as_deref().map(str::trim);
+        let link_type = link.link_type.as_deref().map(str::trim);
+        let link_value = link.link_value.as_deref().map(str::trim);
+        // MatrixMedia accepts the explicit sphProductId independently of the
+        // optional `sphLink` object. Keep that precedence: a product ID is a
+        // complete product attachment request even if old input carries an
+        // unrelated link-type field beside it.
+        let product_id = if let Some(product_id) = product_id.filter(|value| !value.is_empty()) {
+            product_id
+        } else {
+            match link_type {
+                None if link_value.is_none() => return Ok(None),
+                Some(value) if value.eq_ignore_ascii_case("none") => return Ok(None),
+                Some(value) if value.eq_ignore_ascii_case("product") => link_value
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        "WeChat product link requires a non-empty product identifier".to_owned()
+                    })?,
+                Some(_) => {
+                    return Err("WeChat link type is not supported by the local runner".into());
+                }
+                None => return Err("WeChat link type is required for its link value".into()),
+            }
+        };
+        if product_id.len() > 128 || product_id.chars().any(char::is_control) {
+            return Err("WeChat product identifier is malformed".into());
+        }
+        Ok(Some(product_id.to_owned()))
+    }
+
+    fn attach_wechat_product(&self, session: &str, product_id: &str) -> Result<(), String> {
+        self.wait_for_product_action(session, WECHAT_PRODUCT_TYPE_READY_SCRIPT, json!([]))?;
+        if !self.execute_bool(session, WECHAT_PRODUCT_OPEN_CHOOSER_SCRIPT, json!([]))? {
+            return Err("WeChat product chooser could not be opened".into());
+        }
+        self.wait_for_product_action(session, WECHAT_PRODUCT_DIALOG_VISIBLE_SCRIPT, json!([]))?;
+        if !self.execute_bool(session, WECHAT_PRODUCT_SEARCH_SCRIPT, json!([product_id]))? {
+            return Err("WeChat product search could not be started".into());
+        }
+        self.wait_for_product_action(
+            session,
+            WECHAT_PRODUCT_EXACT_ROW_SCRIPT,
+            json!([product_id]),
+        )?;
+        if !self.execute_bool(
+            session,
+            WECHAT_PRODUCT_SELECT_EXACT_SCRIPT,
+            json!([product_id]),
+        )? {
+            return Err("WeChat product could not be selected".into());
+        }
+        self.wait_for_product_action(session, WECHAT_PRODUCT_ADD_READY_SCRIPT, json!([]))?;
+        if !self.execute_bool(session, WECHAT_PRODUCT_ADD_SCRIPT, json!([]))? {
+            return Err("WeChat product could not be added".into());
+        }
+        self.wait_for_product_action(session, WECHAT_PRODUCT_ATTACHED_SCRIPT, json!([]))
+    }
+
     fn is_visible(&self, session: &str, element: &str) -> Result<bool, String> {
         let value = Self::webdriver_value(self.transport.request(
             "POST",
@@ -499,6 +586,13 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
         let file = file
             .to_str()
             .ok_or_else(|| "local media path is not valid Unicode".to_owned())?;
+        // Reject malformed product input before creating an attached-browser
+        // session. A configured link is actionable only for WeChat Channels.
+        let wechat_product = if platform == Platform::WechatChannels {
+            Self::wechat_product_id(request)?
+        } else {
+            None
+        };
         let session = self.session()?;
         let outcome: Result<(), String> = (|| {
             self.navigate(&session, profile.upload_url)?;
@@ -507,6 +601,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             let description = Self::description(platform, request);
             if !description.is_empty() {
                 self.input(&session, profile.description, &description)?;
+            }
+            if let Some(product_id) = wechat_product.as_deref() {
+                self.attach_wechat_product(&session, product_id)?;
             }
             if self.success_marker_visible(&session, profile)? {
                 return Err(

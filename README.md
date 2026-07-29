@@ -200,7 +200,13 @@ Video `publishAt` accepts `YYYY-MM-DD HH:mm` or seconds; article `publishAt`
 also accepts `HH:mm`, normalized to the current local calendar date with zero
 seconds. For video-channel links, `sphLink.type` is exactly `none` or `product`;
 the latter requires `value`, while `sphProductId` takes precedence and creates
-the effective product link.
+the effective product link. With the explicit local WebDriver runner attached,
+only WeChat Channels (`sph`) can apply that effective product link. A nonempty
+`sphProductId` wins even when `sphLink.type` is `none`; otherwise `none` does
+nothing, and `product` requires a nonempty value. The bounded local workflow
+selects the product in the already user-managed browser and closes its temporary
+session; a queued result still does not confirm the platform accepted the video
+or product association.
 Neither tool accepts cookies, passwords, tokens, sessions, or credentials.
 The other ten tools are `list_business_objects`, `get_business_object`,
 `create_business_object`, `list_ledger_entries`, `append_ledger_entry`,

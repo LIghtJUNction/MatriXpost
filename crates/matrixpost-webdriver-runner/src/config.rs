@@ -65,6 +65,14 @@ pub(crate) fn build_executor(
     endpoint: Option<Url>,
     debugger_address: Option<SocketAddr>,
 ) -> Result<Option<Arc<dyn PublicationExecutor>>, String> {
+    Ok(build_attached_publisher(endpoint, debugger_address)?
+        .map(|publisher| publisher as Arc<dyn PublicationExecutor>))
+}
+
+fn build_attached_publisher(
+    endpoint: Option<Url>,
+    debugger_address: Option<SocketAddr>,
+) -> Result<Option<Arc<WebDriverPublisher<HttpWebDriver>>>, String> {
     match (endpoint, debugger_address) {
         (Some(endpoint), Some(address)) if address.ip().is_loopback() => {
             Ok(Some(Arc::new(WebDriverPublisher {
@@ -87,24 +95,10 @@ pub(crate) fn build_article_executor(
     debugger_address: Option<SocketAddr>,
     allow_article_publish: bool,
 ) -> Result<Option<Arc<dyn ArticlePublicationExecutor>>, String> {
-    if !allow_article_publish {
-        return Ok(None);
-    }
-    match (endpoint, debugger_address) {
-        (Some(endpoint), Some(address)) if address.ip().is_loopback() => {
-            Ok(Some(Arc::new(WebDriverPublisher {
-                transport: HttpWebDriver { endpoint },
-                browser_debugger_address: address,
-                acknowledgement: AcknowledgementPolicy::production(),
-                next_job: AtomicU64::new(1),
-            })))
-        }
-        (Some(_), Some(_)) => Err("browser debugger address must be loopback".into()),
-        (None, Some(_)) => {
-            Err("--webdriver-endpoint is required when --browser-debugger-address is set".into())
-        }
-        (_, None) => Ok(None),
-    }
+    Ok(
+        build_opt_in_publisher(endpoint, debugger_address, allow_article_publish)?
+            .map(|publisher| publisher as Arc<dyn ArticlePublicationExecutor>),
+    )
 }
 
 pub(crate) fn build_login_executor(
@@ -112,24 +106,10 @@ pub(crate) fn build_login_executor(
     debugger_address: Option<SocketAddr>,
     allow_login_navigation: bool,
 ) -> Result<Option<Arc<dyn LoginNavigationExecutor>>, String> {
-    if !allow_login_navigation {
-        return Ok(None);
-    }
-    match (endpoint, debugger_address) {
-        (Some(endpoint), Some(address)) if address.ip().is_loopback() => {
-            Ok(Some(Arc::new(WebDriverPublisher {
-                transport: HttpWebDriver { endpoint },
-                browser_debugger_address: address,
-                acknowledgement: AcknowledgementPolicy::production(),
-                next_job: AtomicU64::new(1),
-            })))
-        }
-        (Some(_), Some(_)) => Err("browser debugger address must be loopback".into()),
-        (None, Some(_)) => {
-            Err("--webdriver-endpoint is required when --browser-debugger-address is set".into())
-        }
-        (_, None) => Ok(None),
-    }
+    Ok(
+        build_opt_in_publisher(endpoint, debugger_address, allow_login_navigation)?
+            .map(|publisher| publisher as Arc<dyn LoginNavigationExecutor>),
+    )
 }
 
 pub(crate) fn build_account_status_executor(
@@ -137,24 +117,10 @@ pub(crate) fn build_account_status_executor(
     debugger_address: Option<SocketAddr>,
     allow_account_status_probe: bool,
 ) -> Result<Option<Arc<dyn AccountStatusExecutor>>, String> {
-    if !allow_account_status_probe {
-        return Ok(None);
-    }
-    match (endpoint, debugger_address) {
-        (Some(endpoint), Some(address)) if address.ip().is_loopback() => {
-            Ok(Some(Arc::new(WebDriverPublisher {
-                transport: HttpWebDriver { endpoint },
-                browser_debugger_address: address,
-                acknowledgement: AcknowledgementPolicy::production(),
-                next_job: AtomicU64::new(1),
-            })))
-        }
-        (Some(_), Some(_)) => Err("browser debugger address must be loopback".into()),
-        (None, Some(_)) => {
-            Err("--webdriver-endpoint is required when --browser-debugger-address is set".into())
-        }
-        (_, None) => Ok(None),
-    }
+    Ok(
+        build_opt_in_publisher(endpoint, debugger_address, allow_account_status_probe)?
+            .map(|publisher| publisher as Arc<dyn AccountStatusExecutor>),
+    )
 }
 
 pub(crate) fn build_review_status_executor(
@@ -162,23 +128,21 @@ pub(crate) fn build_review_status_executor(
     debugger_address: Option<SocketAddr>,
     allow_review_status_probe: bool,
 ) -> Result<Option<Arc<dyn ReviewStatusExecutor>>, String> {
-    if !allow_review_status_probe {
-        return Ok(None);
-    }
-    match (endpoint, debugger_address) {
-        (Some(endpoint), Some(address)) if address.ip().is_loopback() => {
-            Ok(Some(Arc::new(WebDriverPublisher {
-                transport: HttpWebDriver { endpoint },
-                browser_debugger_address: address,
-                acknowledgement: AcknowledgementPolicy::production(),
-                next_job: AtomicU64::new(1),
-            })))
-        }
-        (Some(_), Some(_)) => Err("browser debugger address must be loopback".into()),
-        (None, Some(_)) => {
-            Err("--webdriver-endpoint is required when --browser-debugger-address is set".into())
-        }
-        (_, None) => Ok(None),
+    Ok(
+        build_opt_in_publisher(endpoint, debugger_address, allow_review_status_probe)?
+            .map(|publisher| publisher as Arc<dyn ReviewStatusExecutor>),
+    )
+}
+
+fn build_opt_in_publisher(
+    endpoint: Option<Url>,
+    debugger_address: Option<SocketAddr>,
+    enabled: bool,
+) -> Result<Option<Arc<WebDriverPublisher<HttpWebDriver>>>, String> {
+    if enabled {
+        build_attached_publisher(endpoint, debugger_address)
+    } else {
+        Ok(None)
     }
 }
 
