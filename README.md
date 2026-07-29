@@ -207,6 +207,14 @@ nothing, and `product` requires a nonempty value. The bounded local workflow
 selects the product in the already user-managed browser and closes its temporary
 session; a queued result still does not confirm the platform accepted the video
 or product association.
+For WeChat Channels only, a nonblank effective `shortTitle` is written to its
+dedicated short-title field, while a supported target-specific
+`creativeStatement` selects the corresponding platform label instead of being
+silently appended to the description. During a user-requested WeChat publish,
+the runner also follows the upstream optional original-declaration dialog flow:
+no entry or dialog is a safe skip, but a dialog that appears must be completed
+and disappear before draft/publish can continue. These are bounded local
+browser actions, not proof of an accepted declaration, review, or publication.
 Neither tool accepts cookies, passwords, tokens, sessions, or credentials.
 The other ten tools are `list_business_objects`, `get_business_object`,
 `create_business_object`, `list_ledger_entries`, `append_ledger_entry`,

@@ -201,24 +201,40 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
             json!({"script":script,"args":args}),
         )?)?
         .as_bool()
-        .ok_or_else(|| "WebDriver product action did not return a boolean".into())
+        .ok_or_else(|| "WebDriver shadow-root action did not return a boolean".into())
     }
 
-    fn wait_for_product_action(
+    fn wait_for_wechat_shadow_action(
         &self,
         session: &str,
         script: &str,
         args: Value,
     ) -> Result<(), String> {
-        for attempt in 0..WECHAT_PRODUCT_POLL_ATTEMPTS {
+        for attempt in 0..WECHAT_SHADOW_ACTION_POLL_ATTEMPTS {
             if self.execute_bool(session, script, args.clone())? {
                 return Ok(());
             }
-            if attempt + 1 < WECHAT_PRODUCT_POLL_ATTEMPTS {
-                std::thread::sleep(WECHAT_PRODUCT_POLL_INTERVAL);
+            if attempt + 1 < WECHAT_SHADOW_ACTION_POLL_ATTEMPTS {
+                std::thread::sleep(WECHAT_SHADOW_ACTION_POLL_INTERVAL);
             }
         }
-        Err("WeChat product action did not complete before its deadline".into())
+        Err("WeChat shadow-root action did not complete before its deadline".into())
+    }
+
+    fn wait_for_optional_wechat_shadow_action(
+        &self,
+        session: &str,
+        script: &str,
+    ) -> Result<bool, String> {
+        for attempt in 0..WECHAT_SHADOW_ACTION_POLL_ATTEMPTS {
+            if self.execute_bool(session, script, json!([]))? {
+                return Ok(true);
+            }
+            if attempt + 1 < WECHAT_SHADOW_ACTION_POLL_ATTEMPTS {
+                std::thread::sleep(WECHAT_SHADOW_ACTION_POLL_INTERVAL);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn wechat_product_id(request: &PublishRequest) -> Result<Option<String>, String> {
@@ -254,15 +270,19 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
     }
 
     fn attach_wechat_product(&self, session: &str, product_id: &str) -> Result<(), String> {
-        self.wait_for_product_action(session, WECHAT_PRODUCT_TYPE_READY_SCRIPT, json!([]))?;
+        self.wait_for_wechat_shadow_action(session, WECHAT_PRODUCT_TYPE_READY_SCRIPT, json!([]))?;
         if !self.execute_bool(session, WECHAT_PRODUCT_OPEN_CHOOSER_SCRIPT, json!([]))? {
             return Err("WeChat product chooser could not be opened".into());
         }
-        self.wait_for_product_action(session, WECHAT_PRODUCT_DIALOG_VISIBLE_SCRIPT, json!([]))?;
+        self.wait_for_wechat_shadow_action(
+            session,
+            WECHAT_PRODUCT_DIALOG_VISIBLE_SCRIPT,
+            json!([]),
+        )?;
         if !self.execute_bool(session, WECHAT_PRODUCT_SEARCH_SCRIPT, json!([product_id]))? {
             return Err("WeChat product search could not be started".into());
         }
-        self.wait_for_product_action(
+        self.wait_for_wechat_shadow_action(
             session,
             WECHAT_PRODUCT_EXACT_ROW_SCRIPT,
             json!([product_id]),
@@ -274,11 +294,68 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         )? {
             return Err("WeChat product could not be selected".into());
         }
-        self.wait_for_product_action(session, WECHAT_PRODUCT_ADD_READY_SCRIPT, json!([]))?;
+        self.wait_for_wechat_shadow_action(session, WECHAT_PRODUCT_ADD_READY_SCRIPT, json!([]))?;
         if !self.execute_bool(session, WECHAT_PRODUCT_ADD_SCRIPT, json!([]))? {
             return Err("WeChat product could not be added".into());
         }
-        self.wait_for_product_action(session, WECHAT_PRODUCT_ATTACHED_SCRIPT, json!([]))
+        self.wait_for_wechat_shadow_action(session, WECHAT_PRODUCT_ATTACHED_SCRIPT, json!([]))
+    }
+
+    fn apply_wechat_creative_statement(&self, session: &str, label: &str) -> Result<(), String> {
+        if !self.execute_bool(session, WECHAT_CREATIVE_STATEMENT_OPEN_SCRIPT, json!([]))? {
+            return Err("WeChat creative-statement selector could not be opened".into());
+        }
+        self.wait_for_wechat_shadow_action(
+            session,
+            WECHAT_CREATIVE_STATEMENT_SELECT_SCRIPT,
+            json!([label]),
+        )
+    }
+
+    fn try_declare_wechat_original(&self, session: &str) -> Result<(), String> {
+        if !self.execute_bool(session, WECHAT_ORIGINAL_ENTRY_SCRIPT, json!([]))? {
+            return Ok(());
+        }
+        if !self.wait_for_optional_wechat_shadow_action(
+            session,
+            WECHAT_ORIGINAL_ANY_DIALOG_VISIBLE_SCRIPT,
+        )? {
+            return Ok(());
+        }
+        if self.execute_bool(
+            session,
+            WECHAT_ORIGINAL_PROTOCOL_DIALOG_VISIBLE_SCRIPT,
+            json!([]),
+        )? {
+            self.wait_for_wechat_shadow_action(
+                session,
+                WECHAT_ORIGINAL_PROTOCOL_CONFIRM_SCRIPT,
+                json!([]),
+            )?;
+            self.wait_for_wechat_shadow_action(
+                session,
+                WECHAT_ORIGINAL_PROTOCOL_DIALOG_GONE_SCRIPT,
+                json!([]),
+            )?;
+            if !self.wait_for_optional_wechat_shadow_action(
+                session,
+                WECHAT_ORIGINAL_DECLARATION_DIALOG_VISIBLE_SCRIPT,
+            )? {
+                return Ok(());
+            }
+        } else if !self.execute_bool(
+            session,
+            WECHAT_ORIGINAL_DECLARATION_DIALOG_VISIBLE_SCRIPT,
+            json!([]),
+        )? {
+            return Err("WeChat original-declaration dialog state changed unexpectedly".into());
+        }
+        self.wait_for_wechat_shadow_action(session, WECHAT_ORIGINAL_CONFIRM_SCRIPT, json!([]))?;
+        self.wait_for_wechat_shadow_action(
+            session,
+            WECHAT_ORIGINAL_DECLARATION_DIALOG_GONE_SCRIPT,
+            json!([]),
+        )
     }
 
     fn is_visible(&self, session: &str, element: &str) -> Result<bool, String> {
@@ -491,7 +568,10 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         if let Some(address) = &request.address {
             fields.push(address.clone());
         }
-        if let Some(statement) = override_value.and_then(|item| item.creative_statement.as_ref()) {
+        if platform != Platform::WechatChannels
+            && let Some(statement) =
+                override_value.and_then(|item| item.creative_statement.as_ref())
+        {
             fields.push(statement.clone());
         }
         fields.join(" ")
@@ -504,6 +584,55 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
             .find(|item| item.platform == platform)
             .and_then(|item| item.title.as_deref())
             .unwrap_or(&request.title)
+    }
+
+    fn short_title(platform: Platform, request: &PublishRequest) -> Option<&str> {
+        request
+            .overrides
+            .iter()
+            .find(|item| item.platform == platform)
+            .and_then(|item| item.short_title.as_deref())
+            .or(request.short_title.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    /// MatrixMedia resolves a declaration per target platform. The local
+    /// runner intentionally consumes only the WeChat override; a global value
+    /// has no target-specific meaning here. Unknown values follow upstream's
+    /// `none` fallback and therefore cause no browser action.
+    fn wechat_creative_statement_label(request: &PublishRequest) -> Option<&'static str> {
+        let value = request
+            .overrides
+            .iter()
+            .find(|item| item.platform == Platform::WechatChannels)
+            .and_then(|item| item.creative_statement.as_deref())?
+            .trim();
+        match value {
+            "ai_generated"
+            | "AI生成"
+            | "含AI生成内容"
+            | "内容由AI生成"
+            | "内容为AI生成"
+            | "笔记含AI合成内容" => Some("含AI生成内容"),
+            "fiction"
+            | "虚构演绎"
+            | "含虚构演绎内容"
+            | "虚构演绎，仅供娱乐"
+            | "演绎情节，仅供娱乐"
+            | "虚构演绎，故事经历" => Some("内容为虚构剧情，仅供娱乐"),
+            "marketing" | "营销推广" | "内容含营销信息" | "内容含营销推广信息" => {
+                Some("内容包含营销广告")
+            }
+            "personal_opinion" | "个人观点" | "个人观点，仅供参考" | "内容为个人观点或见解" => {
+                Some("个人观点，仅供参考")
+            }
+            "repost" | "转载" | "内容为转载" | "内容为转载信息" | "取自站外" | "素材来源于网络" => {
+                Some("内容为转载")
+            }
+            "self_shot" | "自行拍摄" | "内容为自行拍摄" => Some("内容为自行拍摄"),
+            _ => None,
+        }
     }
 }
 
@@ -593,17 +722,32 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
         } else {
             None
         };
+        let wechat_creative_statement = (platform == Platform::WechatChannels)
+            .then(|| Self::wechat_creative_statement_label(request))
+            .flatten();
         let session = self.session()?;
         let outcome: Result<(), String> = (|| {
             self.navigate(&session, profile.upload_url)?;
             self.input(&session, profile.file, file)?;
             self.input(&session, profile.title, Self::title(platform, request))?;
+            if platform == Platform::WechatChannels
+                && let (Some(selectors), Some(short_title)) =
+                    (profile.short_title, Self::short_title(platform, request))
+            {
+                self.input(&session, selectors, short_title)?;
+            }
             let description = Self::description(platform, request);
             if !description.is_empty() {
                 self.input(&session, profile.description, &description)?;
             }
             if let Some(product_id) = wechat_product.as_deref() {
                 self.attach_wechat_product(&session, product_id)?;
+            }
+            if let Some(label) = wechat_creative_statement {
+                self.apply_wechat_creative_statement(&session, label)?;
+            }
+            if platform == Platform::WechatChannels {
+                self.try_declare_wechat_original(&session)?;
             }
             if self.success_marker_visible(&session, profile)? {
                 return Err(

@@ -46,10 +46,10 @@ pub(crate) const FANQIE_REVIEW_SCROLL_INTERVAL: Duration = Duration::from_millis
 /// title query but returns only one fixed status token, never card/page text,
 /// URLs, identifiers, or selectors.
 pub(crate) const FANQIE_REVIEW_STATUS_SCRIPT: &str = r#"const n=v=>String(v||'').replace(/\s+/g,'').trim();const q=n(arguments[0]);for(const card of document.querySelectorAll('.video-card')){const t=n(card.querySelector('.video-card-title')?.textContent);if(!t||!t.includes(q))continue;const s=n(card.querySelector('.video-status')?.textContent);if(/审核未通过|未通过|驳回|违规|失败/.test(s))return'rejected';if(/审核中|待审核/.test(s))return'under_review';if(/已发布|发布成功|已上线|公开|正常/.test(s))return'published';return'under_review';}window.scrollBy(0,Math.max(window.innerHeight,800));return null;"#;
-/// Every product-link phase has a fixed deadline. The runner never waits for
-/// unbounded UI activity in an attached user browser.
-pub(crate) const WECHAT_PRODUCT_POLL_ATTEMPTS: usize = 30;
-pub(crate) const WECHAT_PRODUCT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Every shadow-root metadata phase has a fixed deadline. The runner never
+/// waits for unbounded UI activity in an attached user browser.
+pub(crate) const WECHAT_SHADOW_ACTION_POLL_ATTEMPTS: usize = 30;
+pub(crate) const WECHAT_SHADOW_ACTION_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// These scripts return only booleans. Product names, identifiers, and DOM
 /// content deliberately never leave the attached page through WebDriver.
 pub(crate) const WECHAT_PRODUCT_TYPE_READY_SCRIPT: &str = r#"const app=document.querySelector('wujie-app.wujie_iframe');const root=app?.shadowRoot;if(!root)return false;const link=root.querySelector('.post-with-link');if(!link)return false;const selected=String(link.querySelector('.choosen-link-wrap span')?.textContent||'').trim();const chooser=link.querySelector('.post-component-choose-wrap .content-wrap');if(selected==='商品'&&chooser)return true;const menu=link.querySelector('.link-list-options');const visible=menu&&getComputedStyle(menu).display!=='none';if(!visible){link.querySelector('.link-display-wrap')?.click();return false;}const product=Array.from(menu.querySelectorAll('.link-option-item')).find(item=>String(item.textContent||'').replace(/\s+/g,'')==='商品');product?.click();return false;"#;
@@ -61,6 +61,21 @@ pub(crate) const WECHAT_PRODUCT_SELECT_EXACT_SCRIPT: &str = r#"const id=argument
 pub(crate) const WECHAT_PRODUCT_ADD_READY_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const dialog=Array.from(root?.querySelectorAll('.weui-desktop-dialog')||[]).find(item=>String(item.textContent||'').includes('从橱窗添加商品')&&getComputedStyle(item).display!=='none');const button=Array.from(dialog?.querySelectorAll('.weui-desktop-btn_primary')||[]).find(item=>/^添加(?:\(\d+\))?$/.test(String(item.textContent||'').replace(/\s+/g,'')));return Boolean(button&&!button.disabled&&!button.classList.contains('weui-desktop-btn_disabled'));"#;
 pub(crate) const WECHAT_PRODUCT_ADD_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const dialog=Array.from(root?.querySelectorAll('.weui-desktop-dialog')||[]).find(item=>String(item.textContent||'').includes('从橱窗添加商品')&&getComputedStyle(item).display!=='none');const button=Array.from(dialog?.querySelectorAll('.weui-desktop-btn_primary')||[]).find(item=>/^添加(?:\(\d+\))?$/.test(String(item.textContent||'').replace(/\s+/g,'')));if(!button||button.disabled||button.classList.contains('weui-desktop-btn_disabled'))return false;button.click();return true;"#;
 pub(crate) const WECHAT_PRODUCT_ATTACHED_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const name=root?.querySelector('.post-with-link .post-component-choose-wrap .choose-content .name');return Boolean(String(name?.textContent||'').trim());"#;
+/// These scripts accept only a known creative-statement label and return a
+/// boolean. They never expose page content to the runner.
+pub(crate) const WECHAT_CREATIVE_STATEMENT_OPEN_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const trigger=root?.querySelector('.post-with-mark-tag .select-display');if(!trigger)return false;trigger.click();return true;"#;
+pub(crate) const WECHAT_CREATIVE_STATEMENT_SELECT_SCRIPT: &str = r#"const expected=arguments[0];const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const option=Array.from(root?.querySelectorAll('.post-with-mark-tag .mark-tag-option')||[]).find(item=>String(item.querySelector('.option-main')?.textContent||'').trim()===expected);if(!option)return false;option.click();return true;"#;
+/// Original-declaration scripts deliberately return only whether each local
+/// page action is available or completed. The declaration itself is attempted
+/// only for an explicit WeChat publication request.
+pub(crate) const WECHAT_ORIGINAL_ENTRY_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const entry=root?.querySelector('.declare-original-checkbox .ant-checkbox-wrapper');if(!entry)return false;entry.click();return true;"#;
+pub(crate) const WECHAT_ORIGINAL_ANY_DIALOG_VISIBLE_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;return Boolean(Array.from(root?.querySelectorAll('.weui-desktop-dialog')||[]).find(dialog=>getComputedStyle(dialog).display!=='none'&&(dialog.querySelector('.weui-desktop-dialog__bd .protocol-text')||dialog.matches('.declare-original-dialog .weui-desktop-dialog'))));"#;
+pub(crate) const WECHAT_ORIGINAL_PROTOCOL_DIALOG_VISIBLE_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;return Boolean(Array.from(root?.querySelectorAll('.weui-desktop-dialog')||[]).find(dialog=>getComputedStyle(dialog).display!=='none'&&dialog.querySelector('.weui-desktop-dialog__bd .protocol-text')));"#;
+pub(crate) const WECHAT_ORIGINAL_PROTOCOL_CONFIRM_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const dialog=Array.from(root?.querySelectorAll('.weui-desktop-dialog')||[]).find(item=>getComputedStyle(item).display!=='none'&&item.querySelector('.weui-desktop-dialog__bd .protocol-text'));const protocol=dialog?.querySelector('.weui-desktop-dialog__bd .protocol-text');const button=Array.from(dialog?.querySelectorAll('button.weui-desktop-btn_primary')||[]).find(item=>String(item.textContent||'').trim().includes('声明原创'));if(!protocol||!button||button.disabled||button.classList.contains('weui-desktop-btn_disabled'))return false;protocol.click();button.click();return true;"#;
+pub(crate) const WECHAT_ORIGINAL_PROTOCOL_DIALOG_GONE_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;return !Array.from(root?.querySelectorAll('.weui-desktop-dialog')||[]).some(dialog=>getComputedStyle(dialog).display!=='none'&&dialog.querySelector('.weui-desktop-dialog__bd .protocol-text'));"#;
+pub(crate) const WECHAT_ORIGINAL_DECLARATION_DIALOG_VISIBLE_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const dialog=root?.querySelector('.declare-original-dialog .weui-desktop-dialog');return Boolean(dialog&&getComputedStyle(dialog).display!=='none');"#;
+pub(crate) const WECHAT_ORIGINAL_CONFIRM_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const dialog=root?.querySelector('.declare-original-dialog .weui-desktop-dialog');const check=dialog?.querySelector('label.ant-checkbox-wrapper');const button=Array.from(dialog?.querySelectorAll('button.weui-desktop-btn_primary')||[]).find(item=>String(item.textContent||'').trim().includes('声明原创'));if(!check||!button||button.disabled||button.classList.contains('weui-desktop-btn_disabled'))return false;check.click();button.click();return true;"#;
+pub(crate) const WECHAT_ORIGINAL_DECLARATION_DIALOG_GONE_SCRIPT: &str = r#"const root=document.querySelector('wujie-app.wujie_iframe')?.shadowRoot;const dialog=root?.querySelector('.declare-original-dialog .weui-desktop-dialog');return !dialog||getComputedStyle(dialog).display==='none';"#;
 
 pub(crate) fn normalize_review_title_query(value: &str) -> String {
     value
@@ -90,6 +105,7 @@ pub(crate) struct PlatformProfile {
     pub(crate) upload_url: &'static str,
     pub(crate) file: &'static [&'static str],
     pub(crate) title: &'static [&'static str],
+    pub(crate) short_title: Option<&'static [&'static str]>,
     pub(crate) description: &'static [&'static str],
     pub(crate) submit: &'static [&'static str],
     pub(crate) draft: &'static [&'static str],
@@ -155,6 +171,7 @@ pub(crate) const PROFILES: &[PlatformProfile] = &[
             "input[placeholder*='标题']",
             "textarea[placeholder*='标题']",
         ],
+        short_title: None,
         description: &[
             "div[contenteditable='true']",
             "textarea[placeholder*='描述']",
@@ -171,6 +188,9 @@ pub(crate) const PROFILES: &[PlatformProfile] = &[
             "input[placeholder*='标题']",
             "textarea[placeholder*='标题']",
         ],
+        short_title: Some(&[
+            "wujie-app.wujie_iframe input[placeholder='填写短标题有机会获得更多流量']",
+        ]),
         description: &[
             "div[contenteditable='true']",
             "textarea[placeholder*='描述']",
@@ -184,6 +204,7 @@ pub(crate) const PROFILES: &[PlatformProfile] = &[
         upload_url: "https://member.bilibili.com/platform/upload/video/frame/",
         file: &["input[type='file']", "input[type='file'][accept*='video']"],
         title: &["input[placeholder*='标题']", "input[aria-label*='标题']"],
+        short_title: None,
         description: &[
             "textarea[placeholder*='简介']",
             "div[contenteditable='true']",
@@ -197,6 +218,7 @@ pub(crate) const PROFILES: &[PlatformProfile] = &[
         upload_url: "https://baijiahao.baidu.com/builder/rc/edit?type=videoV2&is_from_cms=1",
         file: &["input[type='file']", "input.upload-file"],
         title: &["input[placeholder*='标题']", "input[name='title']"],
+        short_title: None,
         description: &[
             "textarea[placeholder*='摘要']",
             "div[contenteditable='true']",
@@ -210,6 +232,7 @@ pub(crate) const PROFILES: &[PlatformProfile] = &[
         upload_url: "https://mp.toutiao.com/profile_v4/xigua/upload-video",
         file: &["input[type='file']", "input.upload-file"],
         title: &["input[placeholder*='标题']", "input[name='title']"],
+        short_title: None,
         description: &[
             "div[contenteditable='true']",
             "textarea[placeholder*='简介']",
@@ -226,6 +249,7 @@ pub(crate) const PROFILES: &[PlatformProfile] = &[
             "input[placeholder*='标题']",
             "textarea[placeholder*='标题']",
         ],
+        short_title: None,
         description: &[
             "textarea[placeholder*='描述']",
             "div[contenteditable='true']",
@@ -242,6 +266,7 @@ pub(crate) const PROFILES: &[PlatformProfile] = &[
             "input[placeholder*='填写标题']",
             "textarea[placeholder*='标题']",
         ],
+        short_title: None,
         description: &[
             "div[contenteditable='true']",
             "textarea[placeholder*='正文']",
@@ -258,6 +283,7 @@ pub(crate) const PROFILES: &[PlatformProfile] = &[
             "input[placeholder*='标题']",
             "textarea[placeholder*='标题']",
         ],
+        short_title: None,
         description: &[
             "div[contenteditable='true']",
             "textarea[placeholder*='描述']",
