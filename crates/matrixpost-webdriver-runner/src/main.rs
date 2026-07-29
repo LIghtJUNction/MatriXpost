@@ -9,7 +9,7 @@ use std::{
     fs::{self, File},
     io::Read,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc,
@@ -28,9 +28,10 @@ use axum::{
 use clap::Parser;
 use matrixpost_core::{
     ARTICLE_RUNNER_PROTOCOL_VERSION, ArticlePlatform, ArticleRunnerRequest, ArticleRunnerResponse,
-    LOGIN_RUNNER_PROTOCOL_VERSION, LoginRunnerRequest, LoginRunnerResponse, MediaSource,
-    PROVIDER_RUNNER_PROTOCOL_VERSION, Platform, ProviderRunnerRequest, ProviderRunnerResponse,
-    PublishArticleRequest, PublishRequest,
+    HttpRemoteMediaStager, LOGIN_RUNNER_PROTOCOL_VERSION, LoginRunnerRequest, LoginRunnerResponse,
+    MediaSource, MediaStagingPolicy, PROVIDER_RUNNER_PROTOCOL_VERSION, Platform,
+    ProviderRunnerRequest, ProviderRunnerResponse, PublishArticleRequest, PublishRequest,
+    RemoteMediaRequest, RemoteMediaStager, StagedMedia,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -52,6 +53,24 @@ const MAX_ARTICLE_SUMMARY_BYTES: usize = 500;
 const MAX_ARTICLE_COVER_BYTES: u64 = 5 * 1024 * 1024;
 const ARTICLE_TEXT_EXTENSIONS: &[&str] = &["md", "txt"];
 const ARTICLE_COVER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+/// Remote videos are staged only into the user-selected directory before a
+/// browser session is created.  Two GiB is large enough for ordinary platform
+/// uploads while keeping the local runner's disk and network exposure bounded.
+const MAX_REMOTE_VIDEO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Accepted MIME types are deliberately finite: the runner stages videos, not
+/// arbitrary remote objects. Parameters such as `charset` remain accepted by
+/// the core policy's prefix comparison.
+const REMOTE_VIDEO_CONTENT_TYPES: &[&str] = &[
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/x-msvideo",
+];
+/// A remote source is untrusted input. Keep every execution failure at the
+/// provider boundary intentionally opaque so neither its URL nor its staged
+/// local path can be reflected to callers.
+const REMOTE_MEDIA_EXECUTION_REJECTION: &str = "remote media publication failed";
 
 #[derive(Clone, Copy)]
 struct AcknowledgementPolicy {
@@ -803,10 +822,44 @@ impl<T: WebDriverTransport> ArticlePublicationExecutor for WebDriverPublisher<T>
     }
 }
 
+struct RemoteMediaSupport {
+    policy: MediaStagingPolicy,
+    stager: Arc<dyn RemoteMediaStager>,
+}
+
+impl RemoteMediaSupport {
+    fn configured(directory: PathBuf) -> Self {
+        Self {
+            policy: MediaStagingPolicy {
+                max_bytes: MAX_REMOTE_VIDEO_BYTES,
+                allowed_content_types: REMOTE_VIDEO_CONTENT_TYPES
+                    .iter()
+                    .map(|item| (*item).to_owned())
+                    .collect(),
+            },
+            stager: Arc::new(HttpRemoteMediaStager::new(directory)),
+        }
+    }
+
+    fn stage(&self, source: &MediaSource) -> Result<Box<dyn StagedMedia>, String> {
+        let MediaSource::RemoteUrl(url) = source else {
+            return Err("remote media staging requires an HTTP(S) media URL".into());
+        };
+        let request = RemoteMediaRequest::new(url.clone(), &self.policy)
+            .map_err(|_| "remote media URL is not supported".to_owned())?;
+        self.stager
+            .stage(&request, &self.policy)
+            // Transport errors may contain the submitted URL. The local runner
+            // must not reflect it through the provider response.
+            .map_err(|_| "remote media staging failed".to_owned())
+    }
+}
+
 struct RunnerService {
     executor: Option<Arc<dyn PublicationExecutor>>,
     login_executor: Option<Arc<dyn LoginNavigationExecutor>>,
     article_executor: Option<Arc<dyn ArticlePublicationExecutor>>,
+    remote_media: Option<RemoteMediaSupport>,
     browser_debugger_address: Option<SocketAddr>,
     debugger_probe: Arc<dyn BrowserDebuggerProbe>,
 }
@@ -885,6 +938,7 @@ async fn publish(
             }),
         );
     }
+    let remote_media_requested = matches!(&body.request.source, MediaSource::RemoteUrl(_));
     let response = match &state.executor {
         None => ProviderRunnerResponse::Unavailable {
             version: PROVIDER_RUNNER_PROTOCOL_VERSION,
@@ -892,7 +946,12 @@ async fn publish(
             reason: "browser debugger address is not configured; no browser session was started"
                 .into(),
         },
-        Some(executor) => match executor.publish(body.platform, &body.request) {
+        Some(executor) => match publish_with_staged_media(
+            executor.as_ref(),
+            state.remote_media.as_ref(),
+            body.platform,
+            &body.request,
+        ) {
             Ok(job_id) if !job_id.trim().is_empty() => ProviderRunnerResponse::Queued {
                 version: PROVIDER_RUNNER_PROTOCOL_VERSION,
                 platform: body.platform,
@@ -901,16 +960,52 @@ async fn publish(
             Ok(_) => ProviderRunnerResponse::Rejected {
                 version: PROVIDER_RUNNER_PROTOCOL_VERSION,
                 platform: body.platform,
-                reason: "runner completed without a valid job identifier".into(),
+                reason: if remote_media_requested {
+                    REMOTE_MEDIA_EXECUTION_REJECTION.into()
+                } else {
+                    "runner completed without a valid job identifier".into()
+                },
             },
             Err(reason) => ProviderRunnerResponse::Rejected {
                 version: PROVIDER_RUNNER_PROTOCOL_VERSION,
                 platform: body.platform,
-                reason,
+                reason: if remote_media_requested {
+                    REMOTE_MEDIA_EXECUTION_REJECTION.into()
+                } else {
+                    reason
+                },
             },
         },
     };
     (StatusCode::OK, Json(response))
+}
+
+fn publish_with_staged_media(
+    executor: &dyn PublicationExecutor,
+    remote_media: Option<&RemoteMediaSupport>,
+    platform: Platform,
+    request: &PublishRequest,
+) -> Result<String, String> {
+    let MediaSource::RemoteUrl(_) = &request.source else {
+        return executor.publish(platform, request);
+    };
+    let support = remote_media.ok_or_else(|| {
+        "remote media staging is disabled; start the runner with --remote-media-dir".to_owned()
+    })?;
+    // Stage before invoking the executor, which in turn is the only code path
+    // allowed to create a WebDriver session.
+    let staged = support.stage(&request.source)?;
+    let mut local_request = request.clone();
+    local_request.source = MediaSource::LocalFile(staged.path().to_path_buf());
+    let publish = executor.publish(platform, &local_request);
+    let cleanup = staged
+        .cleanup()
+        .map_err(|_| "staged remote media cleanup failed".to_owned());
+    match (publish, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(job_id), Ok(())) => Ok(job_id),
+    }
 }
 
 async fn publish_article(
@@ -1036,6 +1131,22 @@ struct Args {
     /// user to complete login manually. This never reads or exports login data.
     #[arg(long)]
     allow_login_navigation: bool,
+    /// Absolute directory used only for bounded HTTP(S) video staging before
+    /// WebDriver upload. Remote media is rejected unless this is configured.
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    remote_media_dir: Option<PathBuf>,
+}
+
+fn build_remote_media_support(
+    directory: Option<PathBuf>,
+) -> Result<Option<RemoteMediaSupport>, String> {
+    match directory {
+        None => Ok(None),
+        Some(directory) if directory.is_absolute() => {
+            Ok(Some(RemoteMediaSupport::configured(directory)))
+        }
+        Some(_) => Err("--remote-media-dir must be an absolute path".into()),
+    }
 }
 
 fn build_executor(
@@ -1155,10 +1266,18 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let remote_media = match build_remote_media_support(args.remote_media_dir) {
+        Ok(support) => support,
+        Err(error) => {
+            eprintln!("matrixpost-webdriver-runner configuration error: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let service = Arc::new(RunnerService {
         executor,
         login_executor,
         article_executor,
+        remote_media,
         browser_debugger_address: args.browser_debugger_address,
         debugger_probe: Arc::new(HttpBrowserDebuggerProbe),
     });
@@ -1186,7 +1305,7 @@ mod tests {
         http::Request,
     };
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, atomic::AtomicBool};
     use tower::ServiceExt;
 
     struct ProfileFixture {
@@ -1330,6 +1449,7 @@ mod tests {
             executor,
             login_executor: None,
             article_executor,
+            remote_media: None,
             browser_debugger_address: None,
             debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
         }
@@ -1342,6 +1462,7 @@ mod tests {
             executor: None,
             login_executor,
             article_executor: None,
+            remote_media: None,
             browser_debugger_address: None,
             debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
         }
@@ -1356,6 +1477,7 @@ mod tests {
             executor,
             login_executor: None,
             article_executor: None,
+            remote_media: None,
             browser_debugger_address,
             debugger_probe: Arc::new(StaticBrowserDebuggerProbe(probe_ready)),
         }
@@ -1826,6 +1948,124 @@ mod tests {
         }
     }
 
+    struct RecordingPublicationExecutor {
+        calls: AtomicU64,
+        local_paths: Mutex<Vec<PathBuf>>,
+        fail: bool,
+    }
+
+    impl RecordingPublicationExecutor {
+        fn new(fail: bool) -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                local_paths: Mutex::new(Vec::new()),
+                fail,
+            }
+        }
+    }
+
+    impl PublicationExecutor for RecordingPublicationExecutor {
+        fn publish(&self, _: Platform, request: &PublishRequest) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let MediaSource::LocalFile(path) = &request.source else {
+                return Err("remote media reached WebDriver executor".into());
+            };
+            self.local_paths.lock().unwrap().push(path.clone());
+            if self.fail {
+                Err("mock WebDriver upload failure".into())
+            } else {
+                Ok("job-1".into())
+            }
+        }
+    }
+
+    struct SentinelFailureExecutor;
+
+    impl PublicationExecutor for SentinelFailureExecutor {
+        fn publish(&self, _: Platform, _: &PublishRequest) -> Result<String, String> {
+            Err(
+                "webdriver failed for https://example.invalid/video.mp4 at /private/staging/video.mp4"
+                    .into(),
+            )
+        }
+    }
+
+    struct TestStagedMedia {
+        path: PathBuf,
+        cleanup_attempted: Arc<AtomicBool>,
+        cleanup_fails: bool,
+    }
+
+    impl StagedMedia for TestStagedMedia {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn cleanup(self: Box<Self>) -> Result<(), matrixpost_core::DomainError> {
+            self.cleanup_attempted.store(true, Ordering::Relaxed);
+            if self.cleanup_fails {
+                Err(matrixpost_core::DomainError::RemoteMedia(
+                    "mock cleanup failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct TestRemoteMediaStager {
+        path: PathBuf,
+        stage_calls: AtomicU64,
+        cleanup_attempted: Arc<AtomicBool>,
+        stage_fails: bool,
+        cleanup_fails: bool,
+    }
+
+    impl TestRemoteMediaStager {
+        fn succeeding(path: PathBuf) -> Self {
+            Self {
+                path,
+                stage_calls: AtomicU64::new(0),
+                cleanup_attempted: Arc::new(AtomicBool::new(false)),
+                stage_fails: false,
+                cleanup_fails: false,
+            }
+        }
+    }
+
+    impl RemoteMediaStager for TestRemoteMediaStager {
+        fn stage(
+            &self,
+            _: &RemoteMediaRequest,
+            _: &dyn matrixpost_core::RemoteMediaPolicy,
+        ) -> Result<Box<dyn StagedMedia>, matrixpost_core::DomainError> {
+            self.stage_calls.fetch_add(1, Ordering::Relaxed);
+            if self.stage_fails {
+                return Err(matrixpost_core::DomainError::RemoteMedia(
+                    "raw remote URL must not escape".into(),
+                ));
+            }
+            Ok(Box::new(TestStagedMedia {
+                path: self.path.clone(),
+                cleanup_attempted: Arc::clone(&self.cleanup_attempted),
+                cleanup_fails: self.cleanup_fails,
+            }))
+        }
+    }
+
+    fn test_remote_media_support(stager: Arc<dyn RemoteMediaStager>) -> RemoteMediaSupport {
+        RemoteMediaSupport {
+            policy: MediaStagingPolicy {
+                max_bytes: MAX_REMOTE_VIDEO_BYTES,
+                allowed_content_types: REMOTE_VIDEO_CONTENT_TYPES
+                    .iter()
+                    .map(|item| (*item).to_owned())
+                    .collect(),
+            },
+            stager,
+        }
+    }
+
     struct AcceptedLogin;
 
     impl LoginNavigationExecutor for AcceptedLogin {
@@ -1961,6 +2201,180 @@ mod tests {
             serde_json::from_slice::<ProviderRunnerResponse>(&body).unwrap(),
             ProviderRunnerResponse::Unavailable { .. }
         ));
+    }
+
+    fn remote_request() -> PublishRequest {
+        let mut value = request();
+        value.source =
+            MediaSource::RemoteUrl(Url::parse("https://media.example.invalid/movie.mp4").unwrap());
+        value
+    }
+
+    #[test]
+    fn remote_media_directory_must_be_explicit_and_absolute() {
+        assert!(build_remote_media_support(None).unwrap().is_none());
+        assert!(build_remote_media_support(Some(PathBuf::from("relative-staging"))).is_err());
+        assert!(
+            build_remote_media_support(Some(PathBuf::from("/explicit/staging")))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_media_without_configured_directory_rejects_before_webdriver_session() {
+        let executor = Arc::new(RecordingPublicationExecutor::new(false));
+        let service = RunnerService {
+            executor: Some(executor.clone()),
+            login_executor: None,
+            article_executor: None,
+            remote_media: None,
+            browser_debugger_address: None,
+            debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
+        };
+        let response = app(Arc::new(service))
+            .oneshot(
+                Request::post("/v1/publish")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&ProviderRunnerRequest {
+                            version: PROVIDER_RUNNER_PROTOCOL_VERSION,
+                            platform: Platform::Douyin,
+                            request: remote_request(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response = serde_json::from_slice::<ProviderRunnerResponse>(&body).unwrap();
+        assert!(matches!(response, ProviderRunnerResponse::Rejected { .. }));
+        assert_eq!(executor.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_media_http_rejection_never_reflects_url_or_staged_path() {
+        let stager = Arc::new(TestRemoteMediaStager::succeeding(PathBuf::from(
+            "/private/staging/video.mp4",
+        )));
+        let service = RunnerService {
+            executor: Some(Arc::new(SentinelFailureExecutor)),
+            login_executor: None,
+            article_executor: None,
+            remote_media: Some(test_remote_media_support(stager)),
+            browser_debugger_address: None,
+            debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
+        };
+        let mut request = request();
+        request.source =
+            MediaSource::RemoteUrl(Url::parse("https://example.invalid/video.mp4").unwrap());
+        let response = app(Arc::new(service))
+            .oneshot(
+                Request::post("/v1/publish")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&ProviderRunnerRequest {
+                            version: PROVIDER_RUNNER_PROTOCOL_VERSION,
+                            platform: Platform::Douyin,
+                            request,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let serialized = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!serialized.contains("https://example.invalid/video.mp4"));
+        assert!(!serialized.contains("/private/staging/video.mp4"));
+        assert_eq!(
+            serde_json::from_str::<ProviderRunnerResponse>(&serialized).unwrap(),
+            ProviderRunnerResponse::Rejected {
+                version: PROVIDER_RUNNER_PROTOCOL_VERSION,
+                platform: Platform::Douyin,
+                reason: REMOTE_MEDIA_EXECUTION_REJECTION.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn configured_remote_media_stages_a_local_path_and_cleans_it_after_webdriver_outcome() {
+        let stager = Arc::new(TestRemoteMediaStager::succeeding(PathBuf::from(
+            "/explicit/staging/movie.mp4",
+        )));
+        let executor = RecordingPublicationExecutor::new(false);
+        let result = publish_with_staged_media(
+            &executor,
+            Some(&test_remote_media_support(stager.clone())),
+            Platform::Douyin,
+            &remote_request(),
+        );
+        assert_eq!(result.unwrap(), "job-1");
+        assert_eq!(stager.stage_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            executor.local_paths.lock().unwrap().as_slice(),
+            [PathBuf::from("/explicit/staging/movie.mp4")]
+        );
+        assert!(stager.cleanup_attempted.load(Ordering::Relaxed));
+
+        let failed_executor = RecordingPublicationExecutor::new(true);
+        let stager = Arc::new(TestRemoteMediaStager::succeeding(PathBuf::from(
+            "/explicit/staging/failing-movie.mp4",
+        )));
+        assert!(
+            publish_with_staged_media(
+                &failed_executor,
+                Some(&test_remote_media_support(stager.clone())),
+                Platform::Douyin,
+                &remote_request(),
+            )
+            .is_err()
+        );
+        assert_eq!(failed_executor.calls.load(Ordering::Relaxed), 1);
+        assert!(stager.cleanup_attempted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn remote_staging_fails_closed_before_webdriver_and_cleanup_failure_is_rejected() {
+        let failing_stager = Arc::new(TestRemoteMediaStager {
+            path: PathBuf::from("/explicit/staging/never-uploaded.mp4"),
+            stage_calls: AtomicU64::new(0),
+            cleanup_attempted: Arc::new(AtomicBool::new(false)),
+            stage_fails: true,
+            cleanup_fails: false,
+        });
+        let executor = RecordingPublicationExecutor::new(false);
+        let error = publish_with_staged_media(
+            &executor,
+            Some(&test_remote_media_support(failing_stager.clone())),
+            Platform::Douyin,
+            &remote_request(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "remote media staging failed");
+        assert_eq!(failing_stager.stage_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(executor.calls.load(Ordering::Relaxed), 0);
+
+        let cleanup_failure = Arc::new(TestRemoteMediaStager {
+            path: PathBuf::from("/explicit/staging/cleanup-failure.mp4"),
+            stage_calls: AtomicU64::new(0),
+            cleanup_attempted: Arc::new(AtomicBool::new(false)),
+            stage_fails: false,
+            cleanup_fails: true,
+        });
+        let error = publish_with_staged_media(
+            &executor,
+            Some(&test_remote_media_support(cleanup_failure.clone())),
+            Platform::Douyin,
+            &remote_request(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "staged remote media cleanup failed");
+        assert!(cleanup_failure.cleanup_attempted.load(Ordering::Relaxed));
     }
 
     #[test]
