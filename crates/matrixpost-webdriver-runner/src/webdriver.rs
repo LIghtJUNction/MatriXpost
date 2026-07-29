@@ -1,3 +1,9 @@
+use crate::profiles::*;
+use matrixpost_core::{
+    ArticlePlatform, MediaSource, Platform, PublishArticleRequest, PublishRequest,
+    REVIEW_STATUS_TITLE_QUERY_MAX_BYTES, ReviewStatus,
+};
+use serde_json::{Value, json};
 use std::{
     fs::{self, File},
     io::Read,
@@ -6,13 +12,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-
-use crate::profiles::*;
-use matrixpost_core::{
-    ArticlePlatform, MediaSource, Platform, PublishArticleRequest, PublishRequest,
-    REVIEW_STATUS_TITLE_QUERY_MAX_BYTES, ReviewStatus,
-};
-use serde_json::{Value, json};
 use url::Url;
 mod fanqie;
 mod kuaishou;
@@ -21,7 +20,6 @@ mod xiaohongshu;
 pub(crate) trait WebDriverTransport: Send + Sync {
     fn request(&self, method: &str, path: &str, body: Value) -> Result<Value, String>;
 }
-
 pub(crate) struct HttpWebDriver {
     pub(crate) endpoint: Url,
 }
@@ -816,14 +814,16 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
                             .into(),
                     );
                 }
-                self.click(
-                    &session,
-                    if request.draft {
+                if platform == Platform::Toutiao {
+                    self.publish_toutiao_footer(&session, request.draft)?;
+                } else {
+                    let action = if request.draft {
                         profile.draft
                     } else {
                         profile.submit
-                    },
-                )?;
+                    };
+                    self.click(&session, action)?;
+                }
                 self.wait_for_success_transition(&session, profile)?;
             }
             Ok(())

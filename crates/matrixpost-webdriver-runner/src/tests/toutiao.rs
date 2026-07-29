@@ -32,8 +32,8 @@ fn completed_statement_replies() -> Vec<Result<Value, String>> {
         value(json!(true)),
         Err("not visible".into()),
         Err("not visible".into()),
-        element("submit"),
-        value(json!(null)),
+        value(json!("vertical_ready")),
+        value(json!("clicked")),
         element("success"),
         value(json!(true)),
         value(json!(null)),
@@ -52,8 +52,8 @@ fn completed_default_replies() -> Vec<Result<Value, String>> {
         value(json!(null)),
         Err("not visible".into()),
         Err("not visible".into()),
-        element("submit"),
-        value(json!(null)),
+        value(json!("vertical_ready")),
+        value(json!("clicked")),
         element("success"),
         value(json!(true)),
         value(json!(null)),
@@ -98,17 +98,15 @@ fn toutiao_target_statement_selects_before_submit_without_description_leak() {
             .and_then(Value::as_str)
             .is_some_and(|text| text.contains("ai_generated"))
     }));
-    let checked = bodies
+    let statement = bodies
         .iter()
-        .rposition(|body| {
-            body.get("script") == Some(&Value::String(TOUTIAO_STATEMENT_SELECTED_SCRIPT.into()))
-        })
+        .position(|body| body.get("args") == Some(&json!(["AI生成"])))
         .unwrap();
-    let submit = bodies
+    let publish = bodies
         .iter()
-        .position(|body| body.get("value") == Some(&Value::String("button[type='submit']".into())))
+        .position(|body| body.get("args") == Some(&json!(["submit"])))
         .unwrap();
-    assert!(checked < submit);
+    assert!(statement < publish);
 }
 
 #[test]
@@ -232,4 +230,157 @@ fn toutiao_unverified_statement_application_fails_closed_before_submit() {
     replies.extend((0..DOUYIN_STATEMENT_POLL_ATTEMPTS).map(|_| value(json!(false))));
     replies.push(value(json!(null)));
     assert_fails_closed(replies);
+}
+
+fn footer_replies(state: &str, action: &str) -> Vec<Result<Value, String>> {
+    vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+        Err("not visible".into()),
+        Err("not visible".into()),
+        value(json!(state)),
+        value(json!(action)),
+        element("success"),
+        value(json!(true)),
+        value(json!(null)),
+    ]
+}
+
+fn footer_action(request: &PublishRequest, state: &str) -> String {
+    let publisher = test_publisher(MockWebDriver::new(footer_replies(state, "clicked")));
+    publisher.publish(Platform::Toutiao, request).unwrap();
+    publisher
+        .transport
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|body| {
+            body.get("args")
+                .and_then(Value::as_array)
+                .filter(|args| args.len() == 1)
+                .and_then(|args| args[0].as_str())
+                .filter(|value| matches!(*value, "draft" | "submit"))
+                .map(str::to_owned)
+        })
+        .unwrap()
+}
+
+#[test]
+fn toutiao_horizontal_draft_uses_draft_action() {
+    let mut request = request();
+    request.draft = true;
+    assert_eq!(footer_action(&request, "horizontal_ready"), "draft");
+}
+
+#[test]
+fn toutiao_vertical_draft_and_non_draft_use_publish_action() {
+    let mut draft = request();
+    draft.draft = true;
+    assert_eq!(footer_action(&draft, "vertical_ready"), "submit");
+    assert_eq!(footer_action(&request(), "horizontal_ready"), "submit");
+}
+
+fn assert_footer_state_fails_closed(state: &str) {
+    let publisher = test_publisher(MockWebDriver::new(footer_replies(state, "unexpected")));
+    assert!(publisher.publish(Platform::Toutiao, &request()).is_err());
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert!(!bodies.iter().any(|body| {
+        body.get("args")
+            .and_then(Value::as_array)
+            .is_some_and(|args| args == &[json!("draft")] || args == &[json!("submit")])
+    }));
+    assert!(
+        publisher
+            .transport
+            .paths
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .ends_with("/session/s")
+    );
+}
+
+#[test]
+fn toutiao_ambiguous_disabled_and_invalid_footer_states_fail_closed() {
+    for state in ["ambiguous", "disabled", "invalid"] {
+        assert_footer_state_fails_closed(state);
+    }
+}
+
+#[test]
+fn toutiao_duplicate_visible_footer_roots_fail_closed_without_action() {
+    assert_footer_state_fails_closed("ambiguous");
+}
+
+#[test]
+fn toutiao_pending_footer_waits_for_ready_state_before_clicking() {
+    let mut replies = footer_replies("horizontal_ready", "clicked");
+    replies.insert(10, value(json!("pending")));
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    publisher.publish(Platform::Toutiao, &request()).unwrap();
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    let first_footer_probe = bodies
+        .iter()
+        .position(|body| body.get("args") == Some(&json!([])))
+        .unwrap();
+    let submit = bodies
+        .iter()
+        .position(|body| body.get("args") == Some(&json!(["submit"])))
+        .unwrap();
+    assert!(first_footer_probe < submit);
+}
+
+#[test]
+fn toutiao_permanently_pending_footer_times_out_without_action() {
+    let mut replies = footer_replies("pending", "unexpected");
+    replies.truncate(10);
+    replies.extend((0..DOUYIN_STATEMENT_POLL_ATTEMPTS).map(|_| value(json!("pending"))));
+    replies.push(value(json!(null)));
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    assert!(publisher.publish(Platform::Toutiao, &request()).is_err());
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert!(!bodies.iter().any(|body| {
+        body.get("args")
+            .and_then(Value::as_array)
+            .is_some_and(|args| args == &[json!("draft")] || args == &[json!("submit")])
+    }));
+    assert!(
+        publisher
+            .transport
+            .paths
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .ends_with("/session/s")
+    );
+}
+
+#[test]
+fn toutiao_footer_action_rejection_fails_closed_without_success_probe() {
+    let publisher = test_publisher(MockWebDriver::new(footer_replies(
+        "vertical_ready",
+        "disabled",
+    )));
+    assert!(publisher.publish(Platform::Toutiao, &request()).is_err());
+    assert_eq!(
+        publisher
+            .transport
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body.get("value") == Some(&Value::String(".publish-success".into())))
+            .count(),
+        1,
+        "the pre-action success rejection remains, but a rejected action has no post-action probe"
+    );
 }
