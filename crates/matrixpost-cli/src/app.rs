@@ -155,12 +155,16 @@ pub(crate) fn run() -> ExitCode {
                 Err(error) => emit(2, serde_json::Value::Null, Some(&error.to_string())),
             }
         }
-        Command::Accounts(args) => match open(cli.state_path)
-            .and_then(|repository| repository.accounts().map_err(|error| error.to_string()))
-        {
-            Ok(accounts) => emit(
+        Command::Accounts(args) => match open(cli.state_path).and_then(|repository| {
+            let accounts = repository.accounts().map_err(|error| error.to_string())?;
+            let article_accounts = repository
+                .article_accounts()
+                .map_err(|error| error.to_string())?;
+            Ok((accounts, article_accounts))
+        }) {
+            Ok((accounts, article_accounts)) => emit(
                 0,
-                serde_json::json!({ "accounts": accounts_with_query_readiness(accounts, &runners, &args) }),
+                serde_json::json!({ "accounts": accounts_with_query_readiness(accounts, article_accounts, &runners, &args) }),
                 None,
             ),
             Err(error) => emit(4, serde_json::Value::Null, Some(&error)),

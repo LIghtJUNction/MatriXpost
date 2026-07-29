@@ -1,11 +1,14 @@
 use std::process::ExitCode;
 
 use matrixpost_core::{
-    Account, AccountReadiness, ArticleRunner, ManualLoginOutcome, Platform, ProviderRegistry,
-    ProviderRunner, ReviewStatus,
+    Account, AccountReadiness, ArticleAccount, ArticleRunner, ManualLoginOutcome, Platform,
+    ProviderRegistry, ProviderRunner, ReviewStatus,
 };
 
-use crate::{args::AccountsArgs, output::emit};
+use crate::{
+    args::{AccountPlatformFilter, AccountsArgs},
+    output::emit,
+};
 
 pub(crate) fn provider_registry(values: &[String]) -> Result<ProviderRegistry, String> {
     ProviderRegistry::from_runners(provider_runners(values)?).map_err(|error| error.to_string())
@@ -108,10 +111,11 @@ pub(crate) fn dispatch_fanqie_review_status(runners: &[ProviderRunner], title: &
 }
 pub(crate) fn accounts_with_query_readiness(
     accounts: Vec<Account>,
+    article_accounts: Vec<ArticleAccount>,
     runners: &[ProviderRunner],
     args: &AccountsArgs,
 ) -> Vec<serde_json::Value> {
-    accounts_with_query_readiness_using(accounts, runners, args, |runner| {
+    accounts_with_query_readiness_using(accounts, article_accounts, runners, args, |runner| {
         runner
             .account_readiness()
             .unwrap_or(AccountReadiness::Rejected)
@@ -119,6 +123,7 @@ pub(crate) fn accounts_with_query_readiness(
 }
 pub(crate) fn accounts_with_query_readiness_using<F>(
     accounts: Vec<Account>,
+    article_accounts: Vec<ArticleAccount>,
     runners: &[ProviderRunner],
     args: &AccountsArgs,
     probe: F,
@@ -126,11 +131,12 @@ pub(crate) fn accounts_with_query_readiness_using<F>(
 where
     F: Fn(&ProviderRunner) -> AccountReadiness,
 {
-    accounts
+    let mut listed = accounts
         .into_iter()
         .filter(|account| {
-            args.platform
-                .is_none_or(|platform| account.platform == platform)
+            args.platform.is_none_or(|platform| {
+                matches!(platform, AccountPlatformFilter::Video(value) if account.platform == value)
+            })
         })
         .filter(|account| {
             args.phone
@@ -145,7 +151,25 @@ where
                 && (!args.logged_out || readiness == AccountReadiness::NotReady);
             matches_readiness.then(|| account_with_readiness(account, readiness))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    listed.extend(
+        article_accounts
+            .into_iter()
+            .filter(|_| {
+                args.platform
+                    .is_none_or(|platform| platform == AccountPlatformFilter::Juejin)
+            })
+            .filter(|account| {
+                args.phone
+                    .as_ref()
+                    .is_none_or(|phone| account.phone == *phone)
+            })
+            // Article account status is persisted metadata, not a live runner probe.  The
+            // readiness-only flags therefore exclude it rather than claiming live state.
+            .filter(|_| !args.logged_in && !args.logged_out)
+            .map(article_account_value),
+    );
+    listed
 }
 fn account_with_readiness(account: Account, readiness: AccountReadiness) -> serde_json::Value {
     let mut account = serde_json::to_value(account).expect("account is serializable");
@@ -157,4 +181,8 @@ fn account_with_readiness(account: Account, readiness: AccountReadiness) -> serd
             serde_json::to_value(readiness).expect("readiness is serializable"),
         );
     account
+}
+
+fn article_account_value(account: ArticleAccount) -> serde_json::Value {
+    serde_json::to_value(account).expect("article account is serializable")
 }

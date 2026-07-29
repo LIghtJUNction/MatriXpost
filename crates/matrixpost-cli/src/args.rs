@@ -7,10 +7,17 @@ use matrixpost_core::{
 };
 
 use crate::query::{
-    parse_approval_status, parse_business_object_status, parse_currency, parse_history_date,
-    parse_history_platform, parse_ledger_direction, parse_positive_minor_amount, parse_rfc3339,
-    parse_video_platform,
+    parse_account_platform, parse_approval_status, parse_business_object_status, parse_currency,
+    parse_history_date, parse_history_platform, parse_ledger_direction,
+    parse_positive_minor_amount, parse_rfc3339,
 };
+
+/// A persisted account family accepted by the account-listing command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AccountPlatformFilter {
+    Video(Platform),
+    Juejin,
+}
 
 /// MatriXpost CLI. Mutating commands never claim that a provider published media.
 #[derive(Debug, Parser)]
@@ -88,9 +95,9 @@ pub(crate) enum Command {
 pub(crate) struct AccountsArgs {
     #[arg(long)]
     pub(crate) json: bool,
-    /// Exact video platform code or one of its established aliases.
-    #[arg(short, long, value_parser = parse_video_platform)]
-    pub(crate) platform: Option<Platform>,
+    /// Exact video platform code, Juejin (`juejin`, `jj`, or `掘金`), or an established alias.
+    #[arg(short, long, value_parser = parse_account_platform)]
+    pub(crate) platform: Option<AccountPlatformFilter>,
     /// Exact non-secret account phone route.
     #[arg(long)]
     pub(crate) phone: Option<String>,

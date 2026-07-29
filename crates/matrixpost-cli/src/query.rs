@@ -6,7 +6,7 @@ use matrixpost_core::{
     LedgerDirection, MediaSource, Platform, PlatformOverride, PublishRequest, WechatLink,
 };
 
-use crate::args::{HistoryArgs, PublishArgs};
+use crate::args::{AccountPlatformFilter, HistoryArgs, PublishArgs};
 
 /// A CLI-only refinement around the core's durable history filter.
 #[derive(Debug)]
@@ -20,6 +20,13 @@ pub(crate) struct HistoryQuery {
 
 pub(crate) fn parse_video_platform(value: &str) -> Result<Platform, String> {
     Platform::from_str(value).map_err(|error| error.to_string())
+}
+
+pub(crate) fn parse_account_platform(value: &str) -> Result<AccountPlatformFilter, String> {
+    match value {
+        "juejin" | "jj" | "掘金" => Ok(AccountPlatformFilter::Juejin),
+        _ => parse_video_platform(value).map(AccountPlatformFilter::Video),
+    }
 }
 
 pub(crate) fn parse_history_date(value: &str) -> Result<NaiveDate, String> {

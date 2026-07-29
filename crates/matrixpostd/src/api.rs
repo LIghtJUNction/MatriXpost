@@ -9,12 +9,15 @@ use axum::{
 use chrono::Utc;
 use matrixpost_core::{
     ApprovalStatus, BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution,
-    DispatchOutcome, DomainError, LedgerEntry, LifecycleRepository, Platform,
-    ProviderDispatchReport, PublishRequest, Repository, UpstreamPublishDto,
+    DispatchOutcome, DomainError, LedgerEntry, LifecycleRepository, ProviderDispatchReport,
+    PublishRequest, Repository, UpstreamPublishDto,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::state::AppState;
+use crate::{
+    metadata::{creative_statements_response, platforms_response},
+    state::AppState,
+};
 
 #[derive(Serialize)]
 struct ApiResponse<T: Serialize> {
@@ -440,18 +443,13 @@ async fn upstream_test_probe() -> impl IntoResponse {
     Json(serde_json::json!({ "success": true, "message": "ok" }))
 }
 async fn platforms() -> impl IntoResponse {
-    Json(
-        Platform::ALL
-            .iter()
-            .map(|item| item.metadata())
-            .collect::<Vec<_>>(),
-    )
+    Json(platforms_response())
 }
 async fn providers(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.providers.availability_report())
 }
 async fn creative_statements() -> Response {
-    unavailable(serde_json::json!({ "creative_statements": [] }))
+    Json(creative_statements_response()).into_response()
 }
 async fn change_data(State(state): State<AppState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {

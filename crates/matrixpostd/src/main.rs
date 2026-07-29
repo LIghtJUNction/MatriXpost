@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod metadata;
 mod scheduler;
 mod server;
 mod state;

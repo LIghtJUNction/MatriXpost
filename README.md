@@ -162,7 +162,11 @@ and `config` for supported non-secret `account`, `pushData`, and metadata
 records using `fileName`, `type`, and structured `item`. Invalid input returns `400`.
 
 `matrixpost accounts --json` and `matrixpost history --json` read the durable
-state. `history` defaults to the latest seven days and accepts `--days`,
+state. `accounts` includes persisted video and Juejin records; use `--platform juejin`
+(also `jj` or `掘金`) to select Juejin. Video rows add a local runner `readiness`
+label, while Juejin rows retain only their persisted credential-free metadata and
+are excluded by `--logged-in` / `--logged-out`, because those flags mean a live
+video-runner readiness probe rather than a Juejin login assertion. `history` defaults to the latest seven days and accepts `--days`,
 `--platform`, `--status` (`success`, `failed`, `publishing`, or `scheduled`),
 and `--all`; filters intersect, while `--all` removes the cutoff. The CLI
 retains the upstream command names and preserves all parsed publish fields in

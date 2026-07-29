@@ -10,7 +10,7 @@ use matrixpost_core::{
 
 use crate::{
     app::schedule_article,
-    args::{Cli, Command, HistoryArgs},
+    args::{AccountPlatformFilter, Cli, Command, HistoryArgs},
     query::{parse_history_filter, parse_request},
 };
 
@@ -204,12 +204,18 @@ fn account_query_arguments_accept_video_aliases_and_reject_conflicts() {
         parsed.command,
         Command::Accounts(args)
             if args.json
-                && args.platform == Some(Platform::Douyin)
+                && args.platform == Some(AccountPlatformFilter::Video(Platform::Douyin))
                 && args.phone.as_deref() == Some("13800138000")
                 && args.logged_in
                 && !args.logged_out
     ));
-    assert!(Cli::try_parse_from(["matrixpost", "accounts", "--platform", "juejin"]).is_err());
+    for alias in ["juejin", "jj", "掘金"] {
+        let parsed = Cli::try_parse_from(["matrixpost", "accounts", "--platform", alias]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Accounts(args) if args.platform == Some(AccountPlatformFilter::Juejin)
+        ));
+    }
     assert!(
         Cli::try_parse_from(["matrixpost", "accounts", "--logged-in", "--logged-out",]).is_err()
     );

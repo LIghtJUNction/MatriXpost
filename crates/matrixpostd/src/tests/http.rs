@@ -248,9 +248,10 @@ async fn router_platform_metadata_publish_503_and_invalid_dto_400() {
     let platforms = Request::get("/platforms").body(Body::empty()).unwrap();
     let (status, body) = json_response(router.clone(), platforms).await;
     assert_eq!(status, StatusCode::OK);
-    let douyin = body
-        .as_array()
-        .unwrap()
+    assert_eq!(body["success"], true);
+    let platform_list = body["platforms"].as_array().unwrap();
+    assert_eq!(platform_list.len(), 8);
+    let douyin = platform_list
         .iter()
         .find(|platform| platform["code"] == "dy")
         .expect("Douyin metadata must be present");
@@ -298,6 +299,191 @@ async fn router_platform_metadata_publish_503_and_invalid_dto_400() {
             .unwrap()
             .contains("invalid JSON publish request")
     );
+}
+
+#[tokio::test]
+async fn upstream_metadata_routes_return_deterministic_compatibility_specs() {
+    let router = app(AppState {
+        repository: Arc::new(SqliteRepository::in_memory().unwrap()),
+        providers: Arc::new(ProviderRegistry::new()),
+        article_runner: None,
+    });
+
+    let (status, platforms) = json_response(
+        router.clone(),
+        Request::get("/platforms").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(platforms["success"], true);
+    assert_eq!(
+        platforms["platforms"][0],
+        serde_json::json!({
+            "code": "dy",
+            "name": "抖音",
+            "aliases": ["douyin", "抖音"],
+            "automated": true,
+            "note": null,
+            "hasConfig": null,
+        })
+    );
+    assert_eq!(platforms["platforms"][7]["code"], "fqsp");
+    assert_eq!(platforms["platforms"][7]["automated"], false);
+    assert_eq!(
+        platforms["platforms"][7]["hasConfig"],
+        serde_json::Value::Null
+    );
+    let (repeat_status, repeated_platforms) = json_response(
+        router.clone(),
+        Request::get("/platforms").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(repeat_status, StatusCode::OK);
+    assert_eq!(repeated_platforms, platforms);
+
+    let (status, statements) = json_response(
+        router.clone(),
+        Request::get("/creative-statements")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(statements["success"], true);
+    assert_eq!(statements["default"], "none");
+    assert_eq!(statements["batchOptions"].as_array().unwrap().len(), 8);
+    assert_eq!(
+        statements["batchOptions"][6],
+        serde_json::json!({
+            "value": "self_shot",
+            "label": "自行拍摄",
+            "onlyPlatforms": ["sph"],
+        })
+    );
+    assert_eq!(
+        statements["platforms"]["sph"]["options"][6],
+        serde_json::json!({
+            "value": "self_shot",
+            "label": "内容为自行拍摄",
+        })
+    );
+    assert_eq!(
+        statements["platforms"]["tt"]["options"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        statements["platforms"]["fqsp"],
+        serde_json::json!({
+            "name": "番茄视频",
+            "supports": false,
+            "options": [],
+        })
+    );
+    assert_eq!(
+        statements["input"]["fallback"],
+        "所选声明在某平台无对应选项时自动回退为 none（无标注）"
+    );
+
+    for (platform, name, supports, values) in [
+        (
+            "dy",
+            "抖音",
+            true,
+            &[
+                "none",
+                "ai_generated",
+                "fiction",
+                "marketing",
+                "personal_opinion",
+                "repost",
+            ][..],
+        ),
+        (
+            "sph",
+            "视频号",
+            true,
+            &[
+                "none",
+                "ai_generated",
+                "fiction",
+                "marketing",
+                "personal_opinion",
+                "repost",
+                "self_shot",
+            ][..],
+        ),
+        (
+            "blbl",
+            "哔哩哔哩",
+            true,
+            &[
+                "none",
+                "ai_generated",
+                "fiction",
+                "marketing",
+                "personal_opinion",
+                "repost",
+                "self_made_no_repost",
+            ][..],
+        ),
+        (
+            "bjh",
+            "百家号",
+            true,
+            &[
+                "none",
+                "ai_generated",
+                "fiction",
+                "marketing",
+                "personal_opinion",
+                "repost",
+            ][..],
+        ),
+        (
+            "tt",
+            "头条",
+            true,
+            &["ai_generated", "fiction", "repost"][..],
+        ),
+        (
+            "ks",
+            "快手",
+            true,
+            &["ai_generated", "fiction", "personal_opinion", "repost"][..],
+        ),
+        (
+            "xhs",
+            "小红书",
+            true,
+            &["ai_generated", "fiction", "marketing"][..],
+        ),
+        ("fqsp", "番茄视频", false, &[][..]),
+    ] {
+        assert_eq!(statements["platforms"][platform]["name"], name);
+        assert_eq!(statements["platforms"][platform]["supports"], supports);
+        assert_eq!(
+            statements["platforms"][platform]["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|option| option["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            values
+        );
+    }
+
+    let (repeat_status, repeated_statements) = json_response(
+        router,
+        Request::get("/creative-statements")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(repeat_status, StatusCode::OK);
+    assert_eq!(repeated_statements, statements);
 }
 
 #[tokio::test]
