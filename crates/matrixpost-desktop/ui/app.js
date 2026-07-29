@@ -8,6 +8,8 @@ const result = document.querySelector("#draft-result");
 const localRunnerTargets = document.querySelector("#local-runner-target-options");
 const localRunnerResult = document.querySelector("#local-runner-result");
 const localRunnerOutcomes = document.querySelector("#local-runner-outcomes");
+const accountReadinessResult = document.querySelector("#account-readiness-result");
+const fanqieReviewResult = document.querySelector("#fanqie-review-result");
 const accountResult = document.querySelector("#account-result");
 const articleAccounts = document.querySelector("#article-accounts");
 const articleAccountResult = document.querySelector("#article-account-result");
@@ -401,6 +403,48 @@ document.querySelector("#local-runner-form").addEventListener("submit", async (e
   } catch (error) {
     localRunnerOutcomes.replaceChildren();
     localRunnerResult.textContent = `Local runner request was not sent: ${String(error)}`;
+  }
+});
+
+document.querySelector("#account-readiness-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  if (form.get("confirmed") !== "on") {
+    accountReadinessResult.textContent = "Confirm the one-shot readiness check before sending.";
+    return;
+  }
+  try {
+    const report = await invoke("account_readiness", {
+      input: {
+        platform: form.get("platform"),
+        providerRunner: form.get("providerRunner") || null,
+        confirmed: true,
+      },
+    });
+    accountReadinessResult.textContent = `Readiness: ${report.state}. This does not prove a completed login or remote publication.`;
+  } catch (error) {
+    accountReadinessResult.textContent = `Readiness check was not sent: ${String(error)}`;
+  }
+});
+
+document.querySelector("#fanqie-review-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  if (form.get("confirmed") !== "on") {
+    fanqieReviewResult.textContent = "Confirm the one-shot Fanqie review check before sending.";
+    return;
+  }
+  try {
+    const report = await invoke("fanqie_review_status", {
+      input: {
+        titleQuery: form.get("titleQuery"),
+        providerRunner: form.get("providerRunner") || null,
+        confirmed: true,
+      },
+    });
+    fanqieReviewResult.textContent = `Fanqie status: ${report.state}. This does not prove remote publication.`;
+  } catch (error) {
+    fanqieReviewResult.textContent = `Fanqie review check was not sent: ${String(error)}`;
   }
 });
 

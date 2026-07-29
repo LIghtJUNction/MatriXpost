@@ -13,7 +13,7 @@ use matrixpost_core::{
     DispatchOutcome, DomainError, HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection,
     LedgerEntry, LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformOverride,
     ProviderDispatchReport, ProviderRegistry, ProviderRunner, PublicationQueue,
-    PublishArticleRequest, PublishRequest, PublishState, Repository, ScheduledJob,
+    PublishArticleRequest, PublishRequest, PublishState, Repository, ReviewStatus, ScheduledJob,
     SqliteRepository, WechatLink,
 };
 use rmcp::{
@@ -117,6 +117,15 @@ struct ListHistoryInput {
     status: Option<HistoryStatusInput>,
     /// When true, do not apply the default trailing-seven-day filter.
     all: Option<bool>,
+}
+
+/// Bounded Fanqie title lookup. The tool returns only a finite status label;
+/// it never returns the submitted title or any page content.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewFanqieStatusInput {
+    /// A bounded title fragment used only inside the local runner.
+    title: String,
 }
 
 /// Video-link metadata accepted by MatrixMedia's WeChat Channels request form.
@@ -361,6 +370,64 @@ struct PublicationResult {
     message: &'static str,
 }
 
+/// Reason-free result of a Fanqie local review-status lookup.
+#[derive(Debug, Serialize)]
+struct ReviewStatusResult {
+    outcome: &'static str,
+    platform: &'static str,
+    message: &'static str,
+}
+
+impl ReviewStatusResult {
+    fn unavailable() -> Self {
+        Self {
+            outcome: "unavailable",
+            platform: "fqsp",
+            message: "no local Fanqie runner is configured; no browser review-status probe was attempted",
+        }
+    }
+
+    fn rejected() -> Self {
+        Self {
+            outcome: "rejected",
+            platform: "fqsp",
+            message: "the local Fanqie review-status probe was rejected; no remote publication success is claimed",
+        }
+    }
+}
+
+impl From<ReviewStatus> for ReviewStatusResult {
+    fn from(status: ReviewStatus) -> Self {
+        let (outcome, message) = match status {
+            ReviewStatus::Published => (
+                "published",
+                "a matching local video-list card is published-like; this does not prove remote publication acceptance",
+            ),
+            ReviewStatus::UnderReview => (
+                "under_review",
+                "a matching local video-list card is under review; no remote publication success is claimed",
+            ),
+            ReviewStatus::Rejected => (
+                "rejected",
+                "the local Fanqie review-status probe was rejected; no remote publication success is claimed",
+            ),
+            ReviewStatus::NotFound => (
+                "not_found",
+                "no matching local video-list card was found; no remote publication success is claimed",
+            ),
+            ReviewStatus::Unavailable => (
+                "unavailable",
+                "the local Fanqie runner is unavailable; no browser review-status probe was completed",
+            ),
+        };
+        Self {
+            outcome,
+            platform: "fqsp",
+            message,
+        }
+    }
+}
+
 /// A reason-free local runner status for one requested platform.
 ///
 /// This is deliberately not [`DispatchOutcome`]: runner response reasons can
@@ -385,6 +452,7 @@ struct ToolFailure {
 struct MatrixpostMcp {
     repository: Arc<SqliteRepository>,
     provider_registry: Arc<ProviderRegistry>,
+    provider_runners: Arc<Vec<ProviderRunner>>,
     article_runner: Option<ArticleRunner>,
 }
 
@@ -414,6 +482,16 @@ impl MatrixpostMcp {
             Ok(result) => structured(result),
             Err(message) => tool_error("invalid_input", message),
         })
+    }
+
+    #[tool(
+        description = "Query a bounded Fanqie title only through an explicitly configured loopback local runner. The result is a safe review-status label and never proves remote publication acceptance."
+    )]
+    async fn review_fanqie_status(
+        &self,
+        Parameters(input): Parameters<ReviewFanqieStatusInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(structured(self.review_fanqie_status_result(input)))
     }
 
     #[tool(
@@ -736,6 +814,20 @@ impl MatrixpostMcp {
             .history()
             .map_err(|error| error.to_string())?;
         Ok(filter.filter(history))
+    }
+
+    fn review_fanqie_status_result(&self, input: ReviewFanqieStatusInput) -> ReviewStatusResult {
+        let Some(runner) = self
+            .provider_runners
+            .iter()
+            .find(|runner| runner.platform == Platform::FanqieVideo)
+        else {
+            return ReviewStatusResult::unavailable();
+        };
+        match runner.fanqie_review_status(&input.title) {
+            Ok(status) => ReviewStatusResult::from(status),
+            Err(_) => ReviewStatusResult::rejected(),
+        }
     }
 
     fn publish_video_result(&self, input: PublishVideoInput) -> Result<PublicationResult, String> {
@@ -1156,6 +1248,7 @@ fn tool_error(code: &'static str, message: String) -> CallToolResult {
 struct McpConfig {
     state_path: PathBuf,
     provider_registry: Arc<ProviderRegistry>,
+    provider_runners: Arc<Vec<ProviderRunner>>,
     article_runner: Option<ArticleRunner>,
 }
 
@@ -1210,13 +1303,14 @@ fn mcp_config(
             return Err(format!("unsupported argument: {argument}"));
         }
     }
-    let provider_registry =
-        ProviderRegistry::from_runners(provider_runners).map_err(|error| error.to_string())?;
+    let provider_registry = ProviderRegistry::from_runners(provider_runners.clone())
+        .map_err(|error| error.to_string())?;
     Ok(McpConfig {
         state_path: state_path
             .or_else(|| env_path.map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_PATH)),
         provider_registry: Arc::new(provider_registry),
+        provider_runners: Arc::new(provider_runners),
         article_runner,
     })
 }
@@ -1272,6 +1366,7 @@ async fn main() -> ExitCode {
     let service = match (MatrixpostMcp {
         repository,
         provider_registry: config.provider_registry,
+        provider_runners: config.provider_runners,
         article_runner: config.article_runner,
     })
     .serve(stdio())
@@ -1315,6 +1410,7 @@ mod tests {
         MatrixpostMcp {
             repository: Arc::new(SqliteRepository::in_memory().unwrap()),
             provider_registry: Arc::new(ProviderRegistry::new()),
+            provider_runners: Arc::new(Vec::new()),
             article_runner: None,
         }
     }
@@ -1348,6 +1444,7 @@ mod tests {
             MatrixpostMcp {
                 repository: Arc::new(SqliteRepository::in_memory().unwrap()),
                 provider_registry: Arc::new(provider_registry),
+                provider_runners: Arc::new(Vec::new()),
                 article_runner: None,
             },
             calls,
@@ -1868,6 +1965,16 @@ mod tests {
     }
 
     #[test]
+    fn fanqie_review_tool_is_reason_free_and_unavailable_without_runner() {
+        let result = service().review_fanqie_status_result(ReviewFanqieStatusInput {
+            title: "Title".into(),
+        });
+        assert_eq!(result.outcome, "unavailable");
+        assert_eq!(result.platform, "fqsp");
+        assert!(!result.message.contains("Title"));
+    }
+
+    #[test]
     fn stderr_logging_is_opt_in() {
         assert!(!logging_enabled(None));
         assert!(logging_enabled(Some(OsStr::new("1"))));
@@ -1897,6 +2004,7 @@ mod tests {
                 "list_ledger_entries",
                 "publish_article",
                 "publish_video",
+                "review_fanqie_status",
                 "transition_business_object",
             ]
         );

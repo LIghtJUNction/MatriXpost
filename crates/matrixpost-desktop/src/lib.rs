@@ -13,12 +13,12 @@ use std::{
 
 use chrono::Utc;
 use matrixpost_core::{
-    Account, AccountStatus, ApprovalStatus, ArticleAccount, ArticleAccountStatus, ArticlePlatform,
-    BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution, DispatchOutcome,
-    DomainError, HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection, LedgerEntry,
-    LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformMetadata, ProviderRegistry,
-    ProviderRunner, ProviderRunnerTransport, PublicationQueue, PublishRequest, PublishState,
-    Repository, SqliteRepository,
+    Account, AccountReadiness, AccountStatus, ApprovalStatus, ArticleAccount, ArticleAccountStatus,
+    ArticlePlatform, BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution,
+    DispatchOutcome, DomainError, HistoryFilter, HistoryRecord, HistoryStatus, LedgerDirection,
+    LedgerEntry, LifecycleRepository, LocalSchedule, MediaSource, Platform, PlatformMetadata,
+    ProviderRegistry, ProviderRunner, ProviderRunnerTransport, PublicationQueue, PublishRequest,
+    PublishState, REVIEW_STATUS_TITLE_QUERY_MAX_BYTES, Repository, ReviewStatus, SqliteRepository,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -92,6 +92,40 @@ pub struct LocalRunnerDispatchOutcome {
 pub struct LocalRunnerDispatchReport {
     pub outcomes: Vec<LocalRunnerDispatchOutcome>,
     pub remote_publish_confirmed: bool,
+}
+
+/// Explicit, one-shot readiness probe for a separately started local runner.
+///
+/// The runner declaration is never persisted. Without one, the result is
+/// deliberately `unavailable` rather than an attempt to discover a runner.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountReadinessInput {
+    pub platform: String,
+    pub provider_runner: Option<String>,
+    pub confirmed: bool,
+}
+
+/// Safe, reason-free account readiness result for the desktop UI.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct AccountReadinessReport {
+    pub state: &'static str,
+}
+
+/// Explicit, one-shot Fanqie review probe for a separately started local
+/// runner. The bounded title is never returned or persisted.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FanqieReviewStatusInput {
+    pub title_query: String,
+    pub provider_runner: Option<String>,
+    pub confirmed: bool,
+}
+
+/// Safe, reason-free Fanqie review-status result for the desktop UI.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct FanqieReviewStatusReport {
+    pub state: &'static str,
 }
 
 /// Credential-free account metadata accepted from the local desktop form.
@@ -478,6 +512,64 @@ impl DesktopService {
         local_runner_dispatch_report(&registry, &request)
     }
 
+    /// Probes an explicitly declared local runner once for an upload-form
+    /// inference. This neither starts nor discovers a runner or browser.
+    pub fn account_readiness(
+        &self,
+        input: AccountReadinessInput,
+    ) -> Result<AccountReadinessReport, DesktopError> {
+        if !input.confirmed {
+            return Err(DesktopError::InvalidRequest(
+                "explicit account readiness confirmation is required".into(),
+            ));
+        }
+        let platform = Platform::from_str(&input.platform)?;
+        let Some(runner) = local_probe_runner(input.provider_runner.as_deref(), platform)? else {
+            return Ok(AccountReadinessReport {
+                state: account_readiness_label(AccountReadiness::Unavailable),
+            });
+        };
+        let readiness = runner.account_readiness().map_err(|_| {
+            DesktopError::InvalidRequest("account readiness request could not be completed".into())
+        })?;
+        Ok(AccountReadinessReport {
+            state: account_readiness_label(readiness),
+        })
+    }
+
+    /// Queries a bounded Fanqie title through an explicitly declared local
+    /// runner. It never persists or returns the title or page data.
+    pub fn fanqie_review_status(
+        &self,
+        input: FanqieReviewStatusInput,
+    ) -> Result<FanqieReviewStatusReport, DesktopError> {
+        if !input.confirmed {
+            return Err(DesktopError::InvalidRequest(
+                "explicit Fanqie review confirmation is required".into(),
+            ));
+        }
+        if !valid_review_title_query(&input.title_query) {
+            return Err(DesktopError::InvalidRequest(
+                "review title query must be non-empty and within the local limit".into(),
+            ));
+        }
+        let Some(runner) =
+            local_probe_runner(input.provider_runner.as_deref(), Platform::FanqieVideo)?
+        else {
+            return Ok(FanqieReviewStatusReport {
+                state: review_status_label(ReviewStatus::Unavailable),
+            });
+        };
+        let status = runner
+            .fanqie_review_status(&input.title_query)
+            .map_err(|_| {
+                DesktopError::InvalidRequest("Fanqie review request could not be completed".into())
+            })?;
+        Ok(FanqieReviewStatusReport {
+            state: review_status_label(status),
+        })
+    }
+
     pub fn save_account(&self, input: SaveAccountInput) -> Result<AccountSaved, DesktopError> {
         let platform = Platform::from_str(&input.platform)?;
         let display_name = input.display_name.trim();
@@ -737,6 +829,55 @@ fn lifecycle_error(error: DomainError) -> DesktopError {
         }
         _ => DesktopError::InvalidRequest("lifecycle request could not be completed".into()),
     }
+}
+
+fn local_probe_runner(
+    declaration: Option<&str>,
+    platform: Platform,
+) -> Result<Option<ProviderRunner>, DesktopError> {
+    let Some(declaration) = declaration.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let runner = ProviderRunner::parse_cli(declaration).map_err(|_| {
+        DesktopError::InvalidRequest(
+            "runner must use the matching PLATFORM=tcp:127.0.0.1:PORT declaration".into(),
+        )
+    })?;
+    if runner.platform != platform
+        || !matches!(runner.transport, ProviderRunnerTransport::Tcp { .. })
+    {
+        return Err(DesktopError::InvalidRequest(
+            "runner must use the matching PLATFORM=tcp:127.0.0.1:PORT declaration".into(),
+        ));
+    }
+    Ok(Some(runner))
+}
+
+const fn account_readiness_label(readiness: AccountReadiness) -> &'static str {
+    match readiness {
+        AccountReadiness::Ready => "ready",
+        AccountReadiness::NotReady => "not_ready",
+        AccountReadiness::Unavailable => "unavailable",
+        AccountReadiness::Rejected => "rejected",
+    }
+}
+
+const fn review_status_label(status: ReviewStatus) -> &'static str {
+    match status {
+        ReviewStatus::Published => "published",
+        ReviewStatus::UnderReview => "under_review",
+        ReviewStatus::Rejected => "rejected",
+        ReviewStatus::NotFound => "not_found",
+        ReviewStatus::Unavailable => "unavailable",
+    }
+}
+
+fn valid_review_title_query(value: &str) -> bool {
+    let normalized = value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    !normalized.is_empty() && normalized.len() <= REVIEW_STATUS_TITLE_QUERY_MAX_BYTES
 }
 
 fn local_runner_registry(
@@ -1051,6 +1192,22 @@ fn dispatch_to_local_runner(
 }
 
 #[tauri::command]
+fn account_readiness(
+    state: tauri::State<'_, DesktopState>,
+    input: AccountReadinessInput,
+) -> Result<AccountReadinessReport, DesktopError> {
+    state.service.account_readiness(input)
+}
+
+#[tauri::command]
+fn fanqie_review_status(
+    state: tauri::State<'_, DesktopState>,
+    input: FanqieReviewStatusInput,
+) -> Result<FanqieReviewStatusReport, DesktopError> {
+    state.service.fanqie_review_status(input)
+}
+
+#[tauri::command]
 fn save_account(
     state: tauri::State<'_, DesktopState>,
     input: SaveAccountInput,
@@ -1167,6 +1324,8 @@ pub fn run() {
             desktop_snapshot,
             save_local_draft,
             dispatch_to_local_runner,
+            account_readiness,
+            fanqie_review_status,
             save_account,
             save_article_account,
             local_history,
@@ -1200,9 +1359,10 @@ mod tests {
     };
 
     use super::{
-        AddLifecycleBusinessRelationInput, AddLifecycleContentAttributionInput,
-        AppendLifecycleLedgerEntryInput, CreateLifecycleObjectInput, DesktopService,
-        DispatchToLocalRunnerInput, HistoryQueryInput, LifecycleApprovalStatusInput,
+        AccountReadinessInput, AddLifecycleBusinessRelationInput,
+        AddLifecycleContentAttributionInput, AppendLifecycleLedgerEntryInput,
+        CreateLifecycleObjectInput, DesktopService, DispatchToLocalRunnerInput,
+        FanqieReviewStatusInput, HistoryQueryInput, LifecycleApprovalStatusInput,
         LifecycleLedgerDirectionInput, LifecycleObjectIdInput, LifecycleStatusInput,
         SaveAccountInput, SaveArticleAccountInput, SaveDraftInput, TransitionLifecycleObjectInput,
     };
@@ -1275,6 +1435,88 @@ mod tests {
             provider_runners: provider_runners.into_iter().map(str::to_owned).collect(),
             confirmed: true,
         }
+    }
+
+    #[test]
+    fn account_readiness_without_a_runner_is_unavailable_and_safe() {
+        let report = service()
+            .account_readiness(AccountReadinessInput {
+                platform: "dy".into(),
+                provider_runner: None,
+                confirmed: true,
+            })
+            .expect("no declaration is a safe unavailable result");
+
+        assert_eq!(report.state, "unavailable");
+        assert!(!format!("{report:?}").contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn probes_require_confirmation_and_matching_loopback_runner() {
+        let unconfirmed = service()
+            .account_readiness(AccountReadinessInput {
+                platform: "dy".into(),
+                provider_runner: Some("dy=tcp:127.0.0.1:39001".into()),
+                confirmed: false,
+            })
+            .expect_err("confirmation must precede runner use");
+        assert_eq!(
+            unconfirmed.to_string(),
+            "invalid local draft: explicit account readiness confirmation is required"
+        );
+
+        let mismatch = service()
+            .fanqie_review_status(FanqieReviewStatusInput {
+                title_query: "safe title".into(),
+                provider_runner: Some("dy=tcp:127.0.0.1:39001".into()),
+                confirmed: true,
+            })
+            .expect_err("Fanqie probe must use a matching runner");
+        assert_eq!(
+            mismatch.to_string(),
+            "invalid local draft: runner must use the matching PLATFORM=tcp:127.0.0.1:PORT declaration"
+        );
+    }
+
+    #[test]
+    fn fanqie_review_without_a_runner_is_unavailable_and_does_not_echo_title() {
+        let report = service()
+            .fanqie_review_status(FanqieReviewStatusInput {
+                title_query: "private test title".into(),
+                provider_runner: None,
+                confirmed: true,
+            })
+            .expect("no declaration is a safe unavailable result");
+
+        assert_eq!(report.state, "unavailable");
+        assert!(!format!("{report:?}").contains("private test title"));
+    }
+
+    #[test]
+    fn fanqie_review_input_rejects_unknown_fields_and_invalid_title() {
+        let input = [("unexpected", "not accepted")]
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    StringDeserializer::<ValueError>::new(key.to_owned()),
+                    StringDeserializer::<ValueError>::new(value.to_owned()),
+                )
+            });
+        let error = FanqieReviewStatusInput::deserialize(MapDeserializer::new(input))
+            .expect_err("unknown IPC input must fail");
+        assert!(error.to_string().contains("unknown field `unexpected`"));
+
+        let error = service()
+            .fanqie_review_status(FanqieReviewStatusInput {
+                title_query: "   \n\t".into(),
+                provider_runner: None,
+                confirmed: true,
+            })
+            .expect_err("blank title must fail before any runner request");
+        assert_eq!(
+            error.to_string(),
+            "invalid local draft: review title query must be non-empty and within the local limit"
+        );
     }
 
     fn history_record(

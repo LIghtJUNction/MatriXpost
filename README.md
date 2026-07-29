@@ -220,7 +220,12 @@ also provides an explicit-confirmation, one-shot local-runner dispatch form.
 It accepts runner declarations only for that invocation, does not start a
 runner or browser, and persists neither runner nor browser configuration. Its
 outcomes describe only local runner results and always report remote publication
-as unconfirmed.
+as unconfirmed. A separate local-runner diagnostics panel can infer upload-form
+readiness or query a bounded Fanqie title's review state through an explicitly
+entered, matching loopback runner declaration. Each check requires confirmation,
+never persists the declaration or title, and returns only a safe status enum;
+it neither starts a runner or browser nor proves a completed login or remote
+publication.
 
 Run the local shell during development from the workspace root:
 
@@ -242,9 +247,10 @@ there is no macOS or Windows bundle or runtime evidence.
 
 The static frontend uses Tauri's injected global IPC bridge
 (`withGlobalTauri:true`) because it has no Node dependency or bundler. That
-bridge reaches fifteen typed Rust commands: `desktop_snapshot`,
+bridge reaches seventeen typed Rust commands: `desktop_snapshot`,
 `save_local_draft`, `dispatch_to_local_runner`, `save_account`,
-`save_article_account`, and `local_history`, plus `lifecycle_objects`, `create_lifecycle_object`,
+`save_article_account`, `local_history`, `account_readiness`, and
+`fanqie_review_status`, plus `lifecycle_objects`, `create_lifecycle_object`,
 `lifecycle_ledger_entries`, `append_lifecycle_ledger_entry`,
 `lifecycle_content_attributions`, `add_lifecycle_content_attribution`, and
 `lifecycle_business_relations`, `add_lifecycle_business_relation`, and

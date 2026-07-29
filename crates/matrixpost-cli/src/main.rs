@@ -5,12 +5,12 @@ use std::{collections::BTreeMap, path::PathBuf, process::ExitCode, str::FromStr}
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use matrixpost_core::{
-    AccountSelection, ApprovalStatus, ArticleDispatchOutcome, ArticleRunner, BusinessObject,
-    BusinessObjectStatus, BusinessRelation, ContentAttribution, HistoryFilter, HistoryStatus,
-    LedgerDirection, LedgerEntry, LifecycleRepository, LocalSchedule, ManualLoginOutcome,
-    MediaSource, Platform, PlatformOverride, ProviderDispatchReport, ProviderRegistry,
-    ProviderRunner, PublishArticleRequest, PublishRequest, Repository, SqliteRepository,
-    WechatLink,
+    AccountReadiness, AccountSelection, ApprovalStatus, ArticleDispatchOutcome, ArticleRunner,
+    BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution, HistoryFilter,
+    HistoryStatus, LedgerDirection, LedgerEntry, LifecycleRepository, LocalSchedule,
+    ManualLoginOutcome, MediaSource, Platform, PlatformOverride, ProviderDispatchReport,
+    ProviderRegistry, ProviderRunner, PublishArticleRequest, PublishRequest, Repository,
+    ReviewStatus, SqliteRepository, WechatLink,
 };
 use serde::Serialize;
 
@@ -66,6 +66,13 @@ enum Command {
     Accounts {
         #[arg(long)]
         json: bool,
+    },
+    /// Query only a bounded Fanqie title's safe review-status label through a
+    /// matching explicit local runner.
+    #[command(name = "review-status")]
+    ReviewStatus {
+        #[arg(long)]
+        title: String,
     },
     History(HistoryArgs),
     /// Show deterministic availability for every supported platform.
@@ -465,6 +472,93 @@ fn dispatch_manual_login(runners: &[ProviderRunner], platform: Platform) -> Exit
             Some("local runner login request was rejected; no login success is asserted"),
         ),
     }
+}
+
+fn dispatch_fanqie_review_status(runners: &[ProviderRunner], title: &str) -> ExitCode {
+    let Some(runner) = login_runner(runners, Platform::FanqieVideo) else {
+        return emit(
+            3,
+            serde_json::json!({ "outcome": "unavailable", "platform": Platform::FanqieVideo }),
+            Some(
+                "no local Fanqie runner is configured; no browser review-status probe was attempted",
+            ),
+        );
+    };
+    match runner.fanqie_review_status(title) {
+        Ok(ReviewStatus::Published) => emit(
+            0,
+            serde_json::json!({ "outcome": "published", "platform": Platform::FanqieVideo }),
+            Some(
+                "a matching local video-list card is published-like; this does not prove remote publication acceptance",
+            ),
+        ),
+        Ok(ReviewStatus::UnderReview) => emit(
+            0,
+            serde_json::json!({ "outcome": "under_review", "platform": Platform::FanqieVideo }),
+            Some(
+                "a matching local video-list card is under review; no remote publication success is claimed",
+            ),
+        ),
+        Ok(ReviewStatus::NotFound) => emit(
+            0,
+            serde_json::json!({ "outcome": "not_found", "platform": Platform::FanqieVideo }),
+            Some(
+                "no matching local video-list card was found; no remote publication success is claimed",
+            ),
+        ),
+        Ok(ReviewStatus::Unavailable) => emit(
+            3,
+            serde_json::json!({ "outcome": "unavailable", "platform": Platform::FanqieVideo }),
+            Some(
+                "the local Fanqie runner is unavailable; no browser review-status probe was completed",
+            ),
+        ),
+        Ok(ReviewStatus::Rejected) | Err(_) => emit(
+            4,
+            serde_json::json!({ "outcome": "rejected", "platform": Platform::FanqieVideo }),
+            Some(
+                "the local Fanqie review-status probe was rejected; no remote publication success is claimed",
+            ),
+        ),
+    }
+}
+
+fn accounts_with_readiness(
+    accounts: Vec<matrixpost_core::Account>,
+    runners: &[ProviderRunner],
+) -> Vec<serde_json::Value> {
+    accounts_with_readiness_using(accounts, runners, |runner| {
+        runner
+            .account_readiness()
+            .unwrap_or(AccountReadiness::Rejected)
+    })
+}
+
+fn accounts_with_readiness_using<F>(
+    accounts: Vec<matrixpost_core::Account>,
+    runners: &[ProviderRunner],
+    probe: F,
+) -> Vec<serde_json::Value>
+where
+    F: Fn(&ProviderRunner) -> AccountReadiness,
+{
+    accounts
+        .into_iter()
+        .map(|account| {
+            let readiness = login_runner(runners, account.platform)
+                .map(&probe)
+                .unwrap_or(AccountReadiness::Unavailable);
+            let mut account = serde_json::to_value(account).expect("account is serializable");
+            account
+                .as_object_mut()
+                .expect("account serializes as an object")
+                .insert(
+                    "readiness".into(),
+                    serde_json::to_value(readiness).expect("readiness is serializable"),
+                );
+            account
+        })
+        .collect()
 }
 fn article_runner(values: &[String]) -> Result<Option<ArticleRunner>, String> {
     match values {
@@ -941,9 +1035,14 @@ fn main() -> ExitCode {
         Command::Accounts { json: _ } => match open(cli.state_path)
             .and_then(|repository| repository.accounts().map_err(|error| error.to_string()))
         {
-            Ok(accounts) => emit(0, serde_json::json!({ "accounts": accounts }), None),
+            Ok(accounts) => emit(
+                0,
+                serde_json::json!({ "accounts": accounts_with_readiness(accounts, &runners) }),
+                None,
+            ),
             Err(error) => emit(4, serde_json::Value::Null, Some(&error)),
         },
+        Command::ReviewStatus { title } => dispatch_fanqie_review_status(&runners, &title),
         Command::History(args) => match parse_history_filter(&args) {
             Ok(filter) => match open(cli.state_path).and_then(|repository| {
                 repository
@@ -967,6 +1066,39 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_status_parser_is_deterministic_and_has_no_runner_fallback() {
+        let parsed =
+            Cli::try_parse_from(["matrixpost", "review-status", "--title", "Title"]).unwrap();
+        assert!(matches!(parsed.command, Command::ReviewStatus { title } if title == "Title"));
+        assert_eq!(
+            dispatch_fanqie_review_status(&[], "Title"),
+            ExitCode::from(3)
+        );
+    }
+
+    #[test]
+    fn accounts_keep_persisted_fields_and_project_safe_runner_readiness() {
+        let account = matrixpost_core::Account {
+            id: "account-1".into(),
+            platform: Platform::Douyin,
+            display_name: "local".into(),
+            status: matrixpost_core::AccountStatus::LoggedIn,
+            phone: "123".into(),
+            partition: "persist:local".into(),
+        };
+        let unavailable = accounts_with_readiness_using(vec![account.clone()], &[], |_| {
+            panic!("no runner must not probe")
+        });
+        assert_eq!(unavailable[0]["id"], "account-1");
+        assert_eq!(unavailable[0]["readiness"], "unavailable");
+        let runner = ProviderRunner::parse_cli("dy=tcp:127.0.0.1:39001").unwrap();
+        let ready =
+            accounts_with_readiness_using(vec![account], &[runner], |_| AccountReadiness::Ready);
+        assert_eq!(ready[0]["readiness"], "ready");
+        assert!(ready[0].get("cookie").is_none());
+    }
     #[test]
     fn publish_arguments_preserve_upstream_fields() {
         let parsed = Cli::try_parse_from([

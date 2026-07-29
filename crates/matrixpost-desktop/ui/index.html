@@ -82,6 +82,58 @@
         <ul id="local-runner-outcomes" class="accounts" aria-live="polite" aria-label="Local runner dispatch outcomes"></ul>
       </section>
 
+      <section aria-labelledby="local-diagnostics-title" class="local-runner-workbench">
+        <h2 id="local-diagnostics-title">Local runner diagnostics</h2>
+        <p class="hint">These one-shot checks only contact a declaration you enter for this request. They neither start a runner or browser nor prove a completed login or remote publication. No runner declaration means unavailable.</p>
+        <div class="diagnostics-grid">
+          <form id="account-readiness-form">
+            <h3>Upload-form readiness</h3>
+            <label>
+              Platform
+              <select name="platform" required>
+                <option value="dy">Douyin (dy)</option>
+                <option value="sph">WeChat Channels (sph)</option>
+                <option value="blbl">Bilibili (blbl)</option>
+                <option value="bjh">Baijiahao (bjh)</option>
+                <option value="tt">Toutiao (tt)</option>
+                <option value="ks">Kuaishou (ks)</option>
+                <option value="xhs">Xiaohongshu (xhs)</option>
+                <option value="fqsp">Fanqie Video (fqsp)</option>
+              </select>
+            </label>
+            <label>
+              Local runner declaration (optional)
+              <input name="providerRunner" spellcheck="false" autocomplete="off" placeholder="dy=tcp:127.0.0.1:39001" aria-describedby="diagnostics-help" />
+            </label>
+            <label class="checkbox-label">
+              <input name="confirmed" type="checkbox" required />
+              I confirm this is my manually started local runner and I want this one-shot readiness check.
+            </label>
+            <button type="submit">Check readiness</button>
+            <p id="account-readiness-result" role="status" aria-live="polite"></p>
+          </form>
+
+          <form id="fanqie-review-form">
+            <h3>Fanqie review status</h3>
+            <label>
+              Video title to check
+              <input name="titleQuery" required maxlength="200" autocomplete="off" />
+            </label>
+            <label>
+              Fanqie local runner declaration (optional)
+              <input name="providerRunner" spellcheck="false" autocomplete="off" placeholder="fqsp=tcp:127.0.0.1:39001" aria-describedby="diagnostics-help" />
+            </label>
+            <label class="checkbox-label">
+              <input name="confirmed" type="checkbox" required />
+              I confirm this is my manually started Fanqie runner and I want this one-shot review check.
+            </label>
+            <button type="submit">Check Fanqie status</button>
+            <p id="fanqie-review-result" role="status" aria-live="polite"></p>
+          </form>
+        </div>
+        <p id="diagnostics-help" class="hint">Use only the matching <code>PLATFORM=tcp:127.0.0.1:PORT</code> declaration. Declarations and titles are not saved; results contain only a safe status.</p>
+      </section>
+
       <section aria-labelledby="accounts-title">
         <h2 id="accounts-title">Local video accounts</h2>
         <p class="hint">Save only display and routing metadata. The routing fields are required by the local account model, but this application never stores passwords, cookies, tokens, or session data.</p>

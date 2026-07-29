@@ -22,8 +22,11 @@ fieldset { border: 1px solid #344045; border-radius: .6rem; padding: .75rem; }
 input, select, textarea { width: 100%; border: 1px solid #4a575c; border-radius: .5rem; padding: .65rem; background: #0f1315; color: inherit; font: inherit; }
 .targets label { width: auto; color: #c2cdd0; }
 .targets input { width: auto; }
-#draft-result, #local-runner-result, #account-result, #history-result, #article-account-result, #lifecycle-object-result, #lifecycle-ledger-result, #lifecycle-attribution-result, #lifecycle-relation-result, #lifecycle-transition-result { min-height: 1.5rem; color: #b7e7cc; }
+#draft-result, #local-runner-result, #account-readiness-result, #fanqie-review-result, #account-result, #history-result, #article-account-result, #lifecycle-object-result, #lifecycle-ledger-result, #lifecycle-attribution-result, #lifecycle-relation-result, #lifecycle-transition-result { min-height: 1.5rem; color: #b7e7cc; }
 .local-runner-workbench { border-color: #4d775f; }
+.diagnostics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; align-items: start; }
+.diagnostics-grid form { max-width: none; }
+.diagnostics-grid h3 { margin-top: 0; font-size: 1rem; }
 .accounts { display: grid; gap: .65rem; margin: 1.25rem 0 0; padding: 0; list-style: none; }
 .account, .history-entry { display: grid; gap: .2rem; padding: .8rem; border: 1px solid #344045; border-radius: .6rem; }
 .account span, .history-entry span, .empty-state { color: #aeb9bc; font-size: .9rem; }
