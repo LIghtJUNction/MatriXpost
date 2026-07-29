@@ -351,6 +351,28 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         )
     }
 
+    fn apply_baijiahao_creative_statement(&self, session: &str, label: &str) -> Result<(), String> {
+        if !self.execute_bool(session, BAIJIAHAO_STATEMENT_OPEN_SCRIPT, json!([]))? {
+            return Err("Baijiahao creative-statement selector could not be opened".into());
+        }
+        self.wait_for_douyin_statement_action(
+            session,
+            BAIJIAHAO_STATEMENT_DIALOG_VISIBLE_SCRIPT,
+            json!([label]),
+        )?;
+        if !self.execute_bool(session, BAIJIAHAO_STATEMENT_SELECT_SCRIPT, json!([label]))? {
+            return Err("Baijiahao creative-statement option could not be selected".into());
+        }
+        if !self.execute_bool(session, BAIJIAHAO_STATEMENT_CONFIRM_SCRIPT, json!([label]))? {
+            return Err("Baijiahao creative-statement confirmation was unavailable".into());
+        }
+        self.wait_for_douyin_statement_action(
+            session,
+            BAIJIAHAO_STATEMENT_DIALOG_GONE_SCRIPT,
+            json!([label]),
+        )
+    }
+
     fn try_declare_wechat_original(&self, session: &str) -> Result<(), String> {
         if !self.execute_bool(session, WECHAT_ORIGINAL_ENTRY_SCRIPT, json!([]))? {
             return Ok(());
@@ -607,9 +629,11 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         if let Some(address) = &request.address {
             fields.push(address.clone());
         }
-        if !matches!(platform, Platform::WechatChannels | Platform::Douyin)
-            && let Some(statement) =
-                override_value.and_then(|item| item.creative_statement.as_ref())
+        if !matches!(
+            platform,
+            Platform::WechatChannels | Platform::Douyin | Platform::Baijiahao
+        ) && let Some(statement) =
+            override_value.and_then(|item| item.creative_statement.as_ref())
         {
             fields.push(statement.clone());
         }
@@ -634,44 +658,6 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
             .or(request.short_title.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-    }
-
-    /// MatrixMedia resolves a declaration per target platform. The local
-    /// runner intentionally consumes only the WeChat override; a global value
-    /// has no target-specific meaning here. Unknown values follow upstream's
-    /// `none` fallback and therefore cause no browser action.
-    fn wechat_creative_statement_label(request: &PublishRequest) -> Option<&'static str> {
-        let value = request
-            .overrides
-            .iter()
-            .find(|item| item.platform == Platform::WechatChannels)
-            .and_then(|item| item.creative_statement.as_deref())?
-            .trim();
-        match value {
-            "ai_generated"
-            | "AI生成"
-            | "含AI生成内容"
-            | "内容由AI生成"
-            | "内容为AI生成"
-            | "笔记含AI合成内容" => Some("含AI生成内容"),
-            "fiction"
-            | "虚构演绎"
-            | "含虚构演绎内容"
-            | "虚构演绎，仅供娱乐"
-            | "演绎情节，仅供娱乐"
-            | "虚构演绎，故事经历" => Some("内容为虚构剧情，仅供娱乐"),
-            "marketing" | "营销推广" | "内容含营销信息" | "内容含营销推广信息" => {
-                Some("内容包含营销广告")
-            }
-            "personal_opinion" | "个人观点" | "个人观点，仅供参考" | "内容为个人观点或见解" => {
-                Some("个人观点，仅供参考")
-            }
-            "repost" | "转载" | "内容为转载" | "内容为转载信息" | "取自站外" | "素材来源于网络" => {
-                Some("内容为转载")
-            }
-            "self_shot" | "自行拍摄" | "内容为自行拍摄" => Some("内容为自行拍摄"),
-            _ => None,
-        }
     }
 }
 
@@ -762,10 +748,13 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             None
         };
         let wechat_creative_statement = (platform == Platform::WechatChannels)
-            .then(|| Self::wechat_creative_statement_label(request))
+            .then(|| wechat_creative_statement_label(request))
             .flatten();
         let douyin_autonomous_statement = (platform == Platform::Douyin)
             .then(|| douyin_autonomous_statement_label(request))
+            .flatten();
+        let baijiahao_creative_statement = (platform == Platform::Baijiahao)
+            .then(|| baijiahao_creative_statement_label(request))
             .flatten();
         let session = self.session()?;
         let outcome: Result<(), String> = (|| {
@@ -790,6 +779,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             }
             if let Some(label) = douyin_autonomous_statement {
                 self.apply_douyin_autonomous_statement(&session, label)?;
+            }
+            if let Some(label) = baijiahao_creative_statement {
+                self.apply_baijiahao_creative_statement(&session, label)?;
             }
             if platform == Platform::WechatChannels {
                 self.try_declare_wechat_original(&session)?;

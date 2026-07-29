@@ -63,6 +63,15 @@ pub(crate) const DOUYIN_STATEMENT_SELECT_SCRIPT: &str = r#"const expected=argume
 pub(crate) const DOUYIN_STATEMENT_CONFIRM_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},matches=Array.from(document.querySelectorAll('.semi-modal-body')).filter(body=>visible(body)&&Array.from(body.querySelectorAll('.semi-radio-addon')).some(item=>String(item.textContent||'').trim()===expected));if(matches.length!==1)return false;const root=matches[0].closest('.semi-modal')||matches[0],buttons=Array.from(root.querySelectorAll('.semi-button.semi-button-primary')).filter(item=>!item.disabled&&item.getAttribute('aria-disabled')!=='true');if(buttons.length!==1)return false;buttons[0].click();return true;"#;
 pub(crate) const DOUYIN_STATEMENT_DIALOG_GONE_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},matches=Array.from(document.querySelectorAll('.semi-modal-body')).filter(body=>visible(body)&&Array.from(body.querySelectorAll('.semi-radio-addon')).some(item=>String(item.textContent||'').trim()===expected));return matches.length===0;"#;
 
+/// Baijiahao declarations use ordinary DOM modals instead of a shadow root.
+/// Scripts accept only known resolved labels and return booleans, keeping page
+/// content and identifiers inside the attached browser.
+pub(crate) const BAIJIAHAO_STATEMENT_OPEN_SCRIPT: &str = r#"const visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},inputs=Array.from(document.querySelectorAll('input[placeholder=\"请选择创作声明\"]')).filter(visible);if(inputs.length!==1)return false;const input=inputs[0],wrap=input.closest('.form-inner-wrap')||input.parentElement;if(!wrap)return false;input.focus();input.click();if(wrap!==input)wrap.click();return true;"#;
+pub(crate) const BAIJIAHAO_STATEMENT_DIALOG_VISIBLE_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},norm=value=>String(value||'').replace(/\s+/g,'').trim(),roots=Array.from(document.querySelectorAll('.cheetah-modal')).filter(visible),dialogs=roots.length?roots:Array.from(document.querySelectorAll('.cheetah-modal-content')).filter(visible),matches=dialogs.filter(dialog=>Array.from(dialog.querySelectorAll('.cheetah-radio-wrapper')).some(item=>norm((item.closest('.flex.items-center')||item.parentElement||item).textContent)===norm(expected)));if(matches.length!==1)return false;return true;"#;
+pub(crate) const BAIJIAHAO_STATEMENT_SELECT_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},norm=value=>String(value||'').replace(/\s+/g,'').trim(),roots=Array.from(document.querySelectorAll('.cheetah-modal')).filter(visible),dialogs=roots.length?roots:Array.from(document.querySelectorAll('.cheetah-modal-content')).filter(visible),matches=dialogs.filter(dialog=>Array.from(dialog.querySelectorAll('.cheetah-radio-wrapper')).some(item=>norm((item.closest('.flex.items-center')||item.parentElement||item).textContent)===norm(expected)));if(matches.length!==1)return false;const options=Array.from(matches[0].querySelectorAll('.cheetah-radio-wrapper')).filter(item=>norm((item.closest('.flex.items-center')||item.parentElement||item).textContent)===norm(expected));if(options.length!==1)return false;options[0].click();return true;"#;
+pub(crate) const BAIJIAHAO_STATEMENT_CONFIRM_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},norm=value=>String(value||'').replace(/\s+/g,'').trim(),roots=Array.from(document.querySelectorAll('.cheetah-modal')).filter(visible),dialogs=roots.length?roots:Array.from(document.querySelectorAll('.cheetah-modal-content')).filter(visible),matches=dialogs.filter(dialog=>Array.from(dialog.querySelectorAll('.cheetah-radio-wrapper')).some(item=>norm((item.closest('.flex.items-center')||item.parentElement||item).textContent)===norm(expected)));if(matches.length!==1)return false;const buttons=Array.from(matches[0].querySelectorAll('.cheetah-modal-footer button.cheetah-btn-primary')).filter(item=>!item.disabled&&item.getAttribute('aria-disabled')!=='true');if(buttons.length!==1)return false;buttons[0].click();return true;"#;
+pub(crate) const BAIJIAHAO_STATEMENT_DIALOG_GONE_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},norm=value=>String(value||'').replace(/\s+/g,'').trim(),roots=Array.from(document.querySelectorAll('.cheetah-modal')).filter(visible),dialogs=roots.length?roots:Array.from(document.querySelectorAll('.cheetah-modal-content')).filter(visible),matches=dialogs.filter(dialog=>Array.from(dialog.querySelectorAll('.cheetah-radio-wrapper')).some(item=>norm((item.closest('.flex.items-center')||item.parentElement||item).textContent)===norm(expected)));return matches.length===0;"#;
+
 /// Match MatrixMedia's target-specific Douyin resolver. An explicitly
 /// supplied unsupported value follows the upstream `none` fallback and is
 /// still selected on the page; an absent Douyin override remains absent.
@@ -97,6 +106,77 @@ pub(crate) fn douyin_autonomous_statement_label(request: &PublishRequest) -> Opt
         }
         _ => "无需添加自主声明",
     })
+}
+
+/// MatrixMedia resolves a declaration per target platform. Unsupported and
+/// unknown Baijiahao values explicitly select the upstream `none` option.
+pub(crate) fn baijiahao_creative_statement_label(request: &PublishRequest) -> Option<&'static str> {
+    let value = request
+        .overrides
+        .iter()
+        .find(|item| item.platform == Platform::Baijiahao)
+        .and_then(|item| item.creative_statement.as_deref())?
+        .trim();
+    Some(match value {
+        "ai_generated"
+        | "AI生成"
+        | "含AI生成内容"
+        | "内容由AI生成"
+        | "内容为AI生成"
+        | "笔记含AI合成内容" => "含AI生成内容",
+        "fiction"
+        | "虚构演绎"
+        | "含虚构演绎内容"
+        | "虚构演绎，仅供娱乐"
+        | "演绎情节，仅供娱乐"
+        | "虚构演绎，故事经历" => "含虚构演绎内容",
+        "marketing" | "营销推广" | "内容含营销信息" | "内容含营销推广信息" => {
+            "内容含营销信息"
+        }
+        "personal_opinion" | "个人观点" | "个人观点，仅供参考" | "内容为个人观点或见解" => {
+            "个人观点，仅供参考"
+        }
+        "repost" | "转载" | "内容为转载" | "内容为转载信息" | "取自站外" | "素材来源于网络" => {
+            "内容为转载"
+        }
+        _ => "无需声明",
+    })
+}
+
+/// Resolve only an explicit WeChat target override; an unsupported value has
+/// no matching local page action.
+pub(crate) fn wechat_creative_statement_label(request: &PublishRequest) -> Option<&'static str> {
+    let value = request
+        .overrides
+        .iter()
+        .find(|item| item.platform == Platform::WechatChannels)
+        .and_then(|item| item.creative_statement.as_deref())?
+        .trim();
+    match value {
+        "ai_generated"
+        | "AI生成"
+        | "含AI生成内容"
+        | "内容由AI生成"
+        | "内容为AI生成"
+        | "笔记含AI合成内容" => Some("含AI生成内容"),
+        "fiction"
+        | "虚构演绎"
+        | "含虚构演绎内容"
+        | "虚构演绎，仅供娱乐"
+        | "演绎情节，仅供娱乐"
+        | "虚构演绎，故事经历" => Some("内容为虚构剧情，仅供娱乐"),
+        "marketing" | "营销推广" | "内容含营销信息" | "内容含营销推广信息" => {
+            Some("内容包含营销广告")
+        }
+        "personal_opinion" | "个人观点" | "个人观点，仅供参考" | "内容为个人观点或见解" => {
+            Some("个人观点，仅供参考")
+        }
+        "repost" | "转载" | "内容为转载" | "内容为转载信息" | "取自站外" | "素材来源于网络" => {
+            Some("内容为转载")
+        }
+        "self_shot" | "自行拍摄" | "内容为自行拍摄" => Some("内容为自行拍摄"),
+        _ => None,
+    }
 }
 /// These scripts return only booleans. Product names, identifiers, and DOM
 /// content deliberately never leave the attached page through WebDriver.
