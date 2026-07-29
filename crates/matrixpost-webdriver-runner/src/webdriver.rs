@@ -237,7 +237,7 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         Ok(false)
     }
 
-    fn wait_for_douyin_statement_action(
+    fn wait_for_statement_action(
         &self,
         session: &str,
         script: &str,
@@ -251,7 +251,7 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
                 std::thread::sleep(DOUYIN_STATEMENT_POLL_INTERVAL);
             }
         }
-        Err("Douyin autonomous-statement action did not complete before its deadline".into())
+        Err("creative-statement action did not complete before its deadline".into())
     }
 
     pub(crate) fn wechat_product_id(request: &PublishRequest) -> Result<Option<String>, String> {
@@ -333,7 +333,7 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         if !self.execute_bool(session, DOUYIN_STATEMENT_OPEN_SCRIPT, json!([]))? {
             return Err("Douyin autonomous-statement selector could not be opened".into());
         }
-        self.wait_for_douyin_statement_action(
+        self.wait_for_statement_action(
             session,
             DOUYIN_STATEMENT_DIALOG_VISIBLE_SCRIPT,
             json!([label]),
@@ -344,18 +344,14 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         if !self.execute_bool(session, DOUYIN_STATEMENT_CONFIRM_SCRIPT, json!([label]))? {
             return Err("Douyin autonomous-statement confirmation was unavailable".into());
         }
-        self.wait_for_douyin_statement_action(
-            session,
-            DOUYIN_STATEMENT_DIALOG_GONE_SCRIPT,
-            json!([label]),
-        )
+        self.wait_for_statement_action(session, DOUYIN_STATEMENT_DIALOG_GONE_SCRIPT, json!([label]))
     }
 
     fn apply_baijiahao_creative_statement(&self, session: &str, label: &str) -> Result<(), String> {
         if !self.execute_bool(session, BAIJIAHAO_STATEMENT_OPEN_SCRIPT, json!([]))? {
             return Err("Baijiahao creative-statement selector could not be opened".into());
         }
-        self.wait_for_douyin_statement_action(
+        self.wait_for_statement_action(
             session,
             BAIJIAHAO_STATEMENT_DIALOG_VISIBLE_SCRIPT,
             json!([label]),
@@ -366,11 +362,26 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         if !self.execute_bool(session, BAIJIAHAO_STATEMENT_CONFIRM_SCRIPT, json!([label]))? {
             return Err("Baijiahao creative-statement confirmation was unavailable".into());
         }
-        self.wait_for_douyin_statement_action(
+        self.wait_for_statement_action(
             session,
             BAIJIAHAO_STATEMENT_DIALOG_GONE_SCRIPT,
             json!([label]),
         )
+    }
+
+    fn apply_bilibili_creative_statement(&self, session: &str, label: &str) -> Result<(), String> {
+        if !self.execute_bool(session, BILIBILI_STATEMENT_OPEN_SCRIPT, json!([]))? {
+            return Err("Bilibili creative-statement selector could not be opened".into());
+        }
+        self.wait_for_statement_action(
+            session,
+            BILIBILI_STATEMENT_LIST_VISIBLE_SCRIPT,
+            json!([label]),
+        )?;
+        if !self.execute_bool(session, BILIBILI_STATEMENT_SELECT_SCRIPT, json!([label]))? {
+            return Err("Bilibili creative-statement option could not be selected".into());
+        }
+        self.wait_for_statement_action(session, BILIBILI_STATEMENT_LIST_GONE_SCRIPT, json!([label]))
     }
 
     fn try_declare_wechat_original(&self, session: &str) -> Result<(), String> {
@@ -631,7 +642,7 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         }
         if !matches!(
             platform,
-            Platform::WechatChannels | Platform::Douyin | Platform::Baijiahao
+            Platform::WechatChannels | Platform::Douyin | Platform::Bilibili | Platform::Baijiahao
         ) && let Some(statement) =
             override_value.and_then(|item| item.creative_statement.as_ref())
         {
@@ -756,6 +767,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
         let baijiahao_creative_statement = (platform == Platform::Baijiahao)
             .then(|| baijiahao_creative_statement_label(request))
             .flatten();
+        let bilibili_creative_statement = (platform == Platform::Bilibili)
+            .then(|| bilibili_creative_statement_label(request))
+            .flatten();
         let session = self.session()?;
         let outcome: Result<(), String> = (|| {
             self.navigate(&session, profile.upload_url)?;
@@ -782,6 +796,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             }
             if let Some(label) = baijiahao_creative_statement {
                 self.apply_baijiahao_creative_statement(&session, label)?;
+            }
+            if let Some(label) = bilibili_creative_statement {
+                self.apply_bilibili_creative_statement(&session, label)?;
             }
             if platform == Platform::WechatChannels {
                 self.try_declare_wechat_original(&session)?;
