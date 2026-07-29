@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::profiles::*;
+mod fanqie;
 mod kuaishou;
 mod toutiao;
 mod xiaohongshu;
@@ -747,6 +748,11 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             .then(|| Self::wechat_product_id(request))
             .transpose()?
             .flatten();
+        if platform == Platform::FanqieVideo && request.draft {
+            return Err(
+                "Fanqie Video does not support draft publication in the local runner".into(),
+            );
+        }
         let creative_statement = match platform {
             Platform::WechatChannels => wechat_creative_statement_label(request),
             Platform::Douyin => douyin_autonomous_statement_label(request),
@@ -800,20 +806,25 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             if platform == Platform::WechatChannels {
                 self.try_declare_wechat_original(&session)?;
             }
-            if self.success_marker_visible(&session, profile)? {
-                return Err(
-                    "a success marker was already visibly present before the publish action".into(),
-                );
+            if platform == Platform::FanqieVideo {
+                self.publish_fanqie_video(&session)?;
+            } else {
+                if self.success_marker_visible(&session, profile)? {
+                    return Err(
+                        "a success marker was already visibly present before the publish action"
+                            .into(),
+                    );
+                }
+                self.click(
+                    &session,
+                    if request.draft {
+                        profile.draft
+                    } else {
+                        profile.submit
+                    },
+                )?;
+                self.wait_for_success_transition(&session, profile)?;
             }
-            self.click(
-                &session,
-                if request.draft {
-                    profile.draft
-                } else {
-                    profile.submit
-                },
-            )?;
-            self.wait_for_success_transition(&session, profile)?;
             Ok(())
         })();
         let cleanup = self.delete_session(&session);
