@@ -149,7 +149,10 @@ state. `history` defaults to the latest seven days and accepts `--days`,
 `--platform`, `--status` (`success`, `failed`, `publishing`, or `scheduled`),
 and `--all`; filters intersect, while `--all` removes the cutoff. The CLI
 retains the upstream command names and preserves all parsed publish fields in
-the typed core request.
+the typed core request. Public video history is a redacted projection: stable
+id, state, time, title, targets, and local draft/schedule intent only. It never
+returns media sources or paths, account routing, tags, request details, or
+provider diagnostics.
 
 `matrixpost lifecycle` manages the same local generic lifecycle state. It can
 create, list, and retrieve objects; append or list immutable ledger entries;
@@ -175,6 +178,8 @@ are `标题`/`title`, `标签`/`tags`, and
 is only a local input: each valid row is sent to the configured local provider
 runner and a `queued` result means that runner accepted/completed its local
 workflow, never that a remote platform has published or processed the video.
+Every row that reaches a local runner records one terminal, redacted local
+history outcome; rows skipped before dispatch do not create history.
 
 For safety, the directory and workbook must be existing, non-symlink local
 paths. Only direct, supported video files are eligible; recursive paths,
@@ -188,23 +193,25 @@ row is unavailable, and `4` for skipped, rejected, or mixed outcomes.
 `matrixpost-mcp` is an MCP stdio server built with the official Rust SDK. It
 uses the same local SQLite state as the CLI. By default it does not spawn
 `matrixpostd`, execute a shell command, or connect to any runner. With an
-explicit loopback `--article-runner`, it can call that separately started local
-article runner, but it never connects directly to a platform, browser, or
+explicit loopback `--provider-runner`, it can dispatch video only to that
+separately started local runner; with `--article-runner`, it can do the same
+for Juejin articles. It never connects directly to a platform, browser, or
 provider automation endpoint and never uses browser/session data. Its stdout
 is reserved for MCP JSON-RPC frames. Diagnostic logging is disabled by default
 and, when explicitly enabled with `MATRIXPOST_MCP_LOG=1`, is written only to
 stderr.
 
 Configure an MCP client to start the installed `matrixpost-mcp` binary with
-the desired state path. Add `--article-runner tcp:127.0.0.1:PORT` only when a
-separately started runner has also opted in with `--allow-article-publish`:
+the desired state path. Add `--provider-runner dy=tcp:127.0.0.1:PORT` only for
+a separately started video runner, and `--article-runner tcp:127.0.0.1:PORT`
+only when that runner has also opted in with `--allow-article-publish`:
 
 ```json
 {
   "mcpServers": {
     "matrixpost": {
       "command": "matrixpost-mcp",
-      "args": ["--state-path", "/absolute/path/to/matrixpost.db", "--article-runner", "tcp:127.0.0.1:39002"]
+      "args": ["--state-path", "/absolute/path/to/matrixpost.db", "--provider-runner", "dy=tcp:127.0.0.1:39001", "--article-runner", "tcp:127.0.0.1:39002"]
     }
   }
 }
@@ -215,11 +222,14 @@ neither is supplied the server uses `matrixpost.db` in its working directory.
 The MCP server exposes fourteen tools: the four upstream tool names `list_accounts`,
 `list_history`, `publish_video`, and `publish_article`. Account and history
 tools read only credential-free SQLite metadata. `publish_video` validates and
-records a local draft/queued job only for `dy`, `ks`, `blbl`, `bjh`, `tt`, or
-`sph`, then returns `provider_available:false` and `remote_publish_attempted:false`;
-no provider automation is attempted. `list_accounts` accepts the exact upstream
-account set (`dy`, `ks`, `blbl`, `bjh`, `tt`, `sph`, `xhs`, `juejin`, `fqsp`)
-and returns a direct JSON array. Juejin entries are stored in a separate,
+records local drafts or scheduled jobs without a dispatch. For an immediate
+`dy`, `ks`, `blbl`, `bjh`, `tt`, or `sph` request, it dispatches only to an
+explicit matching `--provider-runner`, then atomically records the terminal
+local outcome before returning `persisted:true`. Without that runner it records
+the safe `unavailable` outcome; neither outcome confirms remote publication.
+`list_accounts` accepts the exact upstream account set (`dy`, `ks`, `blbl`,
+`bjh`, `tt`, `sph`, `xhs`, `juejin`, `fqsp`) and returns a direct JSON array.
+Juejin entries are stored in a separate,
 credential-free SQLite registry (`phone`, platform, `partition`, plus local display/status metadata), so a
 fresh database returns none and persisted safe metadata is listed normally.
 `publish_article` accepts only `juejin`, normalizes its upstream tag string, and remains explicitly
