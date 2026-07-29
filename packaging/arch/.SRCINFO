@@ -1,6 +1,6 @@
 pkgbase = matrixpost
 	pkgdesc = Rust CLI, MCP server, and headless publication daemon for MatriXpost
-	pkgver = 0.3.1
+	pkgver = 0.4.0
 	pkgrel = 1
 	url = https://github.com/lightjunction/MatriXpost
 	arch = x86_64
@@ -10,7 +10,7 @@ pkgbase = matrixpost
 	makedepends = rust
 	depends = gcc-libs
 	depends = glibc
-	source = matrixpost-0.3.1.tar.gz::https://github.com/LIghtJUNction/MatriXpost/archive/bceb3036079ee260e035799628a1db34aa2aef62.tar.gz
-	sha256sums = cd095e4242861c45dd5ad55e2e070ec860b927d4f09915e0698264a32fcbeba1
+	source = matrixpost-0.4.0.tar.gz::https://github.com/LIghtJUNction/MatriXpost/archive/f27f7f98176c1d18f999a96d108ca0ec46611391.tar.gz
+	sha256sums = 1cc548dba7776ca007dc18e275523417f0dcbde685541baeb858f64750648547
 
 pkgname = matrixpost

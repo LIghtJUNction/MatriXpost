@@ -1,7 +1,7 @@
 # Maintainer: lightjunction <lightjunction@users.noreply.github.com>
 
 pkgname=matrixpost
-pkgver=0.3.1
+pkgver=0.4.0
 pkgrel=1
 pkgdesc='Rust CLI, MCP server, and headless publication daemon for MatriXpost'
 arch=('x86_64' 'aarch64')
@@ -9,12 +9,12 @@ url='https://github.com/lightjunction/MatriXpost'
 license=('GPL-2.0-only')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo' 'rust')
-# v0.3.1 release commit, pinned so a moved tag cannot change the source.
-source=("${pkgname}-${pkgver}.tar.gz::https://github.com/LIghtJUNction/MatriXpost/archive/bceb3036079ee260e035799628a1db34aa2aef62.tar.gz")
-sha256sums=('cd095e4242861c45dd5ad55e2e070ec860b927d4f09915e0698264a32fcbeba1')
+# v0.4.0 release commit, pinned so a moved tag cannot change the source.
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/LIghtJUNction/MatriXpost/archive/f27f7f98176c1d18f999a96d108ca0ec46611391.tar.gz")
+sha256sums=('1cc548dba7776ca007dc18e275523417f0dcbde685541baeb858f64750648547')
 
 build() {
-  cd "${srcdir}/MatriXpost-bceb3036079ee260e035799628a1db34aa2aef62"
+  cd "${srcdir}/MatriXpost-f27f7f98176c1d18f999a96d108ca0ec46611391"
 
   # Arch's -flto=auto leaks into vendored C static archives (ring and SQLite),
   # which clang cannot reliably link through rustc. Preserve the remaining
@@ -27,7 +27,7 @@ build() {
 }
 
 package() {
-  cd "${srcdir}/MatriXpost-bceb3036079ee260e035799628a1db34aa2aef62"
+  cd "${srcdir}/MatriXpost-f27f7f98176c1d18f999a96d108ca0ec46611391"
 
   install -Dm755 target/release/matrixpost "${pkgdir}/usr/bin/matrixpost"
   install -Dm755 target/release/matrixpost-mcp "${pkgdir}/usr/bin/matrixpost-mcp"
