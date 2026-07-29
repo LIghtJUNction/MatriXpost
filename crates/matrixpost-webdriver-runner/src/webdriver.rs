@@ -14,6 +14,7 @@ use std::{
 };
 use url::Url;
 mod baijiahao;
+mod douyin;
 mod fanqie;
 mod kuaishou;
 mod toutiao;
@@ -311,24 +312,6 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
             WECHAT_CREATIVE_STATEMENT_SELECT_SCRIPT,
             json!([label]),
         )
-    }
-
-    fn apply_douyin_autonomous_statement(&self, session: &str, label: &str) -> Result<(), String> {
-        if !self.execute_bool(session, DOUYIN_STATEMENT_OPEN_SCRIPT, json!([]))? {
-            return Err("Douyin autonomous-statement selector could not be opened".into());
-        }
-        self.wait_for_statement_action(
-            session,
-            DOUYIN_STATEMENT_DIALOG_VISIBLE_SCRIPT,
-            json!([label]),
-        )?;
-        if !self.execute_bool(session, DOUYIN_STATEMENT_SELECT_SCRIPT, json!([label]))? {
-            return Err("Douyin autonomous-statement option could not be selected".into());
-        }
-        if !self.execute_bool(session, DOUYIN_STATEMENT_CONFIRM_SCRIPT, json!([label]))? {
-            return Err("Douyin autonomous-statement confirmation was unavailable".into());
-        }
-        self.wait_for_statement_action(session, DOUYIN_STATEMENT_DIALOG_GONE_SCRIPT, json!([label]))
     }
 
     fn apply_bilibili_creative_statement(&self, session: &str, label: &str) -> Result<(), String> {
@@ -762,6 +745,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             }
             if let Some(product_id) = wechat_product.as_deref() {
                 self.attach_wechat_product(&session, product_id)?;
+            }
+            if platform == Platform::Douyin {
+                self.prepare_douyin_video(&session)?;
             }
             if let Some(label) = creative_statement {
                 match platform {

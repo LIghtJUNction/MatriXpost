@@ -27,6 +27,9 @@ fn completed_statement_replies() -> Vec<Result<Value, String>> {
         value(json!(null)),
         element("description"),
         value(json!(null)),
+        value(json!("ready")),
+        value(json!("ready")),
+        value(json!("clicked")),
         value(json!(true)),
         value(json!(true)),
         value(json!(true)),
@@ -40,6 +43,59 @@ fn completed_statement_replies() -> Vec<Result<Value, String>> {
         value(json!(true)),
         value(json!(null)),
     ]
+}
+
+fn completed_without_statement_replies() -> Vec<Result<Value, String>> {
+    vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+        value(json!("ready")),
+        value(json!("ready")),
+        value(json!("clicked")),
+        Err("not visible".into()),
+        Err("not visible".into()),
+        element("submit"),
+        value(json!(null)),
+        element("success"),
+        value(json!(true)),
+        value(json!(null)),
+    ]
+}
+
+fn field_replies() -> Vec<Result<Value, String>> {
+    vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+    ]
+}
+
+fn ready_replies() -> [Result<Value, String>; 3] {
+    [
+        value(json!("ready")),
+        value(json!("ready")),
+        value(json!("clicked")),
+    ]
+}
+
+#[test]
+fn douyin_readiness_budget_matches_the_upstream_thirty_second_window() {
+    assert_eq!(DOUYIN_READY_DEADLINE, std::time::Duration::from_secs(30));
+    assert_eq!(
+        (DOUYIN_READY_POLL_ATTEMPTS as u128) * DOUYIN_READY_POLL_INTERVAL.as_millis(),
+        DOUYIN_READY_DEADLINE.as_millis()
+    );
 }
 
 #[test]
@@ -122,23 +178,7 @@ fn douyin_none_and_unsupported_target_values_actively_select_the_none_label() {
 
 #[test]
 fn douyin_without_target_override_does_not_run_statement_scripts() {
-    let mock = MockWebDriver::new(vec![
-        value(json!({"sessionId":"s"})),
-        value(json!(null)),
-        element("file"),
-        value(json!(null)),
-        element("title"),
-        value(json!(null)),
-        element("description"),
-        value(json!(null)),
-        Err("not visible".into()),
-        Err("not visible".into()),
-        element("submit"),
-        value(json!(null)),
-        element("success"),
-        value(json!(true)),
-        value(json!(null)),
-    ]);
+    let mock = MockWebDriver::new(completed_without_statement_replies());
     let publisher = test_publisher(mock);
     publisher.publish(Platform::Douyin, &request()).unwrap();
     assert!(
@@ -163,18 +203,14 @@ fn douyin_without_target_override_does_not_run_statement_scripts() {
 
 #[test]
 fn douyin_absent_selector_fails_closed_and_cleans_up_before_submit() {
-    let publisher = test_publisher(MockWebDriver::new(vec![
-        value(json!({"sessionId":"s"})),
-        value(json!(null)),
-        element("file"),
-        value(json!(null)),
-        element("title"),
-        value(json!(null)),
-        element("description"),
-        value(json!(null)),
-        value(json!(false)),
-        value(json!(null)),
-    ]));
+    let mut replies = field_replies();
+    replies.extend([
+        value(json!("ready")),
+        value(json!("ready")),
+        value(json!("clicked")),
+    ]);
+    replies.extend([value(json!(false)), value(json!(null))]);
+    let publisher = test_publisher(MockWebDriver::new(replies));
     assert!(
         publisher
             .publish(Platform::Douyin, &request_with_statement("ai_generated"))
@@ -187,21 +223,16 @@ fn douyin_absent_selector_fails_closed_and_cleans_up_before_submit() {
 
 #[test]
 fn douyin_disabled_confirmation_fails_closed_and_cleans_up_before_submit() {
-    let publisher = test_publisher(MockWebDriver::new(vec![
-        value(json!({"sessionId":"s"})),
-        value(json!(null)),
-        element("file"),
-        value(json!(null)),
-        element("title"),
-        value(json!(null)),
-        element("description"),
-        value(json!(null)),
+    let mut replies = field_replies();
+    replies.extend(ready_replies());
+    replies.extend([
         value(json!(true)),
         value(json!(true)),
         value(json!(true)),
         value(json!(false)),
         value(json!(null)),
-    ]));
+    ]);
+    let publisher = test_publisher(MockWebDriver::new(replies));
     assert!(
         publisher
             .publish(Platform::Douyin, &request_with_statement("ai_generated"))
@@ -216,15 +247,9 @@ fn douyin_disabled_confirmation_fails_closed_and_cleans_up_before_submit() {
 fn douyin_two_visible_matching_dialogs_with_one_enabled_confirmation_fail_closed() {
     assert!(DOUYIN_STATEMENT_CONFIRM_SCRIPT.contains("if(matches.length!==1)return false"));
     assert!(DOUYIN_STATEMENT_CONFIRM_SCRIPT.contains("if(buttons.length!==1)return false"));
-    let publisher = test_publisher(MockWebDriver::new(vec![
-        value(json!({"sessionId":"s"})),
-        value(json!(null)),
-        element("file"),
-        value(json!(null)),
-        element("title"),
-        value(json!(null)),
-        element("description"),
-        value(json!(null)),
+    let mut replies = field_replies();
+    replies.extend(ready_replies());
+    replies.extend([
         value(json!(true)),
         value(json!(true)),
         value(json!(true)),
@@ -233,7 +258,8 @@ fn douyin_two_visible_matching_dialogs_with_one_enabled_confirmation_fail_closed
         // the ambiguity instead of selecting the enabled modal.
         value(json!(false)),
         value(json!(null)),
-    ]));
+    ]);
+    let publisher = test_publisher(MockWebDriver::new(replies));
     assert!(
         publisher
             .publish(Platform::Douyin, &request_with_statement("ai_generated"))
@@ -246,20 +272,14 @@ fn douyin_two_visible_matching_dialogs_with_one_enabled_confirmation_fail_closed
 
 #[test]
 fn douyin_persistent_visible_dialog_fails_closed_and_cleans_up_before_submit() {
-    let mut replies = vec![
-        value(json!({"sessionId":"s"})),
-        value(json!(null)),
-        element("file"),
-        value(json!(null)),
-        element("title"),
-        value(json!(null)),
-        element("description"),
-        value(json!(null)),
+    let mut replies = field_replies();
+    replies.extend(ready_replies());
+    replies.extend([
         value(json!(true)),
         value(json!(true)),
         value(json!(true)),
         value(json!(true)),
-    ];
+    ]);
     replies.extend((0..DOUYIN_STATEMENT_POLL_ATTEMPTS).map(|_| value(json!(false))));
     replies.push(value(json!(null)));
     let publisher = test_publisher(MockWebDriver::new(replies));
@@ -287,20 +307,14 @@ fn douyin_hidden_unrelated_modal_does_not_mask_a_persistent_visible_declaration(
         assert!(script.contains("getBoundingClientRect"));
     }
     assert!(DOUYIN_STATEMENT_DIALOG_GONE_SCRIPT.contains("matches.length===0"));
-    let mut replies = vec![
-        value(json!({"sessionId":"s"})),
-        value(json!(null)),
-        element("file"),
-        value(json!(null)),
-        element("title"),
-        value(json!(null)),
-        element("description"),
-        value(json!(null)),
+    let mut replies = field_replies();
+    replies.extend(ready_replies());
+    replies.extend([
         value(json!(true)),
         value(json!(true)),
         value(json!(true)),
         value(json!(true)),
-    ];
+    ]);
     replies.extend((0..DOUYIN_STATEMENT_POLL_ATTEMPTS).map(|_| value(json!(false))));
     replies.push(value(json!(null)));
     let publisher = test_publisher(MockWebDriver::new(replies));
@@ -312,4 +326,156 @@ fn douyin_hidden_unrelated_modal_does_not_mask_a_persistent_visible_declaration(
     let paths = publisher.transport.paths.lock().unwrap();
     assert!(paths.last().unwrap().ends_with("/session/s"));
     assert!(!paths.iter().any(|path| path.ends_with("/click")));
+}
+
+fn has_script(bodies: &[Value], script: &str) -> bool {
+    bodies
+        .iter()
+        .any(|body| body.get("script") == Some(&Value::String(script.into())))
+}
+
+fn assert_no_downstream_douyin_actions(publisher: &WebDriverPublisher<MockWebDriver>) {
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert!(!has_script(&bodies, DOUYIN_STATEMENT_OPEN_SCRIPT));
+    assert!(
+        !bodies.iter().any(|body| {
+            body.get("value") == Some(&Value::String("button[type='submit']".into()))
+        })
+    );
+    drop(bodies);
+    let paths = publisher.transport.paths.lock().unwrap();
+    assert!(
+        paths
+            .last()
+            .is_some_and(|path| path.ends_with("/session/s"))
+    );
+    assert!(!paths.iter().any(|path| path.ends_with("/click")));
+}
+
+#[test]
+fn douyin_preview_and_permission_complete_before_declaration_and_publish() {
+    let publisher = test_publisher(MockWebDriver::new(completed_statement_replies()));
+    publisher
+        .publish(Platform::Douyin, &request_with_statement("ai_generated"))
+        .unwrap();
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    let preview = bodies
+        .iter()
+        .position(|body| {
+            body.get("script") == Some(&Value::String(DOUYIN_PREVIEW_STATE_SCRIPT.into()))
+        })
+        .unwrap();
+    let permission_state = bodies
+        .iter()
+        .position(|body| {
+            body.get("script") == Some(&Value::String(DOUYIN_SAVE_PERMISSION_STATE_SCRIPT.into()))
+        })
+        .unwrap();
+    let permission_action = bodies
+        .iter()
+        .position(|body| {
+            body.get("script") == Some(&Value::String(DOUYIN_SAVE_PERMISSION_ACTION_SCRIPT.into()))
+        })
+        .unwrap();
+    let declaration = bodies
+        .iter()
+        .position(|body| {
+            body.get("script") == Some(&Value::String(DOUYIN_STATEMENT_OPEN_SCRIPT.into()))
+        })
+        .unwrap();
+    assert!(preview < permission_state && permission_state < permission_action);
+    assert!(permission_action < declaration);
+}
+
+#[test]
+fn douyin_duplicate_preview_fails_closed_before_permission_or_declaration() {
+    let mut replies = field_replies();
+    replies.extend([value(json!("ambiguous")), value(json!(null))]);
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    assert!(publisher.publish(Platform::Douyin, &request()).is_err());
+    assert_no_downstream_douyin_actions(&publisher);
+}
+
+#[test]
+fn douyin_permanently_pending_preview_uses_the_complete_bounded_poll_budget() {
+    let mut replies = field_replies();
+    replies.extend((0..DOUYIN_READY_POLL_ATTEMPTS).map(|_| value(json!("pending"))));
+    replies.push(value(json!(null)));
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    assert!(publisher.publish(Platform::Douyin, &request()).is_err());
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|body| {
+                body.get("script") == Some(&Value::String(DOUYIN_PREVIEW_STATE_SCRIPT.into()))
+            })
+            .count(),
+        DOUYIN_READY_POLL_ATTEMPTS
+    );
+    drop(bodies);
+    assert_no_downstream_douyin_actions(&publisher);
+}
+
+#[test]
+fn douyin_permanently_pending_save_permission_uses_the_complete_bounded_poll_budget() {
+    let mut replies = field_replies();
+    replies.push(value(json!("ready")));
+    replies.extend((0..DOUYIN_READY_POLL_ATTEMPTS).map(|_| value(json!("pending"))));
+    replies.push(value(json!(null)));
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    assert!(publisher.publish(Platform::Douyin, &request()).is_err());
+    let bodies = publisher.transport.bodies.lock().unwrap();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|body| {
+                body.get("script")
+                    == Some(&Value::String(DOUYIN_SAVE_PERMISSION_STATE_SCRIPT.into()))
+            })
+            .count(),
+        DOUYIN_READY_POLL_ATTEMPTS
+    );
+    drop(bodies);
+    assert_no_downstream_douyin_actions(&publisher);
+}
+
+#[test]
+fn douyin_preselected_save_permission_is_idempotent() {
+    let mut replies = field_replies();
+    replies.extend([value(json!("ready")), value(json!("selected"))]);
+    replies.extend([
+        Err("not visible".into()),
+        Err("not visible".into()),
+        element("submit"),
+        value(json!(null)),
+        element("success"),
+        value(json!(true)),
+        value(json!(null)),
+    ]);
+    let publisher = test_publisher(MockWebDriver::new(replies));
+    publisher.publish(Platform::Douyin, &request()).unwrap();
+    assert!(!has_script(
+        &publisher.transport.bodies.lock().unwrap(),
+        DOUYIN_SAVE_PERMISSION_ACTION_SCRIPT
+    ));
+}
+
+#[test]
+fn douyin_permission_click_or_proof_failure_stops_before_declaration_and_publish() {
+    for action in ["invalid", "pending"] {
+        let mut replies = field_replies();
+        replies.extend([
+            value(json!("ready")),
+            value(json!("ready")),
+            value(json!(action)),
+        ]);
+        replies.push(value(json!(null)));
+        let publisher = test_publisher(MockWebDriver::new(replies));
+        assert!(
+            publisher.publish(Platform::Douyin, &request()).is_err(),
+            "{action}"
+        );
+        assert_no_downstream_douyin_actions(&publisher);
+    }
 }
