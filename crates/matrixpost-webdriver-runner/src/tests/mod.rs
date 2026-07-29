@@ -6,5 +6,6 @@ mod douyin;
 mod kuaishou;
 mod protocol;
 mod support;
+mod toutiao;
 mod wechat;
 mod xiaohongshu;

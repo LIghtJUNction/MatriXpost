@@ -16,6 +16,7 @@ use url::Url;
 
 use crate::profiles::*;
 mod kuaishou;
+mod toutiao;
 mod xiaohongshu;
 
 pub(crate) trait WebDriverTransport: Send + Sync {
@@ -237,23 +238,6 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
             }
         }
         Ok(false)
-    }
-
-    fn wait_for_statement_action(
-        &self,
-        session: &str,
-        script: &str,
-        args: Value,
-    ) -> Result<(), String> {
-        for attempt in 0..DOUYIN_STATEMENT_POLL_ATTEMPTS {
-            if self.execute_bool(session, script, args.clone())? {
-                return Ok(());
-            }
-            if attempt + 1 < DOUYIN_STATEMENT_POLL_ATTEMPTS {
-                std::thread::sleep(DOUYIN_STATEMENT_POLL_INTERVAL);
-            }
-        }
-        Err("creative-statement action did not complete before its deadline".into())
     }
 
     pub(crate) fn wechat_product_id(request: &PublishRequest) -> Result<Option<String>, String> {
@@ -649,6 +633,7 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
                 | Platform::Bilibili
                 | Platform::Baijiahao
                 | Platform::Kuaishou
+                | Platform::Toutiao
                 | Platform::Xiaohongshu
         ) && let Some(statement) =
             override_value.and_then(|item| item.creative_statement.as_ref())
@@ -768,6 +753,7 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             Platform::Baijiahao => baijiahao_creative_statement_label(request),
             Platform::Bilibili => bilibili_creative_statement_label(request),
             Platform::Kuaishou => kuaishou_creative_statement_label(request),
+            Platform::Toutiao => toutiao_creative_statement_label(request),
             Platform::Xiaohongshu => xiaohongshu_creative_statement_label(request),
             _ => None,
         };
@@ -804,6 +790,7 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
                     Platform::Kuaishou => {
                         self.apply_kuaishou_creative_statement(&session, label)?
                     }
+                    Platform::Toutiao => self.apply_toutiao_creative_statement(&session, label)?,
                     Platform::Xiaohongshu => {
                         self.apply_xiaohongshu_creative_statement(&session, label)?
                     }

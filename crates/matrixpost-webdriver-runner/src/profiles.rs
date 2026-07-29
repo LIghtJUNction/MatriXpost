@@ -88,6 +88,12 @@ pub(crate) const KUAISHOU_STATEMENT_LIST_VISIBLE_SCRIPT: &str = r#"const expecte
 pub(crate) const KUAISHOU_STATEMENT_SELECT_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},norm=value=>String(value||'').replace(/\s+/g,'').trim(),options=list=>Array.from(list.querySelectorAll('.ant-select-item.ant-select-item-option')).filter(item=>visible(item)&&norm(item.getAttribute('title')||item.querySelector('.ant-select-item-option-content')?.textContent)===norm(expected)),lists=Array.from(document.querySelectorAll('.ant-select-dropdown')).filter(visible),matches=lists.filter(list=>options(list).length===1);if(matches.length!==1)return false;const option=options(matches[0])[0],disabled=option.disabled||option.getAttribute('aria-disabled')==='true'||/(^|\s)(?:is-)?disabled(?:\s|$)/.test(String(option.className||''));if(disabled)return false;option.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window}));option.click();return true;"#;
 pub(crate) const KUAISHOU_STATEMENT_APPLIED_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},norm=value=>String(value||'').replace(/\s+/g,'').trim(),keys=['作者声明','作品声明','创作声明','声明'],candidates=Array.from(document.querySelectorAll('[class*="edit-form-item"],[class*="form-item"]')).filter(item=>{const label=item.querySelector('label');const trigger=item.querySelector('.ant-select-selector');return label&&trigger&&visible(item)&&visible(trigger)&&keys.some(key=>norm(label.textContent).includes(key));});if(candidates.length!==1)return false;const trigger=candidates[0].querySelector('.ant-select-selector');const open=Array.from(document.querySelectorAll('.ant-select-dropdown')).some(visible);return norm(trigger.textContent)===norm(expected)&&!open;"#;
 
+/// Toutiao video-source declarations are independent visible checkboxes. The
+/// scripts find exactly one enabled label and return finite action states, so page
+/// text and unrelated checkbox state never leave the attached browser.
+pub(crate) const TOUTIAO_STATEMENT_SELECTED_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},norm=value=>String(value||'').replace(/\s+/g,'').trim(),matches=Array.from(document.querySelectorAll('.byte-checkbox.checkbot-item')).filter(item=>visible(item)&&norm(item.querySelector('.byte-checkbox-inner-text')?.textContent)===norm(expected));return matches.length===1&&matches[0].querySelector('input[type="checkbox"]')?.checked===true;"#;
+pub(crate) const TOUTIAO_STATEMENT_SELECT_SCRIPT: &str = r#"const expected=arguments[0],visible=item=>{const style=getComputedStyle(item);const rect=item.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0&&rect.width>0&&rect.height>0;},norm=value=>String(value||'').replace(/\s+/g,'').trim(),matches=Array.from(document.querySelectorAll('.byte-checkbox.checkbot-item')).filter(item=>visible(item)&&norm(item.querySelector('.byte-checkbox-inner-text')?.textContent)===norm(expected));if(matches.length===0)return'missing';if(matches.length!==1)return'ambiguous';const wrap=matches[0],input=wrap.querySelector('input[type="checkbox"]'),action=wrap.querySelector('.byte-checkbox-wrapper')||wrap,disabled=!input||input.disabled||input.getAttribute('aria-disabled')==='true'||action.getAttribute('aria-disabled')==='true'||/(^|\s)(?:is-)?disabled(?:\s|$)/.test(String(wrap.className||''))||/(^|\s)(?:is-)?disabled(?:\s|$)/.test(String(action.className||''));if(disabled)return'disabled';if(input.checked)return'selected';input.click();if(!input.checked)action.click();return input.checked?'clicked':'unverified';"#;
+
 /// Xiaohongshu exposes declarations through a single visible d-select. The
 /// bounded scripts act only on an exact resolved label and retain all page
 /// content inside the attached browser.
@@ -240,6 +246,37 @@ pub(crate) fn kuaishou_creative_statement_label(request: &PublishRequest) -> Opt
         }
         "repost" | "转载" | "内容为转载" | "内容为转载信息" | "取自站外" | "素材来源于网络" => {
             Some("素材来源于网络")
+        }
+        _ => None,
+    }
+}
+
+/// Toutiao only checks the three video-source labels offered by MatrixMedia.
+/// Missing, `none`, and all unsupported values deliberately preserve the
+/// page default rather than selecting or serializing an invented statement.
+pub(crate) fn toutiao_creative_statement_label(request: &PublishRequest) -> Option<&'static str> {
+    let value = request
+        .overrides
+        .iter()
+        .find(|item| item.platform == Platform::Toutiao)
+        .and_then(|item| item.creative_statement.as_deref())?
+        .trim();
+    match value {
+        "ai_generated"
+        | "AI生成"
+        | "含AI生成内容"
+        | "内容由AI生成"
+        | "内容为AI生成"
+        | "笔记含AI合成内容" => Some("AI生成"),
+        "fiction"
+        | "虚构演绎"
+        | "含虚构演绎内容"
+        | "虚构演绎，仅供娱乐"
+        | "演绎情节，仅供娱乐"
+        | "虚构演绎，故事经历"
+        | "内容为虚构剧情，仅供娱乐" => Some("虚构演绎，故事经历"),
+        "repost" | "转载" | "内容为转载" | "内容为转载信息" | "取自站外" | "素材来源于网络" => {
+            Some("取自站外")
         }
         _ => None,
     }
