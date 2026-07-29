@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn scheduled_mcp_article_is_local_only_and_history_is_redacted() {
+    let service = service();
+    let result = service
+        .publish_article_result(PublishArticleInput {
+            platform: ArticlePlatformInput::Juejin,
+            phone: "13800138000".into(),
+            title: "Safe title".into(),
+            content: Some("private body http://127.0.0.1:39002/secret".into()),
+            file: Some("/private/article.md".into()),
+            cover: None,
+            category: None,
+            tags: None,
+            summary: None,
+            publish_at: Some("2026-08-01 10:20:00".into()),
+            show: None,
+        })
+        .unwrap();
+    assert_eq!(result.outcome, "scheduled_locally");
+    assert!(!result.remote_publish_attempted);
+
+    let due = matrixpost_core::LocalSchedule::parse("2026-08-01 10:20:00").unwrap();
+    let claimed = matrixpost_core::ArticlePublicationQueue::claim_due_articles(
+        service.repository.as_ref(),
+        &due,
+        chrono::Utc::now(),
+        1,
+    )
+    .unwrap();
+    matrixpost_core::ArticlePublicationQueue::complete_article_with_history(
+        service.repository.as_ref(),
+        &claimed[0].id,
+        claimed[0].revision,
+        matrixpost_core::PublishState::Unavailable,
+        chrono::Utc::now(),
+        Some("http://127.0.0.1:39002 private body"),
+    )
+    .unwrap();
+    let history = service.list_article_history_result().unwrap();
+    assert_eq!(history.len(), 1);
+    let serialized = serde_json::to_string(&history).unwrap();
+    for forbidden in [
+        "private body",
+        "/private/article.md",
+        "13800138000",
+        "127.0.0.1:39002",
+    ] {
+        assert!(!serialized.contains(forbidden));
+    }
+}
+
+#[test]
 fn video_request_maps_upstream_arguments_without_provider_side_effects() {
     let request = video_request(PublishVideoInput {
         platform: VideoPlatform::Sph,
@@ -494,6 +545,7 @@ fn macro_generated_router_preserves_upstream_tools_and_exposes_closed_lifecycle_
             "create_business_object",
             "get_business_object",
             "list_accounts",
+            "list_article_history",
             "list_business_objects",
             "list_business_relations",
             "list_content_attributions",

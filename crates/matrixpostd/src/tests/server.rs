@@ -12,6 +12,7 @@ async fn serve_until_shutdown_exits_cleanly_when_shutdown_is_requested() {
         app(AppState {
             repository: Arc::new(SqliteRepository::in_memory().unwrap()),
             providers: Arc::new(ProviderRegistry::new()),
+            article_runner: None,
         }),
         async move {
             receiver

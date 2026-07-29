@@ -2,7 +2,8 @@ use std::{path::PathBuf, process::ExitCode, str::FromStr};
 
 use clap::Parser;
 use matrixpost_core::{
-    AccountSelection, ArticleRunner, Platform, PublishArticleRequest, Repository, SqliteRepository,
+    AccountSelection, ArticlePublicationQueue, ArticleRunner, Platform, PublishArticleRequest,
+    Repository, SqliteRepository,
 };
 
 use crate::{
@@ -43,6 +44,26 @@ pub(crate) fn dispatch_article(
     match runner.dispatch(request) {
         Ok(outcome) => emit_article_dispatch_outcome(outcome),
         Err(error) => emit(2, serde_json::Value::Null, Some(&error.to_string())),
+    }
+}
+
+pub(crate) fn schedule_article(
+    repository: &SqliteRepository,
+    request: &PublishArticleRequest,
+) -> ExitCode {
+    match repository.enqueue_article(request, chrono::Utc::now()) {
+        Ok(job) => emit(
+            0,
+            serde_json::json!({
+                "outcome": "scheduled_locally",
+                "platform": "juejin",
+                "job": { "id": job.id, "state": job.state, "due_at": job.due_at, "revision": job.revision },
+            }),
+            Some(
+                "scheduled article was persisted for local runner work; no remote publishing was attempted",
+            ),
+        ),
+        Err(error) => emit(4, serde_json::Value::Null, Some(&error.to_string())),
     }
 }
 
@@ -104,6 +125,10 @@ pub(crate) fn run() -> ExitCode {
                 scheduled_at: publish_at,
             };
             match request.validate() {
+                Ok(()) if request.scheduled_at.is_some() => match open(cli.state_path) {
+                    Ok(repository) => schedule_article(&repository, &request),
+                    Err(error) => emit(4, serde_json::Value::Null, Some(&error)),
+                },
                 Ok(()) => dispatch_article(article_runner.as_ref(), &request),
                 Err(error) => emit(2, serde_json::Value::Null, Some(&error.to_string())),
             }
@@ -130,6 +155,14 @@ pub(crate) fn run() -> ExitCode {
                 Err(error) => emit(4, serde_json::Value::Null, Some(&error)),
             },
             Err(error) => emit(2, serde_json::Value::Null, Some(&error)),
+        },
+        Command::ArticleHistory => match open(cli.state_path).and_then(|repository| {
+            repository
+                .article_history()
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(history) => emit(0, serde_json::json!({ "history": history }), None),
+            Err(error) => emit(4, serde_json::Value::Null, Some(&error)),
         },
         Command::Providers { json: _ } => emit(0, registry.availability_report(), None),
         Command::Lifecycle(args) => match open(cli.state_path) {

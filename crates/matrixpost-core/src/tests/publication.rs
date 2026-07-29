@@ -387,3 +387,196 @@
             vec!["inclusive"]
         );
     }
+
+    #[test]
+    fn article_queue_persists_safe_due_claim_and_terminal_history() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let now = Utc::now();
+        let request = PublishArticleRequest {
+            platform: "juejin".into(),
+            account: AccountSelection {
+                phone: Some("13800000000".into()),
+                partition: Some("persist:private".into()),
+            },
+            title: "Scheduled article".into(),
+            content: Some("private body https://127.0.0.1:39002/secret".into()),
+            file: Some("/private/article.md".into()),
+            cover: None,
+            category: None,
+            tags: Vec::new(),
+            summary: None,
+            scheduled_at: Some(LocalSchedule::parse("2026-07-30 09:00:00").unwrap()),
+        };
+        let job = repository.enqueue_article(&request, now).unwrap();
+        assert!(job.request.account.is_empty());
+
+        let due = LocalSchedule::parse("2026-07-30 09:00:00").unwrap();
+        let claimed = repository.claim_due_articles(&due, now, 1).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].state, PublishState::Dispatching);
+
+        let (_, history) = repository
+            .complete_article_with_history(
+                &job.id,
+                claimed[0].revision,
+                PublishState::Unavailable,
+                now,
+                Some("article runner was unavailable"),
+            )
+            .unwrap();
+        assert_eq!(history.platform, ArticlePlatform::Juejin);
+        assert_eq!(history.title, "Scheduled article");
+        let serialized = serde_json::to_string(&history).unwrap();
+        for forbidden in [
+            "private body",
+            "/private/article.md",
+            "13800000000",
+            "127.0.0.1:39002",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+        assert_eq!(repository.article_history().unwrap(), vec![history]);
+    }
+
+    #[test]
+    fn article_queue_rejects_unscheduled_requests_without_persisting() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let request = PublishArticleRequest {
+            platform: "juejin".into(),
+            account: AccountSelection::default(),
+            title: "Immediate article".into(),
+            content: Some("body".into()),
+            file: None,
+            cover: None,
+            category: None,
+            tags: Vec::new(),
+            summary: None,
+            scheduled_at: None,
+        };
+        assert!(repository.enqueue_article(&request, Utc::now()).is_err());
+        assert!(repository.article_history().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_from_v8_redacts_article_history_without_stranding_queued_jobs() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let due = LocalSchedule::parse("2026-07-30 09:00:00").unwrap();
+        let recorded_at = "2026-07-30T08:00:00+00:00";
+        let safe_queued_request = PublishArticleRequest {
+            platform: "juejin".into(),
+            account: AccountSelection::default(),
+            title: "Queued article".into(),
+            content: Some("queued article body".into()),
+            file: None,
+            cover: None,
+            category: None,
+            tags: vec!["migration".into()],
+            summary: None,
+            scheduled_at: Some(due.clone()),
+        };
+        let legacy_history_request = PublishArticleRequest {
+            platform: "juejin".into(),
+            account: AccountSelection {
+                phone: Some("13800138000".into()),
+                partition: Some("persist:private".into()),
+            },
+            title: "Legacy article".into(),
+            content: Some("private body http://127.0.0.1:39002/secret".into()),
+            file: Some("/private/article.md".into()),
+            cover: None,
+            category: None,
+            tags: Vec::new(),
+            summary: None,
+            scheduled_at: Some(due.clone()),
+        };
+        {
+            let connection = repository.locked().unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE article_history; DROP TABLE article_jobs; DROP TABLE article_job_sequence; DROP TABLE article_history_sequence; DELETE FROM schema_migrations WHERE version=9; CREATE TABLE article_jobs (id TEXT PRIMARY KEY NOT NULL, request_json TEXT NOT NULL, state TEXT NOT NULL, due_at TEXT NOT NULL, revision INTEGER NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE article_history (id TEXT PRIMARY KEY NOT NULL, request_json TEXT NOT NULL, state TEXT NOT NULL, recorded_at TEXT NOT NULL, detail TEXT); CREATE TABLE article_job_sequence (id INTEGER PRIMARY KEY AUTOINCREMENT); CREATE TABLE article_history_sequence (id INTEGER PRIMARY KEY AUTOINCREMENT);",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO article_jobs(id, request_json, state, due_at, revision, updated_at) VALUES (?1, ?2, 'queued', ?3, 0, ?4)",
+                    params![
+                        "article-job-legacy",
+                        serde_json::to_string(&safe_queued_request).unwrap(),
+                        due.0,
+                        recorded_at,
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO article_history(id, request_json, state, recorded_at, detail) VALUES (?1, ?2, 'published', ?3, ?4)",
+                    params![
+                        "article-history-legacy",
+                        serde_json::to_string(&legacy_history_request).unwrap(),
+                        recorded_at,
+                        "legacy runner detail",
+                    ],
+                )
+                .unwrap();
+            SqliteRepository::migrate(&connection).unwrap();
+
+            let schema: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='article_history'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!schema.contains("request_json"));
+            SqliteRepository::migrate(&connection).unwrap();
+            let repeated_schema: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='article_history'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(repeated_schema, schema);
+            let migration_count: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=9",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(migration_count, 1);
+            let columns = connection
+                .prepare("PRAGMA table_info(article_history)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(!columns.iter().any(|column| column == "request_json"));
+        }
+
+        let claimed = repository
+            .claim_due_articles(&due, Utc::now(), 1)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, "article-job-legacy");
+        assert_eq!(claimed[0].state, PublishState::Dispatching);
+        assert!(!claimed[0].request.has_account_routing());
+
+        let history = repository.article_history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "article-history-legacy");
+        assert_eq!(history[0].platform, ArticlePlatform::Juejin);
+        assert_eq!(history[0].title, "Legacy article");
+        assert_eq!(history[0].state, PublishState::Published);
+        assert_eq!(history[0].recorded_at.to_rfc3339(), recorded_at);
+        let serialized = serde_json::to_string(&history).unwrap();
+        for forbidden in [
+            "private body",
+            "/private/article.md",
+            "13800138000",
+            "127.0.0.1:39002",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }

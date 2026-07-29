@@ -69,6 +69,9 @@ pub(crate) enum Command {
         title: String,
     },
     History(HistoryArgs),
+    /// List terminal scheduled-article local workflow records.
+    #[command(name = "article-history")]
+    ArticleHistory,
     /// Show deterministic availability for every supported platform.
     Providers {
         #[arg(long)]

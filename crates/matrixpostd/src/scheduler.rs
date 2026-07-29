@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use matrixpost_core::{
-    DispatchOutcome, DomainError, LocalSchedule, PublicationQueue, PublishState, Repository,
+    ArticleDispatchOutcome, ArticlePublicationQueue, DispatchOutcome, DomainError, LocalSchedule,
+    PublicationQueue, PublishState, Repository,
 };
 
 use crate::state::AppState;
@@ -31,11 +32,12 @@ pub(crate) fn run_scheduler_tick_at<R>(
     batch_size: usize,
 ) -> Result<(), DomainError>
 where
-    R: Repository + PublicationQueue,
+    R: Repository + PublicationQueue + ArticlePublicationQueue,
 {
     let claimed = state
         .repository
         .claim_due(due_through, updated_at, batch_size)?;
+    let claimed_count = claimed.len();
     for job in claimed {
         let mut request = job.request.clone();
         request.scheduled_at = None;
@@ -82,6 +84,49 @@ where
             {
                 eprintln!("matrixpostd scheduler could not recover a claimed job");
             }
+        }
+    }
+    let remaining = batch_size.saturating_sub(claimed_count);
+    for job in state
+        .repository
+        .claim_due_articles(due_through, updated_at, remaining)?
+    {
+        let mut request = job.request.clone();
+        request.scheduled_at = None;
+        let (terminal_state, detail) = match &state.article_runner {
+            None => (
+                PublishState::Unavailable,
+                SCHEDULED_LOCAL_RUNNER_UNAVAILABLE,
+            ),
+            Some(runner) => match runner.dispatch(&request) {
+                Ok(ArticleDispatchOutcome::Queued { .. }) => {
+                    (PublishState::Published, SCHEDULED_LOCAL_RUNNER_COMPLETE)
+                }
+                Ok(ArticleDispatchOutcome::Unavailable { .. }) => (
+                    PublishState::Unavailable,
+                    SCHEDULED_LOCAL_RUNNER_UNAVAILABLE,
+                ),
+                Ok(ArticleDispatchOutcome::Rejected { .. }) | Err(_) => {
+                    (PublishState::Failed, SCHEDULED_LOCAL_RUNNER_INCOMPLETE)
+                }
+            },
+        };
+        if state
+            .repository
+            .complete_article_with_history(
+                &job.id,
+                job.revision,
+                terminal_state,
+                updated_at,
+                Some(detail),
+            )
+            .is_err()
+            && state
+                .repository
+                .requeue_article_claim(&job.id, job.revision, updated_at)
+                .is_err()
+        {
+            eprintln!("matrixpostd scheduler could not recover a claimed article job");
         }
     }
     Ok(())

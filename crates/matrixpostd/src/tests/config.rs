@@ -42,3 +42,24 @@ fn daemon_config_rejects_invalid_scheduler_bounds() {
         );
     }
 }
+
+#[test]
+fn daemon_config_accepts_loopback_article_runner_and_rejects_remote_one() {
+    let valid: DaemonConfig = toml::from_str(
+        r#"
+        [article_runner]
+        address = '127.0.0.1:39002'
+        "#,
+    )
+    .unwrap();
+    assert!(valid.validate().is_ok());
+
+    let remote: DaemonConfig = toml::from_str(
+        r#"
+        [article_runner]
+        address = '192.0.2.1:39002'
+        "#,
+    )
+    .unwrap();
+    assert!(remote.validate().is_err());
+}

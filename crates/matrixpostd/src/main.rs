@@ -58,6 +58,7 @@ async fn main() -> ExitCode {
     let state = AppState {
         repository,
         providers,
+        article_runner: config.article_runner,
     };
     tokio::spawn(scheduler_loop(
         state.clone(),

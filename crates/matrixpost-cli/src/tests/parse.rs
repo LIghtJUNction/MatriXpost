@@ -3,14 +3,100 @@ use std::num::NonZeroUsize;
 use chrono::{Duration, Local, TimeZone, Utc};
 use clap::Parser;
 use matrixpost_core::{
-    AccountSelection, HistoryRecord, HistoryStatus, MediaSource, Platform, PublishArticleRequest,
-    PublishRequest, PublishState,
+    AccountSelection, ArticlePlatform, ArticlePublicationQueue, HistoryRecord, HistoryStatus,
+    MediaSource, Platform, PublishArticleRequest, PublishRequest, PublishState, Repository,
+    SqliteRepository,
 };
 
 use crate::{
+    app::schedule_article,
     args::{Cli, Command, HistoryArgs},
     query::{parse_history_filter, parse_request},
 };
+
+#[test]
+fn scheduled_cli_article_is_persisted_without_runner_dispatch_and_history_is_redacted() {
+    let parsed = Cli::try_parse_from([
+        "matrixpost",
+        "--article-runner",
+        "tcp:127.0.0.1:1",
+        "publish-article",
+        "--platform",
+        "juejin",
+        "--title",
+        "Safe title",
+        "--phone",
+        "13800138000",
+        "--partition",
+        "persist:private",
+        "--content",
+        "private body http://127.0.0.1:39002/secret",
+        "--file",
+        "/private/article.md",
+        "--publish-at",
+        "2026-08-01 10:20:00",
+    ])
+    .unwrap();
+    let Command::PublishArticle {
+        platform,
+        title,
+        phone,
+        partition,
+        content,
+        file,
+        cover,
+        category,
+        tags,
+        summary,
+        publish_at,
+    } = parsed.command
+    else {
+        panic!("expected scheduled article command");
+    };
+    let request = PublishArticleRequest {
+        platform,
+        account: AccountSelection { phone, partition },
+        title,
+        content,
+        file,
+        cover,
+        category,
+        tags,
+        summary,
+        scheduled_at: publish_at,
+    };
+    let repository = SqliteRepository::in_memory().unwrap();
+    assert_eq!(
+        schedule_article(&repository, &request),
+        std::process::ExitCode::SUCCESS
+    );
+    let claimed = repository
+        .claim_due_articles(
+            request.scheduled_at.as_ref().unwrap(),
+            chrono::Utc::now(),
+            1,
+        )
+        .unwrap();
+    let (_, history) = repository
+        .complete_article_with_history(
+            &claimed[0].id,
+            claimed[0].revision,
+            PublishState::Unavailable,
+            chrono::Utc::now(),
+            Some("http://127.0.0.1:39002 private body"),
+        )
+        .unwrap();
+    assert_eq!(history.platform, ArticlePlatform::Juejin);
+    let output = serde_json::to_string(&repository.article_history().unwrap()).unwrap();
+    for forbidden in [
+        "private body",
+        "/private/article.md",
+        "13800138000",
+        "127.0.0.1:39002",
+    ] {
+        assert!(!output.contains(forbidden));
+    }
+}
 
 #[test]
 fn publish_arguments_preserve_upstream_fields() {

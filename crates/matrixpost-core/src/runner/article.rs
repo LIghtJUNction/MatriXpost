@@ -110,7 +110,9 @@ impl ArticleRunnerResponse {
 /// Credential-free, loopback-only endpoint for the Juejin article runner.
 ///
 /// This is deliberately separate from video provider runners: article
-/// publication has a distinct protocol and is not scheduled by MatriXpost.
+/// publication has a distinct protocol. The daemon owns due-time execution;
+/// it clears a scheduled request before dispatch, while direct runner calls
+/// reject scheduled requests to prevent bypassing that lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArticleRunner {
     pub address: SocketAddr,

@@ -98,6 +98,11 @@ pub(crate) struct ListHistoryInput {
     pub(crate) all: Option<bool>,
 }
 
+/// Read-only terminal scheduled-article workflow history.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ListArticleHistoryInput {}
+
 /// Bounded Fanqie title lookup. The tool returns only a finite status label;
 /// it never returns the submitted title or any page content.
 #[derive(Debug, Deserialize, JsonSchema)]

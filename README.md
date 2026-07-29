@@ -56,9 +56,16 @@ Juejin articles use a separate, deliberately opt-in local route:
 `--article-runner tcp:127.0.0.1:PORT`. The core strips account routing before
 posting its versioned request only to `/v1/publish-article`; it never accepts
 browser profiles, sessions, or credentials in this declaration. Without that
-flag, `publish-article` remains unavailable and makes no runner attempt. Article
-scheduling is not implemented: any article with `--publish-at` is rejected at
-the local runner boundary and is never executed immediately.
+flag, immediate `publish-article` remains unavailable and makes no runner attempt.
+With `--publish-at`, an article is instead persisted as durable local runner work
+without contacting a runner. `matrixpostd` claims due articles only within its
+shared scheduler batch limit and sends them only to an explicitly configured
+loopback article runner. Terminal local workflow history is available through
+`matrixpost article-history` and MCP `list_article_history`; it never proves
+remote Juejin publication. Those history records are deliberately redacted:
+they retain only the stable id, platform, title, terminal state, timestamp, and
+a fixed generic local-workflow detail. They never serialize article bodies,
+file paths, account routing, runner endpoints, or runner diagnostics.
 
 This route is an explicit local opt-in, not evidence of a Juejin login or live
 publication capability. The repository has no authenticated or live-platform
@@ -219,8 +226,9 @@ fresh database returns none and persisted safe metadata is listed normally.
 unavailable unless that loopback article runner is configured. A queued result
 means only that the local runner completed its WebDriver workflow; remote
 publication is not confirmed. Article `publishAt` is validated for upstream
-compatibility but cannot be dispatched: scheduled articles are rejected rather
-than published immediately because article scheduling is not implemented.
+compatibility and, when present, persists durable local article-runner work
+without an immediate dispatch. Terminal local workflow history is available
+through the read-only `list_article_history` tool.
 Video `publishAt` accepts `YYYY-MM-DD HH:mm` or seconds; article `publishAt`
 also accepts `HH:mm`, normalized to the current local calendar date with zero
 seconds. For video-channel links, `sphLink.type` is exactly `none` or `product`;

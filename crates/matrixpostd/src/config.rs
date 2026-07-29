@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
-use matrixpost_core::{ProviderRunner, PublicationQueue, SqliteRepository};
+use matrixpost_core::{ArticleRunner, ProviderRunner, PublicationQueue, SqliteRepository};
 use serde::Deserialize;
 
 /// Secret-free daemon configuration read from TOML.
@@ -16,6 +16,9 @@ pub(crate) struct DaemonConfig {
     /// or calls a platform directly.
     #[serde(default)]
     pub(crate) provider_runners: Vec<ProviderRunner>,
+    /// Optional explicit loopback Juejin article runner for durable article jobs.
+    #[serde(default)]
+    pub(crate) article_runner: Option<ArticleRunner>,
     /// Period between durable due-job claim passes. Must be positive.
     #[serde(default = "default_scheduler_interval_seconds")]
     pub(crate) scheduler_interval_seconds: u64,
@@ -41,6 +44,7 @@ impl Default for DaemonConfig {
             bind: default_bind(),
             state_path: default_state_path(),
             provider_runners: Vec::new(),
+            article_runner: None,
             scheduler_interval_seconds: default_scheduler_interval_seconds(),
             scheduler_batch_size: default_scheduler_batch_size(),
         }
@@ -83,6 +87,9 @@ impl DaemonConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(runner) = &self.article_runner {
+            runner.validate().map_err(|error| error.to_string())?;
+        }
         if self.scheduler_interval_seconds == 0 {
             return Err("scheduler_interval_seconds must be greater than zero".into());
         }

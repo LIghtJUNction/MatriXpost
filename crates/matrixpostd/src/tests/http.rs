@@ -81,6 +81,7 @@ async fn change_data_add_get_update_get_delete_get_and_config_roundtrip() {
         let state = AppState {
             repository: Arc::new(SqliteRepository::in_memory().unwrap()),
             providers: Arc::new(ProviderRegistry::new()),
+            article_runner: None,
         };
         let router = app(state);
         let item = serde_json::json!({ "id": "dy", "platform": "dy", "value": "one" });
@@ -174,6 +175,7 @@ async fn change_data_rejects_nested_secret_fields() {
         let router = app(AppState {
             repository: Arc::new(SqliteRepository::in_memory().unwrap()),
             providers: Arc::new(ProviderRegistry::new()),
+            article_runner: None,
         });
         let (status, body) = json_response(
             router,
@@ -200,6 +202,7 @@ async fn change_data_rejects_structured_item_without_id() {
     let router = app(AppState {
         repository: Arc::new(SqliteRepository::in_memory().unwrap()),
         providers: Arc::new(ProviderRegistry::new()),
+        article_runner: None,
     });
     let (status, body) = json_response(
         router,
@@ -240,6 +243,7 @@ async fn router_platform_metadata_publish_503_and_invalid_dto_400() {
     let router = app(AppState {
         repository: Arc::new(SqliteRepository::in_memory().unwrap()),
         providers: Arc::new(ProviderRegistry::new()),
+        article_runner: None,
     });
     let platforms = Request::get("/platforms").body(Body::empty()).unwrap();
     let (status, body) = json_response(router.clone(), platforms).await;
@@ -301,6 +305,7 @@ async fn upstream_test_probe_and_api_success_alias_are_compatible() {
     let router = app(AppState {
         repository: Arc::new(SqliteRepository::in_memory().unwrap()),
         providers: Arc::new(ProviderRegistry::new()),
+        article_runner: None,
     });
 
     let (status, body) = json_response(

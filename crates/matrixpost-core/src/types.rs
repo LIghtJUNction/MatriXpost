@@ -743,6 +743,35 @@ impl PublishArticleRequest {
     }
 }
 
+/// Durable state for one scheduled article dispatch.  Article jobs are kept
+/// separate from video jobs because their runner protocol and terminal history
+/// are intentionally independent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArticleScheduledJob {
+    pub id: String,
+    pub request: PublishArticleRequest,
+    pub state: PublishState,
+    pub due_at: LocalSchedule,
+    pub revision: u64,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Immutable terminal evidence for a scheduled article's local runner
+/// workflow. It is not evidence of remote Juejin publication.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArticleHistoryRecord {
+    pub id: String,
+    /// The supported article platform. Account routing is intentionally absent.
+    pub platform: ArticlePlatform,
+    /// The requested article title. Body, files, runner endpoints, and account
+    /// routes are deliberately excluded from durable history.
+    pub title: String,
+    pub state: PublishState,
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+    /// A fixed generic workflow outcome, never runner-provided diagnostics.
+    pub detail: Option<String>,
+}
+
 /// Durable state for one publication job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use matrixpost_core::{
-    Account, ArticleAccount, ArticleRunner, BusinessObject, BusinessRelation, ContentAttribution,
-    DomainError, HistoryFilter, HistoryRecord, HistoryStatus, LedgerEntry, LifecycleRepository,
-    Platform, ProviderRegistry, ProviderRunner, PublicationQueue, Repository, SqliteRepository,
+    Account, ArticleAccount, ArticleHistoryRecord, ArticlePublicationQueue, ArticleRunner,
+    BusinessObject, BusinessRelation, ContentAttribution, DomainError, HistoryFilter,
+    HistoryRecord, HistoryStatus, LedgerEntry, LifecycleRepository, Platform, ProviderRegistry,
+    ProviderRunner, PublicationQueue, Repository, SqliteRepository,
 };
 use rmcp::{handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router};
 use serde::Serialize;
@@ -12,10 +13,10 @@ use serde::Serialize;
 use crate::{
     AccountsPlatform, AddBusinessRelationInput, AddContentAttributionInput, AppendLedgerEntryInput,
     ApprovalStatusInput, CreateBusinessObjectInput, GetBusinessObjectInput, HistoryPlatform,
-    ListAccountsInput, ListBusinessObjectsInput, ListBusinessRelationsInput,
-    ListContentAttributionsInput, ListHistoryInput, ListLedgerEntriesInput, ListedAccount,
-    PublicationResult, ReviewFanqieStatusInput, ReviewStatusResult, ToolFailure,
-    TransitionBusinessObjectInput,
+    ListAccountsInput, ListArticleHistoryInput, ListBusinessObjectsInput,
+    ListBusinessRelationsInput, ListContentAttributionsInput, ListHistoryInput,
+    ListLedgerEntriesInput, ListedAccount, PublicationResult, ReviewFanqieStatusInput,
+    ReviewStatusResult, ToolFailure, TransitionBusinessObjectInput,
     request::{
         article_dispatch_result, article_request, article_unavailable_result, job_result,
         video_dispatch_result, video_request,
@@ -55,6 +56,19 @@ impl MatrixpostMcp {
         Ok(match self.list_history_result(input) {
             Ok(result) => structured(result),
             Err(message) => tool_error("invalid_input", message),
+        })
+    }
+
+    #[tool(
+        description = "List terminal scheduled-article local runner workflow history. Records never prove remote publication."
+    )]
+    async fn list_article_history(
+        &self,
+        Parameters(_input): Parameters<ListArticleHistoryInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match self.list_article_history_result() {
+            Ok(result) => structured(result),
+            Err(message) => tool_error("internal_error", message),
         })
     }
 
@@ -394,6 +408,12 @@ impl MatrixpostMcp {
         ))
     }
 
+    pub(crate) fn list_article_history_result(&self) -> Result<Vec<ArticleHistoryRecord>, String> {
+        self.repository
+            .article_history()
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn review_fanqie_status_result(
         &self,
         input: ReviewFanqieStatusInput,
@@ -458,6 +478,20 @@ impl MatrixpostMcp {
         input: crate::PublishArticleInput,
     ) -> Result<PublicationResult, String> {
         let request = article_request(input)?;
+        if request.scheduled_at.is_some() {
+            self.repository
+                .enqueue_article(&request, Utc::now())
+                .map_err(|error| error.to_string())?;
+            return Ok(PublicationResult {
+                outcome: "scheduled_locally",
+                provider_available: false,
+                remote_publish_attempted: false,
+                persisted: true,
+                job: None,
+                providers: None,
+                message: "scheduled article was persisted for local runner work; no remote publishing was attempted",
+            });
+        }
         let Some(runner) = &self.article_runner else {
             return Ok(article_unavailable_result());
         };

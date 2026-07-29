@@ -9,8 +9,9 @@ pub(super) use axum::{
     http::{Request, StatusCode},
 };
 pub(super) use matrixpost_core::{
-    DispatchOutcome, DomainError, LocalSchedule, Platform, ProviderDispatchReport,
-    ProviderRegistry, PublicationQueue, PublishRequest, PublishState, Repository, SqliteRepository,
+    ArticlePublicationQueue, DispatchOutcome, DomainError, LocalSchedule, Platform,
+    ProviderDispatchReport, ProviderRegistry, PublicationQueue, PublishRequest, PublishState,
+    Repository, SqliteRepository,
 };
 pub(super) use std::{path::PathBuf, sync::Arc, time::Duration};
 use tower::ServiceExt;
@@ -72,6 +73,7 @@ pub(super) fn lifecycle_router() -> Router {
     app(AppState {
         repository: Arc::new(SqliteRepository::in_memory().unwrap()),
         providers: Arc::new(ProviderRegistry::new()),
+        article_runner: None,
     })
 }
 
@@ -201,6 +203,10 @@ impl Repository for FailFirstCompletionRepository {
     fn delete_config(&self, key: &str) -> Result<bool, DomainError> {
         self.inner.delete_config(key)
     }
+
+    fn article_history(&self) -> Result<Vec<matrixpost_core::ArticleHistoryRecord>, DomainError> {
+        self.inner.article_history()
+    }
 }
 
 impl PublicationQueue for FailFirstCompletionRepository {
@@ -241,6 +247,52 @@ impl PublicationQueue for FailFirstCompletionRepository {
     }
 }
 
+impl ArticlePublicationQueue for FailFirstCompletionRepository {
+    fn enqueue_article(
+        &self,
+        request: &matrixpost_core::PublishArticleRequest,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<matrixpost_core::ArticleScheduledJob, DomainError> {
+        self.inner.enqueue_article(request, now)
+    }
+
+    fn claim_due_articles(
+        &self,
+        due_through: &LocalSchedule,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<matrixpost_core::ArticleScheduledJob>, DomainError> {
+        self.inner.claim_due_articles(due_through, now, limit)
+    }
+
+    fn complete_article_with_history(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        next: PublishState,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        detail: Option<&str>,
+    ) -> Result<
+        (
+            matrixpost_core::ArticleScheduledJob,
+            matrixpost_core::ArticleHistoryRecord,
+        ),
+        DomainError,
+    > {
+        self.inner
+            .complete_article_with_history(id, expected_revision, next, updated_at, detail)
+    }
+
+    fn requeue_article_claim(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<matrixpost_core::ArticleScheduledJob, DomainError> {
+        self.inner.requeue_article_claim(id, expected_revision, now)
+    }
+}
+
 pub(super) fn scheduled_request() -> PublishRequest {
     PublishRequest {
         source: matrixpost_core::MediaSource::LocalFile("movie.mp4".into()),
@@ -277,6 +329,7 @@ pub(super) fn scheduler_state(
         AppState {
             repository: Arc::new(SqliteRepository::in_memory().unwrap()),
             providers: Arc::new(providers),
+            article_runner: None,
         },
         observed,
     )
