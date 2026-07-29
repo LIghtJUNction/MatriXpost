@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 use url::Url;
+mod baijiahao;
 mod fanqie;
 mod kuaishou;
 mod toutiao;
@@ -328,28 +329,6 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
             return Err("Douyin autonomous-statement confirmation was unavailable".into());
         }
         self.wait_for_statement_action(session, DOUYIN_STATEMENT_DIALOG_GONE_SCRIPT, json!([label]))
-    }
-
-    fn apply_baijiahao_creative_statement(&self, session: &str, label: &str) -> Result<(), String> {
-        if !self.execute_bool(session, BAIJIAHAO_STATEMENT_OPEN_SCRIPT, json!([]))? {
-            return Err("Baijiahao creative-statement selector could not be opened".into());
-        }
-        self.wait_for_statement_action(
-            session,
-            BAIJIAHAO_STATEMENT_DIALOG_VISIBLE_SCRIPT,
-            json!([label]),
-        )?;
-        if !self.execute_bool(session, BAIJIAHAO_STATEMENT_SELECT_SCRIPT, json!([label]))? {
-            return Err("Baijiahao creative-statement option could not be selected".into());
-        }
-        if !self.execute_bool(session, BAIJIAHAO_STATEMENT_CONFIRM_SCRIPT, json!([label]))? {
-            return Err("Baijiahao creative-statement confirmation was unavailable".into());
-        }
-        self.wait_for_statement_action(
-            session,
-            BAIJIAHAO_STATEMENT_DIALOG_GONE_SCRIPT,
-            json!([label]),
-        )
     }
 
     fn apply_bilibili_creative_statement(&self, session: &str, label: &str) -> Result<(), String> {
@@ -814,7 +793,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
                             .into(),
                     );
                 }
-                if platform == Platform::Toutiao {
+                if platform == Platform::Baijiahao {
+                    self.publish_baijiahao_action(&session, request.draft)?;
+                } else if platform == Platform::Toutiao {
                     self.publish_toutiao_footer(&session, request.draft)?;
                 } else {
                     let action = if request.draft {
