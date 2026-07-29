@@ -47,7 +47,7 @@ Preserve the supplied systemd hardening model: a dedicated state directory, leas
 
 Run relevant format, tests, lint, documentation, package/build checks, and CI before a release. Treat GitHub, crates.io, AUR, and server writes as external actions requiring explicit authorization. Publish dependent public crates only after `matrixpost-core` is visible to crates.io.
 
-Version `0.3.0` is the latest coordinated lifecycle release: `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` are published on crates.io, and the v0.3.0 GitHub Release exists. Validate any AUR recipe against its exact immutable source archive and checksum; a local recipe or GitHub commit is not evidence of an AUR remote upload.
+Version `0.3.1` is the latest coordinated lifecycle release: `matrixpost-core`, `matrixpost-cli`, `matrixpostd`, and `matrixpost-mcp` are published on crates.io, and the v0.3.1 GitHub Release exists. Validate any AUR recipe against its exact immutable source archive and checksum; a local recipe or GitHub commit is not evidence of an AUR remote upload.
 
 ## Reference
 
