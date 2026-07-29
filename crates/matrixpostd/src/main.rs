@@ -1,6 +1,6 @@
 //! Headless HTTP adapter backed by the durable core repository.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -13,9 +13,9 @@ use axum::{
 use clap::Parser;
 use matrixpost_core::{
     ApprovalStatus, BusinessObject, BusinessObjectStatus, BusinessRelation, ContentAttribution,
-    DispatchOutcome, DomainError, LedgerEntry, LifecycleRepository, Platform,
-    ProviderDispatchReport, ProviderRegistry, ProviderRunner, PublishRequest, Repository,
-    SqliteRepository, UpstreamPublishDto,
+    DispatchOutcome, DomainError, LedgerEntry, LifecycleRepository, LocalSchedule, Platform,
+    ProviderDispatchReport, ProviderRegistry, ProviderRunner, PublicationQueue, PublishRequest,
+    PublishState, Repository, SqliteRepository, UpstreamPublishDto,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,9 +26,17 @@ struct DaemonConfig {
     bind: SocketAddr,
     #[serde(default = "default_state_path")]
     state_path: PathBuf,
-    /// Local runner declarations. They are validated but never executed here.
+    /// Explicit loopback local-runner declarations used by immediate HTTP
+    /// dispatch and by due-job scheduler passes; neither path opens a browser
+    /// or calls a platform directly.
     #[serde(default)]
     provider_runners: Vec<ProviderRunner>,
+    /// Period between durable due-job claim passes. Must be positive.
+    #[serde(default = "default_scheduler_interval_seconds")]
+    scheduler_interval_seconds: u64,
+    /// Maximum jobs claimed in one scheduler pass, capped by the core queue.
+    #[serde(default = "default_scheduler_batch_size")]
+    scheduler_batch_size: usize,
 }
 fn default_bind() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8788))
@@ -36,12 +44,20 @@ fn default_bind() -> SocketAddr {
 fn default_state_path() -> PathBuf {
     PathBuf::from("matrixpost.db")
 }
+const fn default_scheduler_interval_seconds() -> u64 {
+    5
+}
+const fn default_scheduler_batch_size() -> usize {
+    16
+}
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
             state_path: default_state_path(),
             provider_runners: Vec::new(),
+            scheduler_interval_seconds: default_scheduler_interval_seconds(),
+            scheduler_batch_size: default_scheduler_batch_size(),
         }
     }
 }
@@ -77,14 +93,37 @@ impl DaemonConfig {
         if let Some(path) = args.state_path {
             config.state_path = path;
         }
+        config.validate()?;
         Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.scheduler_interval_seconds == 0 {
+            return Err("scheduler_interval_seconds must be greater than zero".into());
+        }
+        if self.scheduler_batch_size == 0
+            || self.scheduler_batch_size > <SqliteRepository as PublicationQueue>::MAX_CLAIM_BATCH
+        {
+            return Err(format!(
+                "scheduler_batch_size must be between 1 and {}",
+                <SqliteRepository as PublicationQueue>::MAX_CLAIM_BATCH
+            ));
+        }
+        Ok(())
     }
 }
 
-#[derive(Clone)]
-struct AppState {
-    repository: Arc<SqliteRepository>,
+struct AppState<R = SqliteRepository> {
+    repository: Arc<R>,
     providers: Arc<ProviderRegistry>,
+}
+impl<R> Clone for AppState<R> {
+    fn clone(&self) -> Self {
+        Self {
+            repository: Arc::clone(&self.repository),
+            providers: Arc::clone(&self.providers),
+        }
+    }
 }
 #[derive(Serialize)]
 struct ApiResponse<T: Serialize> {
@@ -608,6 +647,117 @@ async fn publish(State(state): State<AppState>, body: Bytes) -> Response {
     }
 }
 
+const SCHEDULED_LOCAL_RUNNER_COMPLETE: &str =
+    "scheduled local runner workflow completed; remote platform processing is not confirmed";
+const SCHEDULED_LOCAL_RUNNER_UNAVAILABLE: &str =
+    "scheduled local runner was unavailable; no remote platform publication was attempted";
+const SCHEDULED_LOCAL_RUNNER_INCOMPLETE: &str =
+    "scheduled local runner workflow was incomplete; remote platform processing is not confirmed";
+
+/// Runs one deterministic durable-scheduler pass.
+///
+/// The queue claim happens before any runner is contacted. Each claimed job is
+/// therefore owned by this pass and retains its optimistic revision for the
+/// terminal state transition. Runner requests deliberately clear the original
+/// local schedule: the daemon, rather than a provider, owns due-time timing.
+/// No branch here opens a browser or calls a platform directly; dispatch is
+/// limited to the already configured local provider registry. A claimed task
+/// is an at-least-once local workflow: if terminal persistence fails, its
+/// exact non-terminal claim is requeued for retry, and no path claims remote
+/// platform success.
+fn run_scheduler_tick_at<R>(
+    state: &AppState<R>,
+    due_through: &LocalSchedule,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    batch_size: usize,
+) -> Result<(), DomainError>
+where
+    R: Repository + PublicationQueue,
+{
+    let claimed = state
+        .repository
+        .claim_due(due_through, updated_at, batch_size)?;
+    for job in claimed {
+        let mut request = job.request.clone();
+        request.scheduled_at = None;
+        let (terminal_state, detail) = match state.providers.dispatch_all(&request) {
+            Ok(report)
+                if report
+                    .outcomes
+                    .values()
+                    .all(|outcome| matches!(outcome, DispatchOutcome::Queued { .. })) =>
+            {
+                (PublishState::Published, SCHEDULED_LOCAL_RUNNER_COMPLETE)
+            }
+            Ok(report)
+                if report
+                    .outcomes
+                    .values()
+                    .all(|outcome| matches!(outcome, DispatchOutcome::Unavailable { .. })) =>
+            {
+                (
+                    PublishState::Unavailable,
+                    SCHEDULED_LOCAL_RUNNER_UNAVAILABLE,
+                )
+            }
+            Ok(_) | Err(_) => (PublishState::Failed, SCHEDULED_LOCAL_RUNNER_INCOMPLETE),
+        };
+        if state
+            .repository
+            .complete_job_with_history(
+                &job.id,
+                job.revision,
+                terminal_state,
+                updated_at,
+                Some(detail),
+            )
+            .is_err()
+        {
+            // The runner may already have accepted this request. Requeue only
+            // the exact non-terminal claim instead of inventing a terminal
+            // record, so retry semantics remain explicitly at-least-once.
+            if state
+                .repository
+                .requeue_claim(&job.id, job.revision, updated_at)
+                .is_err()
+            {
+                eprintln!("matrixpostd scheduler could not recover a claimed job");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn current_local_schedule() -> Result<LocalSchedule, DomainError> {
+    LocalSchedule::parse(
+        &chrono::Local::now()
+            .naive_local()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
+/// Runs the periodic scheduler independently from request handling.
+async fn scheduler_loop(state: AppState, interval: Duration, batch_size: usize) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let tick_state = state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let due_through = current_local_schedule()?;
+            run_scheduler_tick_at(&tick_state, &due_through, chrono::Utc::now(), batch_size)
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            // Errors can contain storage/runner text. Keep the daemon log
+            // intentionally non-sensitive and let the next pass retry only
+            // jobs that remain queued.
+            eprintln!("matrixpostd scheduler tick failed");
+        }
+    }
+}
+
 /// Builds the local HTTP contract used by desktop and server callers.
 fn app(state: AppState) -> Router {
     Router::new()
@@ -675,15 +825,16 @@ async fn main() -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    match axum::serve(
-        listener,
-        app(AppState {
-            repository,
-            providers,
-        }),
-    )
-    .await
-    {
+    let state = AppState {
+        repository,
+        providers,
+    };
+    tokio::spawn(scheduler_loop(
+        state.clone(),
+        Duration::from_secs(config.scheduler_interval_seconds),
+        config.scheduler_batch_size,
+    ));
+    match axum::serve(listener, app(state)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("matrixpostd stopped unexpectedly: {error}");
@@ -695,6 +846,11 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -751,6 +907,216 @@ mod tests {
         })
     }
 
+    #[derive(Clone)]
+    struct SchedulerProvider {
+        platform: Platform,
+        availability: matrixpost_core::ProviderAvailability,
+        outcome: DispatchOutcome,
+        observed: Arc<Mutex<Vec<PublishRequest>>>,
+    }
+
+    impl matrixpost_core::PublishProvider for SchedulerProvider {
+        fn platform(&self) -> Platform {
+            self.platform
+        }
+
+        fn availability(&self) -> matrixpost_core::ProviderAvailability {
+            self.availability.clone()
+        }
+
+        fn enqueue(&self, request: &PublishRequest) -> Result<DispatchOutcome, DomainError> {
+            self.observed.lock().unwrap().push(request.clone());
+            Ok(self.outcome.clone())
+        }
+    }
+
+    /// Test-only persistence seam proving a failed terminal write does not
+    /// stop subsequent claimed work or strand the failed claim.
+    struct FailFirstCompletionRepository {
+        inner: SqliteRepository,
+        remaining_failures: AtomicUsize,
+    }
+
+    impl FailFirstCompletionRepository {
+        fn new() -> Self {
+            Self {
+                inner: SqliteRepository::in_memory().unwrap(),
+                remaining_failures: AtomicUsize::new(1),
+            }
+        }
+    }
+
+    impl Repository for FailFirstCompletionRepository {
+        fn save_account(&self, account: &matrixpost_core::Account) -> Result<(), DomainError> {
+            self.inner.save_account(account)
+        }
+
+        fn accounts(&self) -> Result<Vec<matrixpost_core::Account>, DomainError> {
+            self.inner.accounts()
+        }
+
+        fn save_article_account(
+            &self,
+            account: &matrixpost_core::ArticleAccount,
+        ) -> Result<(), DomainError> {
+            self.inner.save_article_account(account)
+        }
+
+        fn article_accounts(&self) -> Result<Vec<matrixpost_core::ArticleAccount>, DomainError> {
+            self.inner.article_accounts()
+        }
+
+        fn append_history(
+            &self,
+            record: &matrixpost_core::HistoryRecord,
+        ) -> Result<(), DomainError> {
+            self.inner.append_history(record)
+        }
+
+        fn history(&self) -> Result<Vec<matrixpost_core::HistoryRecord>, DomainError> {
+            self.inner.history()
+        }
+
+        fn insert_job(&self, job: &matrixpost_core::ScheduledJob) -> Result<(), DomainError> {
+            self.inner.insert_job(job)
+        }
+
+        fn job(&self, id: &str) -> Result<Option<matrixpost_core::ScheduledJob>, DomainError> {
+            self.inner.job(id)
+        }
+
+        fn transition_job(
+            &self,
+            id: &str,
+            expected_revision: u64,
+            next: PublishState,
+            updated_at: chrono::DateTime<chrono::Utc>,
+        ) -> Result<matrixpost_core::ScheduledJob, DomainError> {
+            self.inner
+                .transition_job(id, expected_revision, next, updated_at)
+        }
+
+        fn complete_job_with_history(
+            &self,
+            id: &str,
+            expected_revision: u64,
+            next: PublishState,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            detail: Option<&str>,
+        ) -> Result<
+            (
+                matrixpost_core::ScheduledJob,
+                matrixpost_core::HistoryRecord,
+            ),
+            DomainError,
+        > {
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(DomainError::Database(
+                    "injected terminal write failure".into(),
+                ));
+            }
+            self.inner
+                .complete_job_with_history(id, expected_revision, next, updated_at, detail)
+        }
+
+        fn set_config(&self, key: &str, value: &str) -> Result<(), DomainError> {
+            self.inner.set_config(key, value)
+        }
+
+        fn config(&self, key: &str) -> Result<Option<String>, DomainError> {
+            self.inner.config(key)
+        }
+
+        fn delete_config(&self, key: &str) -> Result<bool, DomainError> {
+            self.inner.delete_config(key)
+        }
+    }
+
+    impl PublicationQueue for FailFirstCompletionRepository {
+        fn enqueue(
+            &self,
+            request: &PublishRequest,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<matrixpost_core::ScheduledJob, DomainError> {
+            self.inner.enqueue(request, now)
+        }
+
+        fn advance(
+            &self,
+            id: &str,
+            expected_revision: u64,
+            next: PublishState,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<matrixpost_core::ScheduledJob, DomainError> {
+            self.inner.advance(id, expected_revision, next, now)
+        }
+
+        fn claim_due(
+            &self,
+            due_through: &LocalSchedule,
+            now: chrono::DateTime<chrono::Utc>,
+            limit: usize,
+        ) -> Result<Vec<matrixpost_core::ScheduledJob>, DomainError> {
+            self.inner.claim_due(due_through, now, limit)
+        }
+
+        fn requeue_claim(
+            &self,
+            id: &str,
+            expected_revision: u64,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<matrixpost_core::ScheduledJob, DomainError> {
+            self.inner.requeue_claim(id, expected_revision, now)
+        }
+    }
+
+    fn scheduled_request() -> PublishRequest {
+        PublishRequest {
+            source: matrixpost_core::MediaSource::LocalFile("movie.mp4".into()),
+            title: "Scheduled title".into(),
+            short_title: None,
+            tags: Vec::new(),
+            address: None,
+            draft: false,
+            bt2: None,
+            scheduled_at: Some(LocalSchedule::parse("2026-07-29 09:00:00").unwrap()),
+            task_name: None,
+            account: Default::default(),
+            wechat_link: Default::default(),
+            overrides: Vec::new(),
+            targets: vec![Platform::Douyin],
+        }
+    }
+
+    fn scheduler_state(
+        availability: matrixpost_core::ProviderAvailability,
+        outcome: DispatchOutcome,
+    ) -> (AppState, Arc<Mutex<Vec<PublishRequest>>>) {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut providers = ProviderRegistry::new();
+        providers
+            .register(Box::new(SchedulerProvider {
+                platform: Platform::Douyin,
+                availability,
+                outcome,
+                observed: Arc::clone(&observed),
+            }))
+            .unwrap();
+        (
+            AppState {
+                repository: Arc::new(SqliteRepository::in_memory().unwrap()),
+                providers: Arc::new(providers),
+            },
+            observed,
+        )
+    }
+
     #[test]
     fn config_defaults_are_secret_free() {
         let config = DaemonConfig::default();
@@ -775,6 +1141,161 @@ mod tests {
             registry.availability(Platform::Douyin),
             matrixpost_core::ProviderAvailability::Available
         );
+    }
+
+    #[test]
+    fn daemon_config_rejects_invalid_scheduler_bounds() {
+        for config in [
+            "scheduler_interval_seconds = 0",
+            "scheduler_batch_size = 0",
+            "scheduler_batch_size = 65",
+        ] {
+            assert!(
+                toml::from_str::<DaemonConfig>(config)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_tick_publishes_locally_once_and_strips_schedule() {
+        let (state, observed) = scheduler_state(
+            matrixpost_core::ProviderAvailability::Available,
+            DispatchOutcome::Queued {
+                job_id: "local-workflow".into(),
+            },
+        );
+        let now = chrono::Utc::now();
+        let job = state.repository.enqueue(&scheduled_request(), now).unwrap();
+        let due = LocalSchedule::parse("2026-07-29 09:00:00").unwrap();
+
+        run_scheduler_tick_at(&state, &due, now, 1).unwrap();
+        let complete = state.repository.job(&job.id).unwrap().unwrap();
+        assert_eq!(complete.state, PublishState::Published);
+        assert_eq!(complete.revision, 2);
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].scheduled_at, None);
+        drop(observed);
+
+        let history = state.repository.history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].state, PublishState::Published);
+        let detail = history[0].detail.as_deref().unwrap();
+        assert_eq!(detail, SCHEDULED_LOCAL_RUNNER_COMPLETE);
+        assert!(!detail.contains("movie.mp4"));
+        assert!(!detail.contains("127.0.0.1"));
+
+        run_scheduler_tick_at(&state, &due, now, 1).unwrap();
+        assert_eq!(state.repository.history().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scheduler_requeues_only_the_failed_claim_and_completes_later_jobs() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut providers = ProviderRegistry::new();
+        providers
+            .register(Box::new(SchedulerProvider {
+                platform: Platform::Douyin,
+                availability: matrixpost_core::ProviderAvailability::Available,
+                outcome: DispatchOutcome::Queued {
+                    job_id: "local-workflow".into(),
+                },
+                observed: Arc::clone(&observed),
+            }))
+            .unwrap();
+        let state = AppState {
+            repository: Arc::new(FailFirstCompletionRepository::new()),
+            providers: Arc::new(providers),
+        };
+        let now = chrono::Utc::now();
+        let due = LocalSchedule::parse("2026-07-29 09:00:00").unwrap();
+        let first = state.repository.enqueue(&scheduled_request(), now).unwrap();
+        let second = state.repository.enqueue(&scheduled_request(), now).unwrap();
+
+        run_scheduler_tick_at(&state, &due, now, 2).unwrap();
+        let first_after_failure = state.repository.job(&first.id).unwrap().unwrap();
+        assert_eq!(first_after_failure.state, PublishState::Queued);
+        assert_eq!(first_after_failure.revision, 2);
+        assert_eq!(
+            state.repository.job(&second.id).unwrap().unwrap().state,
+            PublishState::Published
+        );
+        assert_eq!(state.repository.history().unwrap().len(), 1);
+
+        run_scheduler_tick_at(&state, &due, now, 2).unwrap();
+        assert_eq!(
+            state.repository.job(&first.id).unwrap().unwrap().state,
+            PublishState::Published
+        );
+        assert_eq!(state.repository.history().unwrap().len(), 2);
+        // The runner received the first request twice: recovery occurs after
+        // a possible local acceptance, so semantics are intentionally
+        // at-least-once rather than a false exactly-once claim.
+        assert_eq!(observed.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn scheduler_tick_marks_unavailable_and_rejected_outcomes_safely() {
+        let now = chrono::Utc::now();
+        let due = LocalSchedule::parse("2026-07-29 09:00:00").unwrap();
+        let (unavailable_state, unavailable_observed) = scheduler_state(
+            matrixpost_core::ProviderAvailability::Unavailable {
+                reason: "not logged in".into(),
+            },
+            DispatchOutcome::Queued {
+                job_id: "must-not-run".into(),
+            },
+        );
+        let unavailable_job = unavailable_state
+            .repository
+            .enqueue(&scheduled_request(), now)
+            .unwrap();
+        run_scheduler_tick_at(&unavailable_state, &due, now, 1).unwrap();
+        assert_eq!(
+            unavailable_state
+                .repository
+                .job(&unavailable_job.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            PublishState::Unavailable
+        );
+        assert!(unavailable_observed.lock().unwrap().is_empty());
+        assert_eq!(
+            unavailable_state.repository.history().unwrap()[0].detail,
+            Some(SCHEDULED_LOCAL_RUNNER_UNAVAILABLE.into())
+        );
+
+        let (rejected_state, _) = scheduler_state(
+            matrixpost_core::ProviderAvailability::Available,
+            DispatchOutcome::Rejected {
+                reason: "tcp:127.0.0.1:39001 rejected movie.mp4".into(),
+            },
+        );
+        let rejected_job = rejected_state
+            .repository
+            .enqueue(&scheduled_request(), now)
+            .unwrap();
+        run_scheduler_tick_at(&rejected_state, &due, now, 1).unwrap();
+        assert_eq!(
+            rejected_state
+                .repository
+                .job(&rejected_job.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            PublishState::Failed
+        );
+        let detail = rejected_state.repository.history().unwrap()[0]
+            .detail
+            .clone()
+            .unwrap();
+        assert_eq!(detail, SCHEDULED_LOCAL_RUNNER_INCOMPLETE);
+        assert!(!detail.contains("127.0.0.1"));
+        assert!(!detail.contains("movie.mp4"));
     }
     #[test]
     fn malformed_http_json_is_a_bad_request() {

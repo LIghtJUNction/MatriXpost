@@ -15,7 +15,7 @@ use std::{
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -1126,6 +1126,19 @@ pub trait Repository: Send + Sync {
         next: PublishState,
         updated_at: DateTime<Utc>,
     ) -> Result<ScheduledJob, DomainError>;
+    /// Atomically completes a claimed job and records its one terminal history
+    /// entry. The transition and insert share one SQLite transaction so a
+    /// process interruption cannot leave a terminal job without history or a
+    /// duplicate retry record. The durable store allocates the history ID in
+    /// that transaction; callers cannot predict or select it.
+    fn complete_job_with_history(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        next: PublishState,
+        updated_at: DateTime<Utc>,
+        detail: Option<&str>,
+    ) -> Result<(ScheduledJob, HistoryRecord), DomainError>;
     fn set_config(&self, key: &str, value: &str) -> Result<(), DomainError>;
     fn config(&self, key: &str) -> Result<Option<String>, DomainError>;
     fn delete_config(&self, key: &str) -> Result<bool, DomainError>;
@@ -1191,6 +1204,12 @@ pub trait LifecycleRepository: Send + Sync {
 
 /// Queue semantics separated from persistence so schedulers are replaceable.
 pub trait PublicationQueue: Send + Sync {
+    /// The largest number of jobs one scheduler transaction may claim.
+    ///
+    /// Keeping this bound in the core makes a misconfigured embedding unable
+    /// to turn one periodic pass into an unbounded local side-effect burst.
+    const MAX_CLAIM_BATCH: usize = 64;
+
     fn enqueue(
         &self,
         request: &PublishRequest,
@@ -1201,6 +1220,35 @@ pub trait PublicationQueue: Send + Sync {
         id: &str,
         expected_revision: u64,
         next: PublishState,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduledJob, DomainError>;
+
+    /// Atomically claims at most `limit` queued, scheduled jobs due on or
+    /// before `due_through`.
+    ///
+    /// Claimed jobs move to [`PublishState::Dispatching`] and have their
+    /// revision incremented before this call returns. Drafts, unscheduled
+    /// jobs, future jobs, and jobs already claimed by another scheduler are
+    /// excluded. `limit` is capped at [`Self::MAX_CLAIM_BATCH`].
+    fn claim_due(
+        &self,
+        due_through: &LocalSchedule,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ScheduledJob>, DomainError>;
+
+    /// Returns one uncompleted dispatch claim to the due queue.
+    ///
+    /// This is intentionally narrower than [`Self::advance`]: it only accepts
+    /// the exact `Dispatching` revision claimed by a scheduler. It is used
+    /// after the local runner may already have accepted work but the durable
+    /// terminal transition could not be recorded. The subsequent retry is
+    /// therefore **at-least-once** delivery to a local runner, never an
+    /// exactly-once remote-platform guarantee.
+    fn requeue_claim(
+        &self,
+        id: &str,
+        expected_revision: u64,
         now: DateTime<Utc>,
     ) -> Result<ScheduledJob, DomainError>;
 }
@@ -1257,6 +1305,16 @@ impl SqliteRepository {
             .map_err(DomainError::database)?;
         if !version_six {
             connection.execute_batch("BEGIN; CREATE TABLE business_relations (id TEXT PRIMARY KEY NOT NULL, source_business_object_id TEXT NOT NULL REFERENCES business_objects(id), target_business_object_id TEXT NOT NULL REFERENCES business_objects(id), relation_type TEXT NOT NULL, attributes_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(source_business_object_id, target_business_object_id, relation_type)); INSERT INTO schema_migrations(version) VALUES (6); COMMIT;").map_err(DomainError::database)?;
+        }
+        let version_seven: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DomainError::database)?;
+        if !version_seven {
+            connection.execute_batch("BEGIN; CREATE TABLE history_sequence (id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO schema_migrations(version) VALUES (7); COMMIT;").map_err(DomainError::database)?;
         }
         Ok(())
     }
@@ -1429,6 +1487,59 @@ impl Repository for SqliteRepository {
             updated_at,
             ..current
         })
+    }
+    fn complete_job_with_history(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        next: PublishState,
+        updated_at: DateTime<Utc>,
+        detail: Option<&str>,
+    ) -> Result<(ScheduledJob, HistoryRecord), DomainError> {
+        let mut connection = self.locked()?;
+        let transaction = connection.transaction().map_err(DomainError::database)?;
+        let current =
+            load_job_tx(&transaction, id)?.ok_or_else(|| DomainError::UnknownJob(id.to_owned()))?;
+        current.state.transition(next)?;
+        if current.revision != expected_revision {
+            return Err(DomainError::StaleJobRevision {
+                id: id.to_owned(),
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE jobs SET state=?1, revision=?2, updated_at=?3 WHERE id=?4 AND revision=?5",
+                params![
+                    next.db(),
+                    expected_revision + 1,
+                    updated_at.to_rfc3339(),
+                    id,
+                    expected_revision
+                ],
+            )
+            .map_err(DomainError::database)?;
+        if changed != 1 {
+            return Err(DomainError::ConcurrentJobUpdate(id.to_owned()));
+        }
+        let history = insert_terminal_history(
+            &transaction,
+            &current.request.runner_safe(),
+            next,
+            updated_at,
+            detail,
+        )?;
+        transaction.commit().map_err(DomainError::database)?;
+        Ok((
+            ScheduledJob {
+                state: next,
+                revision: expected_revision + 1,
+                updated_at,
+                ..current
+            },
+            history,
+        ))
     }
     fn set_config(&self, key: &str, value: &str) -> Result<(), DomainError> {
         let connection = self.locked()?;
@@ -1770,6 +1881,119 @@ impl PublicationQueue for SqliteRepository {
         now: DateTime<Utc>,
     ) -> Result<ScheduledJob, DomainError> {
         self.transition_job(id, expected_revision, next, now)
+    }
+
+    fn claim_due(
+        &self,
+        due_through: &LocalSchedule,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ScheduledJob>, DomainError> {
+        let limit = limit.min(Self::MAX_CLAIM_BATCH);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut connection = self.locked()?;
+        // An IMMEDIATE transaction serializes competing repository instances
+        // before either can observe a queued candidate. The subsequent
+        // revision/state predicate remains a defensive guard against an
+        // unexpected out-of-band writer.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DomainError::database)?;
+        let candidates = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, request_json, state, due_at, revision, updated_at \
+                     FROM jobs \
+                     WHERE state='queued' AND due_at IS NOT NULL AND due_at <= ?1 \
+                     ORDER BY due_at, id LIMIT ?2",
+                )
+                .map_err(DomainError::database)?;
+            statement
+                .query_map(params![due_through.0, limit as i64], row_to_job)
+                .map_err(DomainError::database)?
+                .map(|row| row.map_err(DomainError::database)?)
+                .collect::<Result<Vec<_>, DomainError>>()?
+        };
+
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for current in candidates {
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs SET state=?1, revision=?2, updated_at=?3 \
+                     WHERE id=?4 AND state='queued' AND revision=?5",
+                    params![
+                        PublishState::Dispatching.db(),
+                        current.revision + 1,
+                        now.to_rfc3339(),
+                        current.id,
+                        current.revision,
+                    ],
+                )
+                .map_err(DomainError::database)?;
+            if changed != 1 {
+                return Err(DomainError::ConcurrentJobUpdate(current.id));
+            }
+            claimed.push(ScheduledJob {
+                state: PublishState::Dispatching,
+                revision: current.revision + 1,
+                updated_at: now,
+                ..current
+            });
+        }
+        transaction.commit().map_err(DomainError::database)?;
+        Ok(claimed)
+    }
+
+    fn requeue_claim(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduledJob, DomainError> {
+        let mut connection = self.locked()?;
+        let transaction = connection.transaction().map_err(DomainError::database)?;
+        let current =
+            load_job_tx(&transaction, id)?.ok_or_else(|| DomainError::UnknownJob(id.to_owned()))?;
+        if current.state != PublishState::Dispatching {
+            return Err(DomainError::InvalidStateTransition {
+                from: current.state,
+                to: PublishState::Queued,
+            });
+        }
+        if current.revision != expected_revision {
+            return Err(DomainError::StaleJobRevision {
+                id: id.to_owned(),
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE jobs SET state=?1, revision=?2, updated_at=?3 \
+                 WHERE id=?4 AND state=?5 AND revision=?6",
+                params![
+                    PublishState::Queued.db(),
+                    expected_revision + 1,
+                    now.to_rfc3339(),
+                    id,
+                    PublishState::Dispatching.db(),
+                    expected_revision,
+                ],
+            )
+            .map_err(DomainError::database)?;
+        if changed != 1 {
+            return Err(DomainError::ConcurrentJobUpdate(id.to_owned()));
+        }
+        transaction.commit().map_err(DomainError::database)?;
+        Ok(ScheduledJob {
+            state: PublishState::Queued,
+            revision: expected_revision + 1,
+            updated_at: now,
+            ..current
+        })
     }
 }
 
@@ -2978,6 +3202,47 @@ fn load_job_tx(
         .transpose()
 }
 
+/// Allocates and persists terminal scheduler history in the caller's job
+/// transaction. The private sequence is durable across restarts. Although
+/// ordinary history import may use arbitrary IDs, a defensive conflict retry
+/// makes a generated scheduler ID collision-free as well.
+fn insert_terminal_history(
+    transaction: &Transaction<'_>,
+    request: &PublishRequest,
+    state: PublishState,
+    recorded_at: DateTime<Utc>,
+    detail: Option<&str>,
+) -> Result<HistoryRecord, DomainError> {
+    loop {
+        transaction
+            .execute("INSERT INTO history_sequence DEFAULT VALUES", [])
+            .map_err(DomainError::database)?;
+        let record = HistoryRecord {
+            id: format!("scheduled-history-{}", transaction.last_insert_rowid()),
+            request: request.clone(),
+            state,
+            recorded_at,
+            detail: detail.map(str::to_owned),
+        };
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO history(id, request_json, state, recorded_at, detail) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record.id,
+                    json(&record.request)?,
+                    record.state.db(),
+                    record.recorded_at.to_rfc3339(),
+                    record.detail,
+                ],
+            )
+            .map_err(DomainError::database)?;
+        if inserted == 1 {
+            return Ok(record);
+        }
+    }
+}
+
 fn load_business_object(
     connection: &Connection,
     id: &str,
@@ -3389,11 +3654,13 @@ mod tests {
     use super::*;
     use std::{
         collections::VecDeque,
+        env, fs,
         io::{self, Cursor, Read},
         sync::{
-            Arc,
+            Arc, Barrier,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
+        thread,
     };
 
     static STAGING_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -3850,6 +4117,169 @@ mod tests {
             Err(DomainError::StaleJobRevision { .. })
         ));
         assert_eq!(repository.job(&job.id).unwrap(), Some(dispatched));
+    }
+
+    #[test]
+    fn claim_due_is_atomic_bounded_and_excludes_ineligible_jobs() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let updated_at = Utc::now();
+        let due = LocalSchedule::parse("2026-01-02 03:04:05").unwrap();
+
+        let due_job = repository.enqueue(&request(), updated_at).unwrap();
+
+        let mut future_request = request();
+        future_request.scheduled_at = Some(LocalSchedule::parse("2026-01-02 03:04:06").unwrap());
+        let future_job = repository.enqueue(&future_request, updated_at).unwrap();
+
+        let mut unscheduled_request = request();
+        unscheduled_request.scheduled_at = None;
+        let unscheduled_job = repository
+            .enqueue(&unscheduled_request, updated_at)
+            .unwrap();
+
+        let mut draft_request = request();
+        draft_request.draft = true;
+        let draft_job = repository.enqueue(&draft_request, updated_at).unwrap();
+
+        let claimed = repository
+            .claim_due(
+                &due,
+                updated_at,
+                <SqliteRepository as PublicationQueue>::MAX_CLAIM_BATCH + 1,
+            )
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, due_job.id);
+        assert_eq!(claimed[0].state, PublishState::Dispatching);
+        assert_eq!(claimed[0].revision, 1);
+        assert_eq!(claimed[0].due_at, Some(due.clone()));
+        assert!(
+            repository
+                .claim_due(
+                    &due,
+                    updated_at,
+                    <SqliteRepository as PublicationQueue>::MAX_CLAIM_BATCH,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repository.job(&future_job.id).unwrap().unwrap().state,
+            PublishState::Queued
+        );
+        assert_eq!(
+            repository.job(&unscheduled_job.id).unwrap().unwrap().state,
+            PublishState::Queued
+        );
+        assert_eq!(
+            repository.job(&draft_job.id).unwrap().unwrap().state,
+            PublishState::Draft
+        );
+    }
+
+    #[test]
+    fn completing_a_claimed_job_records_one_matching_history_atomically() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let now = Utc::now();
+        let job = repository.enqueue(&request(), now).unwrap();
+        let due = job.due_at.clone().unwrap();
+        let claimed = repository.claim_due(&due, now, 1).unwrap().pop().unwrap();
+        // A pre-existing legacy ID in the scheduler namespace must not make a
+        // terminal transition collide. The repository allocates and retries a
+        // durable private sequence inside the same transaction.
+        repository
+            .append_history(&HistoryRecord {
+                id: "scheduled-history-1".into(),
+                request: request(),
+                state: PublishState::Queued,
+                recorded_at: now,
+                detail: None,
+            })
+            .unwrap();
+        let (completed, history) = repository
+            .complete_job_with_history(
+                &claimed.id,
+                claimed.revision,
+                PublishState::Published,
+                now,
+                Some("local runner workflow completed"),
+            )
+            .unwrap();
+        assert_eq!(completed.state, PublishState::Published);
+        assert_eq!(history.id, "scheduled-history-2");
+        assert_eq!(history.request, claimed.request.runner_safe());
+        assert_eq!(history.state, PublishState::Published);
+        assert_eq!(repository.history().unwrap().len(), 2);
+        assert!(matches!(
+            repository.complete_job_with_history(
+                &claimed.id,
+                claimed.revision,
+                PublishState::Published,
+                now,
+                None,
+            ),
+            Err(DomainError::InvalidStateTransition { .. })
+        ));
+        assert_eq!(repository.history().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn requeue_claim_is_revision_guarded_and_due_again() {
+        let repository = SqliteRepository::in_memory().unwrap();
+        let now = Utc::now();
+        let job = repository.enqueue(&request(), now).unwrap();
+        let due = job.due_at.clone().unwrap();
+        let claimed = repository.claim_due(&due, now, 1).unwrap().pop().unwrap();
+
+        assert!(matches!(
+            repository.requeue_claim(&claimed.id, claimed.revision - 1, now),
+            Err(DomainError::StaleJobRevision { .. })
+        ));
+        let requeued = repository
+            .requeue_claim(&claimed.id, claimed.revision, now)
+            .unwrap();
+        assert_eq!(requeued.state, PublishState::Queued);
+        assert_eq!(requeued.revision, claimed.revision + 1);
+        let retry = repository.claim_due(&due, now, 1).unwrap().pop().unwrap();
+        assert_eq!(retry.id, claimed.id);
+        assert_eq!(retry.state, PublishState::Dispatching);
+        assert_eq!(retry.revision, requeued.revision + 1);
+    }
+
+    #[test]
+    fn competing_sqlite_connections_claim_a_due_job_once() {
+        let path = env::temp_dir().join(format!(
+            "matrixpost-claim-{}-{}.sqlite",
+            std::process::id(),
+            STAGING_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = Arc::new(SqliteRepository::open(&path).unwrap());
+        let second = Arc::new(SqliteRepository::open(&path).unwrap());
+        let now = Utc::now();
+        let job = first.enqueue(&request(), now).unwrap();
+        let due = job.due_at.clone().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let contenders = [Arc::clone(&first), Arc::clone(&second)].map(|repository| {
+            let barrier = Arc::clone(&barrier);
+            let due = due.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                repository.claim_due(&due, now, 1)
+            })
+        });
+        barrier.wait();
+        let claims = contenders
+            .into_iter()
+            .map(|contender| contender.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(claims.iter().map(Vec::len).sum::<usize>(), 1);
+        assert_eq!(
+            first.job(&job.id).unwrap().unwrap().state,
+            PublishState::Dispatching
+        );
+        drop(first);
+        drop(second);
+        fs::remove_file(path).unwrap();
     }
     #[test]
     fn sqlite_persists_safe_accounts_and_history() {

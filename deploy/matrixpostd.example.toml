@@ -4,6 +4,12 @@
 bind = "127.0.0.1:8788"
 state_path = "/var/lib/matrixpost/matrixpost.db"
 
+# matrixpostd claims due local schedules at this interval. Each pass is bounded
+# to 1..64 jobs and only dispatches through configured loopback runners.
+# A completed local runner workflow is not proof of remote platform publication.
+scheduler_interval_seconds = 5
+scheduler_batch_size = 16
+
 # Optional, local-only runner declarations. A TCP entry invokes the separately
 # started matrixpost-webdriver-runner v1 protocol; matrixpostd never reads
 # browser data, profiles, cookies, or credentials. Unix socket and named-pipe
