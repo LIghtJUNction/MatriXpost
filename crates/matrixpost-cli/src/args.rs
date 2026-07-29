@@ -295,10 +295,23 @@ pub(crate) struct HistoryArgs {
 pub(crate) struct PublishArgs {
     #[arg(short = 'p', long = "platform", required = true)]
     pub(crate) platforms: Vec<String>,
-    #[arg(short = 'f', long)]
-    pub(crate) file: String,
+    /// A single local path or an HTTP(S) media URL. Mutually exclusive with --dir.
+    #[arg(
+        short = 'f',
+        long,
+        required_unless_present = "dir",
+        conflicts_with = "dir"
+    )]
+    pub(crate) file: Option<String>,
+    /// A local directory whose direct media files are selected by --config/--xlsx.
+    #[arg(long, required_unless_present = "file", conflicts_with = "file")]
+    pub(crate) dir: Option<PathBuf>,
+    /// XLSX batch configuration. Required for --dir and forbidden for --file.
+    #[arg(long = "config", visible_alias = "xlsx", conflicts_with = "file")]
+    pub(crate) config: Option<PathBuf>,
+    /// Required for one file. Batch rows provide their own titles.
     #[arg(short = 't', long)]
-    pub(crate) title: String,
+    pub(crate) title: Option<String>,
     #[arg(long = "short-title")]
     pub(crate) short_title: Option<String>,
     #[arg(long = "tags", alias = "bq", value_delimiter = ',')]

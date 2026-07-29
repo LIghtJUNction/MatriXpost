@@ -2,6 +2,7 @@
 
 mod app;
 mod args;
+mod batch;
 mod lifecycle;
 mod output;
 mod query;

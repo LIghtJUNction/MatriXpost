@@ -151,6 +151,31 @@ lifecycle/approval transitions. Ledger amounts are integer minor units. A
 transition requires the current revision, so stale updates are rejected rather
 than silently overwriting another local change.
 
+## Batch video manifests
+
+`publish` also accepts one local directory and an XLSX manifest:
+
+```bash
+matrixpost --provider-runner dy=tcp:127.0.0.1:39001 \
+  publish --dir /absolute/path/to/media --config /absolute/path/to/batch.xlsx \
+  --platform dy
+```
+
+`--xlsx` is an alias for `--config`. The first worksheet supplies one row per
+video. It must contain a `文件名`, `filename`, or `file` column; optional columns
+are `标题`/`title`, `标签`/`tags`, and
+`创作声明`/`creativestatement`/`cs`. Blank filename rows are ignored. The manifest
+is only a local input: each valid row is sent to the configured local provider
+runner and a `queued` result means that runner accepted/completed its local
+workflow, never that a remote platform has published or processed the video.
+
+For safety, the directory and workbook must be existing, non-symlink local
+paths. Only direct, supported video files are eligible; recursive paths,
+symlinks, filename escapes, and non-media files are rejected or skipped. Batch
+results include a per-row outcome and use exit code `0` when every attempted
+row is queued, `2` for manifest/preflight failures, `3` when every attempted
+row is unavailable, and `4` for skipped, rejected, or mixed outcomes.
+
 ## MCP server
 
 `matrixpost-mcp` is an MCP stdio server built with the official Rust SDK. It

@@ -7,6 +7,7 @@ use matrixpost_core::{
 
 use crate::{
     args::{Cli, Command},
+    batch,
     lifecycle::{execute_lifecycle, lifecycle_repository_error},
     output::{emit, emit_article_dispatch_outcome, emit_dispatch},
     query::{parse_history_filter, parse_request},
@@ -64,10 +65,19 @@ pub(crate) fn run() -> ExitCode {
             Ok(value) => dispatch_manual_login(&runners, value),
             Err(error) => emit(2, serde_json::Value::Null, Some(&error.to_string())),
         },
-        Command::Publish(args) => match parse_request(args) {
-            Ok(request) => dispatch_publish(&registry, &request),
-            Err(error) => emit(2, serde_json::Value::Null, Some(&error)),
-        },
+        Command::Publish(args) => {
+            if args.dir.is_some() {
+                match batch::prepare(args) {
+                    Ok(plan) => batch::dispatch(&registry, plan),
+                    Err(error) => emit(2, serde_json::Value::Null, Some(&error)),
+                }
+            } else {
+                match parse_request(args) {
+                    Ok(request) => dispatch_publish(&registry, &request),
+                    Err(error) => emit(2, serde_json::Value::Null, Some(&error)),
+                }
+            }
+        }
         Command::PublishArticle {
             platform,
             title,

@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 chrono.workspace = true
+calamine.workspace = true
 clap.workspace = true
 matrixpost-core = { version = "0.4.0", path = "../matrixpost-core" }
 serde.workspace = true

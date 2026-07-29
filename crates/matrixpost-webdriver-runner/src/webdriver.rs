@@ -394,10 +394,10 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
         profile: &PlatformProfile,
     ) -> Result<bool, String> {
         for selector in profile.success {
-            if let Some(element) = self.find_once(session, selector) {
-                if self.is_visible(session, &element)? {
-                    return Ok(true);
-                }
+            if let Some(element) = self.find_once(session, selector)
+                && self.is_visible(session, &element)?
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -424,10 +424,10 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
 
     fn article_success_marker_visible(&self, session: &str) -> Result<bool, String> {
         for selector in JUEJIN_PROFILE.success {
-            if let Some(element) = self.find_once(session, selector) {
-                if self.is_visible(session, &element)? {
-                    return Ok(true);
-                }
+            if let Some(element) = self.find_once(session, selector)
+                && self.is_visible(session, &element)?
+            {
+                return Ok(true);
             }
         }
         Ok(false)

@@ -178,6 +178,16 @@ impl HistoryQuery {
 }
 
 pub(crate) fn parse_request(args: PublishArgs) -> Result<PublishRequest, String> {
+    let file = args
+        .file
+        .as_deref()
+        .ok_or_else(|| "--file is required unless --dir is supplied".to_owned())?;
+    if args.dir.is_some() || args.config.is_some() {
+        return Err("--file cannot be combined with --dir or --config".into());
+    }
+    let title = args
+        .title
+        .ok_or_else(|| "--title is required with --file".to_owned())?;
     let targets = args
         .platforms
         .iter()
@@ -211,7 +221,7 @@ pub(crate) fn parse_request(args: PublishArgs) -> Result<PublishRequest, String>
             }
         }
     }
-    let source = match url::Url::parse(&args.file) {
+    let source = match url::Url::parse(file) {
         Ok(url) if matches!(url.scheme(), "http" | "https") => MediaSource::RemoteUrl(url),
         Ok(url) => {
             return Err(format!(
@@ -219,11 +229,11 @@ pub(crate) fn parse_request(args: PublishArgs) -> Result<PublishRequest, String>
                 url.scheme()
             ));
         }
-        Err(_) => MediaSource::LocalFile(args.file.into()),
+        Err(_) => MediaSource::LocalFile(file.into()),
     };
     let request = PublishRequest {
         source,
-        title: args.title,
+        title,
         short_title: args.short_title,
         tags: args.tags,
         address: args.address,
