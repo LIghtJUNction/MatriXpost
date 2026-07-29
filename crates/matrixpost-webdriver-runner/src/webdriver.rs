@@ -7,19 +7,17 @@ use std::{
     time::Duration,
 };
 
+use crate::profiles::*;
 use matrixpost_core::{
     ArticlePlatform, MediaSource, Platform, PublishArticleRequest, PublishRequest,
     REVIEW_STATUS_TITLE_QUERY_MAX_BYTES, ReviewStatus,
 };
 use serde_json::{Value, json};
 use url::Url;
-
-use crate::profiles::*;
 mod fanqie;
 mod kuaishou;
 mod toutiao;
 mod xiaohongshu;
-
 pub(crate) trait WebDriverTransport: Send + Sync {
     fn request(&self, method: &str, path: &str, body: Value) -> Result<Value, String>;
 }
@@ -805,6 +803,9 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
             }
             if platform == Platform::WechatChannels {
                 self.try_declare_wechat_original(&session)?;
+            }
+            if platform == Platform::Xiaohongshu {
+                self.normalize_xiaohongshu_pk_cover(&session)?;
             }
             if platform == Platform::FanqieVideo {
                 self.publish_fanqie_video(&session)?;

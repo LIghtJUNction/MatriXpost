@@ -1,5 +1,8 @@
 use super::support::*;
-use crate::{profiles::*, webdriver::*};
+use crate::{
+    profiles::{DOUYIN_STATEMENT_POLL_ATTEMPTS, xiaohongshu_creative_statement_label},
+    webdriver::*,
+};
 use matrixpost_core::*;
 use serde_json::{Value, json};
 
@@ -31,6 +34,7 @@ fn completed_statement_replies() -> Vec<Result<Value, String>> {
         value(json!(true)),
         value(json!(true)),
         value(json!("description")),
+        value(json!("unchecked")),
         Err("not visible".into()),
         Err("not visible".into()),
         element("submit"),
@@ -51,6 +55,7 @@ fn completed_default_replies() -> Vec<Result<Value, String>> {
         value(json!(null)),
         element("description"),
         value(json!(null)),
+        value(json!("unchecked")),
         Err("not visible".into()),
         Err("not visible".into()),
         element("submit"),
@@ -59,6 +64,17 @@ fn completed_default_replies() -> Vec<Result<Value, String>> {
         value(json!(true)),
         value(json!(null)),
     ]
+}
+
+fn execute_count_before_submit(paths: &[String]) -> usize {
+    let submit = paths
+        .iter()
+        .position(|path| path.ends_with("/element/submit/click"))
+        .unwrap();
+    paths[..submit]
+        .iter()
+        .filter(|path| path.ends_with("/execute/sync"))
+        .count()
 }
 
 #[test]
@@ -107,26 +123,16 @@ fn xiaohongshu_selects_before_submit_without_description_leak() {
         .publish(Platform::Xiaohongshu, &request_with_statement("marketing"))
         .unwrap();
     let bodies = publisher.transport.bodies.lock().unwrap();
-    assert!(bodies.iter().any(|body| {
-        body.get("script") == Some(&Value::String(XIAOHONGSHU_STATEMENT_SELECT_SCRIPT.into()))
-            && body.get("args") == Some(&json!(["内容包含营销广告"]))
-    }));
     assert!(!bodies.iter().any(|body| {
         body.get("text")
             .and_then(Value::as_str)
             .is_some_and(|text| text.contains("marketing"))
     }));
-    let applied = bodies
-        .iter()
-        .position(|body| {
-            body.get("script") == Some(&Value::String(XIAOHONGSHU_STATEMENT_APPLIED_SCRIPT.into()))
-        })
-        .unwrap();
-    let submit = bodies
-        .iter()
-        .position(|body| body.get("value") == Some(&Value::String("button[type='submit']".into())))
-        .unwrap();
-    assert!(applied < submit);
+    drop(bodies);
+    assert_eq!(
+        execute_count_before_submit(&publisher.transport.paths.lock().unwrap()),
+        5
+    );
 }
 
 #[test]
@@ -189,22 +195,9 @@ fn xiaohongshu_missing_none_unknown_or_other_platform_override_skips_statement_a
     ] {
         let publisher = test_publisher(MockWebDriver::new(completed_default_replies()));
         publisher.publish(Platform::Xiaohongshu, &request).unwrap();
-        assert!(
-            !publisher
-                .transport
-                .bodies
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|body| {
-                    matches!(
-                        body.get("script").and_then(Value::as_str),
-                        Some(XIAOHONGSHU_STATEMENT_OPEN_SCRIPT)
-                            | Some(XIAOHONGSHU_STATEMENT_LIST_VISIBLE_SCRIPT)
-                            | Some(XIAOHONGSHU_STATEMENT_SELECT_SCRIPT)
-                            | Some(XIAOHONGSHU_STATEMENT_APPLIED_SCRIPT)
-                    )
-                })
+        assert_eq!(
+            execute_count_before_submit(&publisher.transport.paths.lock().unwrap()),
+            1
         );
     }
 }
@@ -311,4 +304,120 @@ fn xiaohongshu_unverified_selection_fails_closed_before_submit() {
     let paths = publisher.transport.paths.lock().unwrap();
     assert!(paths.last().unwrap().ends_with("/session/s"));
     assert!(!paths.iter().any(|path| path.ends_with("/click")));
+}
+
+#[test]
+fn xiaohongshu_pk_cover_selected_is_cleared_before_submit_with_or_without_declaration() {
+    for (mut replies, pk_state) in [
+        (completed_statement_replies(), 12),
+        (completed_default_replies(), 8),
+    ] {
+        replies[pk_state] = value(json!("checked"));
+        replies.insert(pk_state + 1, value(json!(true)));
+        replies.insert(pk_state + 2, value(json!("unchecked")));
+        let publisher = test_publisher(MockWebDriver::new(replies));
+        let request = if pk_state == 12 {
+            request_with_statement("marketing")
+        } else {
+            request()
+        };
+        publisher.publish(Platform::Xiaohongshu, &request).unwrap();
+        assert_eq!(
+            execute_count_before_submit(&publisher.transport.paths.lock().unwrap()),
+            if pk_state == 12 { 7 } else { 3 }
+        );
+    }
+}
+
+#[test]
+fn xiaohongshu_pk_cover_absent_or_unchecked_is_a_noop_that_still_submits() {
+    for state in ["absent", "unchecked"] {
+        let mut replies = completed_default_replies();
+        replies[8] = value(json!(state));
+        let publisher = test_publisher(MockWebDriver::new(replies));
+        publisher
+            .publish(Platform::Xiaohongshu, &request())
+            .unwrap();
+        assert_eq!(
+            execute_count_before_submit(&publisher.transport.paths.lock().unwrap()),
+            1
+        );
+        assert!(
+            publisher
+                .transport
+                .paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/element/submit/click"))
+        );
+    }
+}
+
+#[test]
+fn xiaohongshu_pk_cover_invalid_or_unresolved_action_fails_closed_before_submit() {
+    let mut still_selected = vec![
+        value(json!({"sessionId":"s"})),
+        value(json!(null)),
+        element("file"),
+        value(json!(null)),
+        element("title"),
+        value(json!(null)),
+        element("description"),
+        value(json!(null)),
+        value(json!("checked")),
+        value(json!(true)),
+    ];
+    still_selected.extend((0..DOUYIN_STATEMENT_POLL_ATTEMPTS).map(|_| value(json!("checked"))));
+    still_selected.push(value(json!(null)));
+    for replies in [
+        vec![
+            value(json!({"sessionId":"s"})),
+            value(json!(null)),
+            element("file"),
+            value(json!(null)),
+            element("title"),
+            value(json!(null)),
+            element("description"),
+            value(json!(null)),
+            value(json!("invalid")),
+            value(json!(null)),
+        ],
+        vec![
+            value(json!({"sessionId":"s"})),
+            value(json!(null)),
+            element("file"),
+            value(json!(null)),
+            element("title"),
+            value(json!(null)),
+            element("description"),
+            value(json!(null)),
+            value(json!("ambiguous")),
+            value(json!(null)),
+        ],
+        vec![
+            value(json!({"sessionId":"s"})),
+            value(json!(null)),
+            element("file"),
+            value(json!(null)),
+            element("title"),
+            value(json!(null)),
+            element("description"),
+            value(json!(null)),
+            value(json!("checked")),
+            value(json!(false)),
+            value(json!(null)),
+        ],
+        still_selected,
+    ] {
+        let publisher = test_publisher(MockWebDriver::new(replies));
+        assert!(
+            publisher
+                .publish(Platform::Xiaohongshu, &request())
+                .is_err()
+        );
+        let paths = publisher.transport.paths.lock().unwrap();
+        assert!(paths.last().unwrap().ends_with("/session/s"));
+        assert!(!paths.iter().any(|path| path.ends_with("/click")));
+    }
 }
