@@ -51,9 +51,18 @@ impl<T: WebDriverTransport> PublicationExecutor for WebDriverPublisher<T> {
                 {
                     self.input(&session, selectors, short_title)?;
                 }
-                let description = Self::description(platform, request);
+                let description = if platform == Platform::Bilibili {
+                    // Bilibili receives tags through its chip editor below;
+                    // keep only the location in its free-form description.
+                    request.address.clone().unwrap_or_default()
+                } else {
+                    Self::description(platform, request)
+                };
                 if !description.is_empty() {
                     self.input(&session, profile.description, &description)?;
+                }
+                if platform == Platform::Bilibili {
+                    self.input_bilibili_tags(&session, request)?;
                 }
             }
             if let Some(product_id) = wechat_product.as_deref() {

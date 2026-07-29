@@ -2,9 +2,10 @@ use serde_json::json;
 
 use super::{WebDriverPublisher, WebDriverTransport};
 use crate::profiles::{
-    BILIBILI_UPLOAD_READY_POLL_ATTEMPTS, BILIBILI_UPLOAD_READY_POLL_INTERVAL,
-    BILIBILI_UPLOAD_READY_STATE_SCRIPT,
+    BILIBILI_TAG_COMMITTED_SCRIPT, BILIBILI_TAG_SUBMIT_SCRIPT, BILIBILI_UPLOAD_READY_POLL_ATTEMPTS,
+    BILIBILI_UPLOAD_READY_POLL_INTERVAL, BILIBILI_UPLOAD_READY_STATE_SCRIPT,
 };
+use matrixpost_core::{Platform, PublishRequest};
 
 impl<T: WebDriverTransport> WebDriverPublisher<T> {
     fn bilibili_upload_poll_interval() -> std::time::Duration {
@@ -42,5 +43,29 @@ impl<T: WebDriverTransport> WebDriverPublisher<T> {
             }
         }
         Err("Bilibili upload processing did not become ready before its deadline".into())
+    }
+
+    pub(super) fn input_bilibili_tags(
+        &self,
+        session: &str,
+        request: &PublishRequest,
+    ) -> Result<(), String> {
+        let tags = request
+            .overrides
+            .iter()
+            .find(|item| item.platform == Platform::Bilibili)
+            .and_then(|item| item.tags.as_deref())
+            .unwrap_or(&request.tags);
+        for tag in tags {
+            let tag = tag.trim();
+            if tag.is_empty() {
+                return Err("Bilibili tags must not be empty".into());
+            }
+            if !self.execute_bool(session, BILIBILI_TAG_SUBMIT_SCRIPT, json!([tag]))? {
+                return Err("Bilibili tag input was unavailable or disabled".into());
+            }
+            self.wait_for_statement_action(session, BILIBILI_TAG_COMMITTED_SCRIPT, json!([]))?;
+        }
+        Ok(())
     }
 }
