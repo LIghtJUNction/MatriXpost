@@ -34,6 +34,9 @@ pub(crate) enum Command {
     Login {
         #[arg(short, long)]
         platform: String,
+        /// Render a local runner QR code in this terminal (Douyin and WeChat Channels only).
+        #[arg(long)]
+        terminal_qr: bool,
     },
     Publish(PublishArgs),
     #[command(name = "publish-article")]

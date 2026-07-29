@@ -1,4 +1,13 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -15,7 +24,10 @@ use matrixpost_core::{
     PROVIDER_RUNNER_PROTOCOL_VERSION, Platform, ProviderRunnerRequest, ProviderRunnerResponse,
     PublishRequest, REVIEW_STATUS_RUNNER_PROTOCOL_VERSION, RemoteMediaRequest, RemoteMediaStager,
     ReviewStatus, ReviewStatusRunnerRequest, ReviewStatusRunnerResponse, StagedMedia,
+    TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION, TerminalQrLoginCancelRequest,
+    TerminalQrLoginRefreshRequest, TerminalQrLoginRunnerRequest, TerminalQrLoginRunnerResponse,
 };
+use rand::{Rng, distr::Alphanumeric};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -57,12 +69,268 @@ impl RemoteMediaSupport {
 pub(crate) struct RunnerService {
     pub(crate) executor: Option<Arc<dyn PublicationExecutor>>,
     pub(crate) login_executor: Option<Arc<dyn LoginNavigationExecutor>>,
+    pub(crate) terminal_qr_login_executor: Option<Arc<dyn TerminalQrLoginExecutor>>,
+    pub(crate) terminal_qr_attempts: Arc<TerminalQrAttempts>,
     pub(crate) account_status_executor: Option<Arc<dyn AccountStatusExecutor>>,
     pub(crate) review_status_executor: Option<Arc<dyn ReviewStatusExecutor>>,
     pub(crate) article_executor: Option<Arc<dyn ArticlePublicationExecutor>>,
     pub(crate) remote_media: Option<RemoteMediaSupport>,
     pub(crate) browser_debugger_address: Option<SocketAddr>,
     pub(crate) debugger_probe: Arc<dyn BrowserDebuggerProbe>,
+}
+
+const TERMINAL_QR_ATTEMPT_LIFETIME: Duration = Duration::from_secs(15 * 60);
+const TERMINAL_QR_MAX_ACTIVE_ATTEMPTS: usize = 4;
+
+pub(crate) struct TerminalQrAttempts {
+    reserved_slots: AtomicU64,
+    lifetime: Duration,
+    attempts: Mutex<HashMap<String, TerminalQrAttemptRecord>>,
+}
+
+struct TerminalQrAttemptRecord {
+    platform: Platform,
+    created_at: Instant,
+    attempt: Box<dyn TerminalQrLoginAttempt>,
+}
+
+impl TerminalQrAttempts {
+    pub(crate) fn new() -> Self {
+        Self::with_lifetime(TERMINAL_QR_ATTEMPT_LIFETIME)
+    }
+
+    pub(crate) fn with_lifetime(lifetime: Duration) -> Self {
+        Self {
+            reserved_slots: AtomicU64::new(0),
+            lifetime,
+            attempts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn reserve_slot(&self) -> bool {
+        let mut slots = self.reserved_slots.load(Ordering::Acquire);
+        loop {
+            if slots >= TERMINAL_QR_MAX_ACTIVE_ATTEMPTS as u64 {
+                return false;
+            }
+            match self.reserved_slots.compare_exchange_weak(
+                slots,
+                slots + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => slots = current,
+            }
+        }
+    }
+
+    fn release_slot(&self) {
+        let _ = self
+            .reserved_slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
+                slots.checked_sub(1)
+            });
+    }
+
+    fn remove_expired(&self) {
+        let expired = {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .expect("terminal QR attempt lock poisoned");
+            let now = Instant::now();
+            let tokens = attempts
+                .iter()
+                .filter(|(_, record)| now.duration_since(record.created_at) >= self.lifetime)
+                .map(|(token, _)| token.clone())
+                .collect::<Vec<_>>();
+            tokens
+                .into_iter()
+                .filter_map(|token| attempts.remove(&token))
+                .collect::<Vec<_>>()
+        };
+        for mut record in expired {
+            let _ = record.attempt.close();
+            self.release_slot();
+        }
+    }
+
+    fn schedule_expiry(self: Arc<Self>, token: String) {
+        tokio::spawn(async move {
+            tokio::time::sleep(self.lifetime).await;
+            let expired = {
+                let mut attempts = self
+                    .attempts
+                    .lock()
+                    .expect("terminal QR attempt lock poisoned");
+                match attempts.get(&token) {
+                    Some(record) if record.created_at.elapsed() >= self.lifetime => {
+                        attempts.remove(&token)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(mut record) = expired {
+                let _ = record.attempt.close();
+                self.release_slot();
+            }
+        });
+    }
+
+    pub(crate) fn start(
+        &self,
+        executor: Arc<dyn TerminalQrLoginExecutor>,
+        platform: Platform,
+    ) -> TerminalQrLoginRunnerResponse {
+        self.remove_expired();
+        if !self.reserve_slot() {
+            return terminal_qr_rejected(platform);
+        }
+        let mut attempt = match executor.start_terminal_qr_login(platform) {
+            Ok(attempt) => attempt,
+            Err(_) => {
+                self.release_slot();
+                return terminal_qr_rejected(platform);
+            }
+        };
+        if attempt.platform() != platform {
+            let _ = attempt.close();
+            self.release_slot();
+            return terminal_qr_rejected(platform);
+        }
+        let png_base64 = match attempt.capture_qr_png_base64() {
+            Ok(png_base64) => png_base64,
+            Err(_) => {
+                let _ = attempt.close();
+                self.release_slot();
+                return terminal_qr_rejected(platform);
+            }
+        };
+        let token = match self.attempts.lock() {
+            Ok(mut attempts) => {
+                let token = terminal_qr_attempt_token(&attempts);
+                attempts.insert(
+                    token.clone(),
+                    TerminalQrAttemptRecord {
+                        platform,
+                        created_at: Instant::now(),
+                        attempt,
+                    },
+                );
+                token
+            }
+            Err(_) => {
+                let _ = attempt.close();
+                self.release_slot();
+                return terminal_qr_rejected(platform);
+            }
+        };
+        TerminalQrLoginRunnerResponse::QrAvailable {
+            version: TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION,
+            platform,
+            attempt_token: token,
+            png_base64,
+        }
+    }
+
+    fn refresh(&self, platform: Platform, token: &str) -> TerminalQrLoginRunnerResponse {
+        let mut expired = None;
+        let response = {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .expect("terminal QR attempt lock poisoned");
+            let Some(record) = attempts.get(token) else {
+                return terminal_qr_rejected(platform);
+            };
+            if record.platform != platform {
+                return terminal_qr_rejected(platform);
+            }
+            let is_expired = record.created_at.elapsed() >= self.lifetime;
+            if is_expired {
+                expired = attempts.remove(token);
+                TerminalQrLoginRunnerResponse::TimedOut {
+                    version: TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION,
+                    platform,
+                }
+            } else {
+                let capture = attempts
+                    .get_mut(token)
+                    .expect("terminal QR attempt disappeared while locked")
+                    .attempt
+                    .capture_qr_png_base64();
+                match capture {
+                    Ok(png_base64) => TerminalQrLoginRunnerResponse::QrAvailable {
+                        version: TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION,
+                        platform,
+                        attempt_token: token.to_owned(),
+                        png_base64,
+                    },
+                    Err(_) => {
+                        expired = attempts.remove(token);
+                        terminal_qr_rejected(platform)
+                    }
+                }
+            }
+        };
+        if let Some(mut record) = expired {
+            let _ = record.attempt.close();
+            self.release_slot();
+        }
+        response
+    }
+
+    pub(crate) fn cancel(&self, platform: Platform, token: &str) -> TerminalQrLoginRunnerResponse {
+        let record = {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .expect("terminal QR attempt lock poisoned");
+            match attempts.get(token) {
+                Some(record) if record.platform == platform => attempts.remove(token),
+                _ => None,
+            }
+        };
+        let Some(mut record) = record else {
+            return terminal_qr_rejected(platform);
+        };
+        let closed = record.attempt.close().is_ok();
+        self.release_slot();
+        if !closed {
+            return terminal_qr_rejected(platform);
+        }
+        TerminalQrLoginRunnerResponse::Cancelled {
+            version: TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION,
+            platform,
+        }
+    }
+}
+
+fn terminal_qr_attempt_token(attempts: &HashMap<String, TerminalQrAttemptRecord>) -> String {
+    loop {
+        let token = rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect::<String>();
+        if !attempts.contains_key(&token) {
+            return token;
+        }
+    }
+}
+
+impl Default for TerminalQrAttempts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn terminal_qr_rejected(platform: Platform) -> TerminalQrLoginRunnerResponse {
+    TerminalQrLoginRunnerResponse::Rejected {
+        version: TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION,
+        platform,
+    }
 }
 
 pub(crate) trait BrowserDebuggerProbe: Send + Sync {
@@ -302,6 +570,77 @@ pub(crate) async fn login(
     (StatusCode::OK, Json(response))
 }
 
+pub(crate) async fn terminal_qr_login(
+    State(state): State<Arc<RunnerService>>,
+    Json(body): Json<TerminalQrLoginRunnerRequest>,
+) -> impl IntoResponse {
+    if !body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(terminal_qr_rejected(body.platform)),
+        );
+    }
+    let response = match &state.terminal_qr_login_executor {
+        Some(executor) => state
+            .terminal_qr_attempts
+            .start(Arc::clone(executor), body.platform),
+        None => TerminalQrLoginRunnerResponse::Unavailable {
+            version: TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION,
+            platform: body.platform,
+        },
+    };
+    if let TerminalQrLoginRunnerResponse::QrAvailable { attempt_token, .. } = &response {
+        Arc::clone(&state.terminal_qr_attempts).schedule_expiry(attempt_token.clone());
+    }
+    (StatusCode::OK, Json(response))
+}
+
+pub(crate) async fn refresh_terminal_qr_login(
+    State(state): State<Arc<RunnerService>>,
+    Json(body): Json<TerminalQrLoginRefreshRequest>,
+) -> impl IntoResponse {
+    if !body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(terminal_qr_rejected(body.platform)),
+        );
+    }
+    let response = if state.terminal_qr_login_executor.is_some() {
+        state
+            .terminal_qr_attempts
+            .refresh(body.platform, &body.attempt_token)
+    } else {
+        TerminalQrLoginRunnerResponse::Unavailable {
+            version: TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION,
+            platform: body.platform,
+        }
+    };
+    (StatusCode::OK, Json(response))
+}
+
+pub(crate) async fn cancel_terminal_qr_login(
+    State(state): State<Arc<RunnerService>>,
+    Json(body): Json<TerminalQrLoginCancelRequest>,
+) -> impl IntoResponse {
+    if !body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(terminal_qr_rejected(body.platform)),
+        );
+    }
+    let response = if state.terminal_qr_login_executor.is_some() {
+        state
+            .terminal_qr_attempts
+            .cancel(body.platform, &body.attempt_token)
+    } else {
+        TerminalQrLoginRunnerResponse::Unavailable {
+            version: TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION,
+            platform: body.platform,
+        }
+    };
+    (StatusCode::OK, Json(response))
+}
+
 pub(crate) async fn account_status(
     State(state): State<Arc<RunnerService>>,
     Json(body): Json<AccountStatusRunnerRequest>,
@@ -391,6 +730,15 @@ pub(crate) fn app(service: Arc<RunnerService>) -> Router {
         .route("/v1/publish", post(publish))
         .route("/v1/publish-article", post(publish_article))
         .route("/v1/login", post(login))
+        .route("/v1/login/terminal-qr", post(terminal_qr_login))
+        .route(
+            "/v1/login/terminal-qr/refresh",
+            post(refresh_terminal_qr_login),
+        )
+        .route(
+            "/v1/login/terminal-qr/cancel",
+            post(cancel_terminal_qr_login),
+        )
         .route("/v1/account-status", post(account_status))
         .route("/v1/review-status", post(review_status))
         .with_state(service)

@@ -17,6 +17,7 @@ use crate::{
         accounts_with_query_readiness, article_runner, dispatch_fanqie_review_status,
         dispatch_manual_login, provider_registry, provider_runners,
     },
+    terminal_qr::dispatch_terminal_qr_login,
 };
 
 fn open(path: PathBuf) -> Result<SqliteRepository, String> {
@@ -93,7 +94,11 @@ pub(crate) fn run() -> ExitCode {
         Err(error) => return emit(2, serde_json::Value::Null, Some(&error)),
     };
     match cli.command {
-        Command::Login { platform } => match Platform::from_str(&platform) {
+        Command::Login {
+            platform,
+            terminal_qr,
+        } => match Platform::from_str(&platform) {
+            Ok(value) if terminal_qr => dispatch_terminal_qr_login(&runners, value),
             Ok(value) => dispatch_manual_login(&runners, value),
             Err(error) => emit(2, serde_json::Value::Null, Some(&error.to_string())),
         },

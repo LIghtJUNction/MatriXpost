@@ -18,9 +18,11 @@ mod bilibili;
 mod douyin;
 mod fanqie;
 mod kuaishou;
+mod terminal_qr;
 mod toutiao;
 mod wechat;
 mod xiaohongshu;
+pub(crate) use terminal_qr::{TerminalQrLoginAttempt, TerminalQrLoginExecutor};
 pub(crate) trait WebDriverTransport: Send + Sync {
     fn request(&self, method: &str, path: &str, body: Value) -> Result<Value, String>;
 }
@@ -35,10 +37,22 @@ impl WebDriverTransport for HttpWebDriver {
             .timeout(Duration::from_secs(45))
             .build();
         let request = match method {
+            "GET" => agent.get(&endpoint),
             "POST" => agent.post(&endpoint),
             "DELETE" => agent.delete(&endpoint),
             _ => return Err("unsupported WebDriver method".into()),
         };
+        if method == "GET" {
+            return request
+                .call()
+                .map_err(|_| "WebDriver request failed".to_owned())?
+                .into_string()
+                .map_err(|_| "WebDriver response was not valid JSON".to_owned())
+                .and_then(|body| {
+                    serde_json::from_str(&body)
+                        .map_err(|_| "WebDriver response was not valid JSON".to_owned())
+                });
+        }
         let body = serde_json::to_string(&body)
             .map_err(|_| "WebDriver request could not be serialized".to_owned())?;
         request

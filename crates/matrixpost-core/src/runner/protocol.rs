@@ -28,6 +28,27 @@ pub const PROVIDER_RUNNER_PROTOCOL_VERSION: u16 = 1;
 /// a claim that a user has completed login.
 pub const LOGIN_RUNNER_PROTOCOL_VERSION: u16 = 1;
 
+/// Version of the credential-free terminal QR login protocol.
+///
+/// This protocol is intentionally separate from [`LoginRunnerRequest`]. It
+/// can expose QR image pixels for a user to render in a terminal, but never
+/// carries or reports browser state, credentials, routes, or login success.
+pub const TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION: u16 = 1;
+
+/// Largest opaque attempt token accepted from a terminal QR runner.
+pub const TERMINAL_QR_LOGIN_ATTEMPT_TOKEN_MAX_BYTES: usize = 128;
+
+/// Largest base64-encoded PNG accepted from a terminal QR runner.
+///
+/// QR codes are small; this cap keeps a compromised loopback runner from
+/// making a CLI allocate an unbounded response while still leaving generous
+/// room for lossless PNG encoding.
+pub const TERMINAL_QR_LOGIN_PNG_BASE64_MAX_BYTES: usize = 1_048_576;
+
+/// Largest complete JSON response accepted from a terminal QR runner.
+pub const TERMINAL_QR_LOGIN_RESPONSE_MAX_BYTES: usize =
+    TERMINAL_QR_LOGIN_PNG_BASE64_MAX_BYTES + 4_096;
+
 /// Version of the credential-free local account-readiness protocol.
 pub const ACCOUNT_STATUS_RUNNER_PROTOCOL_VERSION: u16 = 1;
 
@@ -195,6 +216,268 @@ impl AccountStatusRunnerResponse {
 pub struct LoginRunnerRequest {
     pub version: u16,
     pub platform: Platform,
+}
+
+/// Minimal request for a local terminal QR login attempt.
+///
+/// Only Douyin and WeChat Channels are supported. The request does not carry
+/// a token because any attempt association stays inside the local runner and
+/// its loopback client boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalQrLoginRunnerRequest {
+    pub version: u16,
+    pub platform: Platform,
+}
+
+impl TerminalQrLoginRunnerRequest {
+    /// Checks the version and the two platforms that expose terminal QR flow.
+    pub const fn validate(&self) -> bool {
+        self.version == TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION
+            && matches!(self.platform, Platform::Douyin | Platform::WechatChannels)
+    }
+}
+
+/// Attempt-scoped request for a local terminal QR refresh.
+///
+/// The opaque token is valid only within the runner's local loopback-client
+/// boundary. It never identifies a browser profile or authenticated session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalQrLoginRefreshRequest {
+    pub version: u16,
+    pub platform: Platform,
+    pub attempt_token: String,
+}
+
+impl TerminalQrLoginRefreshRequest {
+    /// Checks the protocol version, supported platform, and opaque token.
+    pub fn validate(&self) -> bool {
+        terminal_qr_request_matches(self.version, self.platform)
+            && terminal_qr_attempt_token_is_valid(&self.attempt_token)
+    }
+}
+
+/// Attempt-scoped request to cancel a local terminal QR attempt.
+///
+/// Cancellation only discards the runner's local attempt state; it never
+/// changes a browser session or a platform login state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalQrLoginCancelRequest {
+    pub version: u16,
+    pub platform: Platform,
+    pub attempt_token: String,
+}
+
+impl TerminalQrLoginCancelRequest {
+    /// Checks the protocol version, supported platform, and opaque token.
+    pub fn validate(&self) -> bool {
+        terminal_qr_request_matches(self.version, self.platform)
+            && terminal_qr_attempt_token_is_valid(&self.attempt_token)
+    }
+}
+
+/// Credential-free state emitted by a terminal QR login runner.
+///
+/// `QrAvailable` contains only the QR PNG pixels and a bounded opaque attempt
+/// token. It never means that login completed. `Pending`, `TimedOut`, and
+/// `Cancelled` likewise report only the local attempt state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TerminalQrLoginRunnerResponse {
+    QrAvailable {
+        version: u16,
+        platform: Platform,
+        attempt_token: String,
+        png_base64: String,
+    },
+    Pending {
+        version: u16,
+        platform: Platform,
+        attempt_token: String,
+    },
+    TimedOut {
+        version: u16,
+        platform: Platform,
+    },
+    Cancelled {
+        version: u16,
+        platform: Platform,
+    },
+    Unavailable {
+        version: u16,
+        platform: Platform,
+    },
+    Rejected {
+        version: u16,
+        platform: Platform,
+    },
+}
+
+/// Validated local state for a terminal QR login attempt.
+///
+/// No variant claims that a browser session exists or that a user completed
+/// login. Callers must use a separate, credential-free readiness check after
+/// the user has acted on the QR code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalQrLoginOutcome {
+    QrAvailable {
+        attempt_token: String,
+        png_base64: String,
+    },
+    Pending {
+        attempt_token: String,
+    },
+    TimedOut,
+    Cancelled,
+    Unavailable,
+    Rejected,
+}
+
+impl TerminalQrLoginRunnerResponse {
+    pub(crate) fn into_terminal_qr_login(
+        self,
+        expected_platform: Platform,
+    ) -> Option<TerminalQrLoginOutcome> {
+        match self {
+            Self::QrAvailable {
+                version,
+                platform,
+                attempt_token,
+                png_base64,
+            } if terminal_qr_response_matches(version, platform, expected_platform)
+                && terminal_qr_attempt_token_is_valid(&attempt_token)
+                && terminal_qr_png_base64_is_valid(&png_base64) =>
+            {
+                Some(TerminalQrLoginOutcome::QrAvailable {
+                    attempt_token,
+                    png_base64,
+                })
+            }
+            Self::Pending {
+                version,
+                platform,
+                attempt_token,
+            } if terminal_qr_response_matches(version, platform, expected_platform)
+                && terminal_qr_attempt_token_is_valid(&attempt_token) =>
+            {
+                Some(TerminalQrLoginOutcome::Pending { attempt_token })
+            }
+            Self::TimedOut { version, platform }
+                if terminal_qr_response_matches(version, platform, expected_platform) =>
+            {
+                Some(TerminalQrLoginOutcome::TimedOut)
+            }
+            Self::Cancelled { version, platform }
+                if terminal_qr_response_matches(version, platform, expected_platform) =>
+            {
+                Some(TerminalQrLoginOutcome::Cancelled)
+            }
+            Self::Unavailable { version, platform }
+                if terminal_qr_response_matches(version, platform, expected_platform) =>
+            {
+                Some(TerminalQrLoginOutcome::Unavailable)
+            }
+            Self::Rejected { version, platform }
+                if terminal_qr_response_matches(version, platform, expected_platform) =>
+            {
+                Some(TerminalQrLoginOutcome::Rejected)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn terminal_qr_response_matches(
+    version: u16,
+    platform: Platform,
+    expected_platform: Platform,
+) -> bool {
+    version == TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION
+        && platform == expected_platform
+        && matches!(platform, Platform::Douyin | Platform::WechatChannels)
+}
+
+const fn terminal_qr_request_matches(version: u16, platform: Platform) -> bool {
+    version == TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION
+        && matches!(platform, Platform::Douyin | Platform::WechatChannels)
+}
+
+fn terminal_qr_attempt_token_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= TERMINAL_QR_LOGIN_ATTEMPT_TOKEN_MAX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn terminal_qr_png_base64_is_valid(value: &str) -> bool {
+    const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+
+    if value.len() < 12
+        || value.len() > TERMINAL_QR_LOGIN_PNG_BASE64_MAX_BYTES
+        || !value.len().is_multiple_of(4)
+    {
+        return false;
+    }
+
+    let mut signature = [0_u8; 8];
+    let mut written = 0;
+    let bytes = value.as_bytes();
+    if let Some(first_padding) = bytes.iter().position(|&byte| byte == b'=')
+        && bytes[first_padding..].iter().any(|&byte| byte != b'=')
+    {
+        return false;
+    }
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let Some(a) = base64_value(chunk[0]) else {
+            return false;
+        };
+        let Some(b) = base64_value(chunk[1]) else {
+            return false;
+        };
+        let padding = chunk.iter().skip(2).filter(|&&byte| byte == b'=').count();
+        if padding > 2
+            || (padding > 0 && index + 1 != bytes.len() / 4)
+            || (padding == 2 && chunk[2] != b'=')
+        {
+            return false;
+        }
+        let c = if chunk[2] == b'=' {
+            0
+        } else if let Some(value) = base64_value(chunk[2]) {
+            value
+        } else {
+            return false;
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else if let Some(value) = base64_value(chunk[3]) {
+            value
+        } else {
+            return false;
+        };
+        let decoded = [(a << 2) | (b >> 4), (b << 4) | (c >> 2), (c << 6) | d];
+        for byte in decoded.into_iter().take(3 - padding) {
+            if written < signature.len() {
+                signature[written] = byte;
+                written += 1;
+            }
+        }
+    }
+    written >= PNG_SIGNATURE.len() && signature == PNG_SIGNATURE
+}
+
+const fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
 }
 
 /// Result returned by a local manual-login navigation request.

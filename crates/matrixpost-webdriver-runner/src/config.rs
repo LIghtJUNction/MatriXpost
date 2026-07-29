@@ -35,6 +35,10 @@ struct Args {
     /// user to complete login manually. This never reads or exports login data.
     #[arg(long)]
     allow_login_navigation: bool,
+    /// Permit bounded terminal QR capture from an already-attached local
+    /// browser. The runner returns only QR pixels and never reads login data.
+    #[arg(long)]
+    allow_terminal_qr_login: bool,
     /// Permit temporary attached-browser navigation solely to infer upload-form
     /// readiness. No browser data is read or exported.
     #[arg(long)]
@@ -109,6 +113,17 @@ pub(crate) fn build_login_executor(
     Ok(
         build_opt_in_publisher(endpoint, debugger_address, allow_login_navigation)?
             .map(|publisher| publisher as Arc<dyn LoginNavigationExecutor>),
+    )
+}
+
+pub(crate) fn build_terminal_qr_login_executor(
+    endpoint: Option<Url>,
+    debugger_address: Option<SocketAddr>,
+    allow_terminal_qr_login: bool,
+) -> Result<Option<Arc<dyn TerminalQrLoginExecutor>>, String> {
+    Ok(
+        build_opt_in_publisher(endpoint, debugger_address, allow_terminal_qr_login)?
+            .map(|publisher| publisher as Arc<dyn TerminalQrLoginExecutor>),
     )
 }
 
@@ -191,6 +206,17 @@ pub(crate) async fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let terminal_qr_login_executor = match build_terminal_qr_login_executor(
+        endpoint.clone(),
+        args.browser_debugger_address,
+        args.allow_terminal_qr_login,
+    ) {
+        Ok(executor) => executor,
+        Err(error) => {
+            eprintln!("matrixpost-webdriver-runner configuration error: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let account_status_executor = match build_account_status_executor(
         endpoint.clone(),
         args.browser_debugger_address,
@@ -223,6 +249,8 @@ pub(crate) async fn run() -> ExitCode {
     let service = Arc::new(RunnerService {
         executor,
         login_executor,
+        terminal_qr_login_executor,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
         account_status_executor,
         review_status_executor,
         article_executor,

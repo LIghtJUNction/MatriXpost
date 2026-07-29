@@ -7,6 +7,7 @@ mod lifecycle;
 mod output;
 mod query;
 mod runners;
+mod terminal_qr;
 
 use std::process::ExitCode;
 

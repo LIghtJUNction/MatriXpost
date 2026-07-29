@@ -1,9 +1,9 @@
 use crate::{
     profiles::{AcknowledgementPolicy, ELEMENT_KEY},
-    service::{BrowserDebuggerProbe, RunnerService, app},
+    service::{BrowserDebuggerProbe, RunnerService, TerminalQrAttempts, app},
     webdriver::{
         ArticlePublicationExecutor, LoginNavigationExecutor, PublicationExecutor,
-        WebDriverPublisher, WebDriverTransport,
+        TerminalQrLoginAttempt, TerminalQrLoginExecutor, WebDriverPublisher, WebDriverTransport,
     },
 };
 use axum::{
@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::{
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -73,6 +73,7 @@ pub(crate) const PROFILE_FIXTURES: &[ProfileFixture] = &[
 
 pub(crate) struct MockWebDriver {
     pub(crate) replies: Mutex<VecDeque<Result<Value, String>>>,
+    pub(crate) methods: Mutex<Vec<String>>,
     pub(crate) paths: Mutex<Vec<String>>,
     pub(crate) bodies: Mutex<Vec<Value>>,
 }
@@ -80,13 +81,15 @@ impl MockWebDriver {
     pub(crate) fn new(replies: Vec<Result<Value, String>>) -> Self {
         Self {
             replies: Mutex::new(replies.into()),
+            methods: Mutex::new(Vec::new()),
             paths: Mutex::new(Vec::new()),
             bodies: Mutex::new(Vec::new()),
         }
     }
 }
 impl WebDriverTransport for MockWebDriver {
-    fn request(&self, _: &str, path: &str, body: Value) -> Result<Value, String> {
+    fn request(&self, method: &str, path: &str, body: Value) -> Result<Value, String> {
+        self.methods.lock().unwrap().push(method.into());
         self.paths.lock().unwrap().push(path.into());
         self.bodies.lock().unwrap().push(body);
         self.replies
@@ -172,6 +175,8 @@ pub(crate) fn runner_service(
     RunnerService {
         executor,
         login_executor: None,
+        terminal_qr_login_executor: None,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
         account_status_executor: None,
         review_status_executor: None,
         article_executor,
@@ -187,6 +192,8 @@ pub(crate) fn runner_service_with_login(
     RunnerService {
         executor: None,
         login_executor,
+        terminal_qr_login_executor: None,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
         account_status_executor: None,
         review_status_executor: None,
         article_executor: None,
@@ -194,6 +201,115 @@ pub(crate) fn runner_service_with_login(
         browser_debugger_address: None,
         debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
     }
+}
+
+pub(crate) struct TestTerminalQrExecutor {
+    pub(crate) closes: Arc<AtomicU64>,
+    pub(crate) capture_fails: bool,
+}
+
+pub(crate) struct BlockingTerminalQrExecutor {
+    pub(crate) starts: AtomicU64,
+    pub(crate) closes: Arc<AtomicU64>,
+    barrier: Barrier,
+}
+
+impl BlockingTerminalQrExecutor {
+    pub(crate) fn new(expected_starts: usize) -> Self {
+        Self {
+            starts: AtomicU64::new(0),
+            closes: Arc::new(AtomicU64::new(0)),
+            barrier: Barrier::new(expected_starts),
+        }
+    }
+}
+
+impl TestTerminalQrExecutor {
+    pub(crate) fn available() -> Self {
+        Self {
+            closes: Arc::new(AtomicU64::new(0)),
+            capture_fails: false,
+        }
+    }
+}
+
+struct TestTerminalQrAttempt {
+    platform: Platform,
+    closes: Arc<AtomicU64>,
+    capture_fails: bool,
+}
+
+impl TerminalQrLoginAttempt for TestTerminalQrAttempt {
+    fn platform(&self) -> Platform {
+        self.platform
+    }
+
+    fn capture_qr_png_base64(&mut self) -> Result<String, String> {
+        if self.capture_fails {
+            Err("capture failed".into())
+        } else {
+            Ok("iVBORw0KGgo=".into())
+        }
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        self.closes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl TerminalQrLoginExecutor for TestTerminalQrExecutor {
+    fn start_terminal_qr_login(
+        self: Arc<Self>,
+        platform: Platform,
+    ) -> Result<Box<dyn TerminalQrLoginAttempt>, String> {
+        Ok(Box::new(TestTerminalQrAttempt {
+            platform,
+            closes: Arc::clone(&self.closes),
+            capture_fails: self.capture_fails,
+        }))
+    }
+}
+
+impl TerminalQrLoginExecutor for BlockingTerminalQrExecutor {
+    fn start_terminal_qr_login(
+        self: Arc<Self>,
+        platform: Platform,
+    ) -> Result<Box<dyn TerminalQrLoginAttempt>, String> {
+        self.starts.fetch_add(1, Ordering::Relaxed);
+        self.barrier.wait();
+        Ok(Box::new(TestTerminalQrAttempt {
+            platform,
+            closes: Arc::clone(&self.closes),
+            capture_fails: false,
+        }))
+    }
+}
+
+pub(crate) fn runner_service_with_terminal_qr(
+    terminal_qr_login_executor: Option<Arc<dyn TerminalQrLoginExecutor>>,
+) -> RunnerService {
+    RunnerService {
+        executor: None,
+        login_executor: None,
+        terminal_qr_login_executor,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
+        account_status_executor: None,
+        review_status_executor: None,
+        article_executor: None,
+        remote_media: None,
+        browser_debugger_address: None,
+        debugger_probe: Arc::new(StaticBrowserDebuggerProbe(false)),
+    }
+}
+
+pub(crate) fn runner_service_with_terminal_qr_attempts(
+    terminal_qr_login_executor: Option<Arc<dyn TerminalQrLoginExecutor>>,
+    terminal_qr_attempts: Arc<TerminalQrAttempts>,
+) -> RunnerService {
+    let mut service = runner_service_with_terminal_qr(terminal_qr_login_executor);
+    service.terminal_qr_attempts = terminal_qr_attempts;
+    service
 }
 
 pub(crate) fn runner_service_with_probe(
@@ -204,6 +320,8 @@ pub(crate) fn runner_service_with_probe(
     RunnerService {
         executor,
         login_executor: None,
+        terminal_qr_login_executor: None,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
         account_status_executor: None,
         review_status_executor: None,
         article_executor: None,

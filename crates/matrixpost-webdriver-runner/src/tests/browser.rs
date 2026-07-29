@@ -592,3 +592,33 @@ fn fanqie_review_status_classifier_is_plain_executable_javascript() {
         );
     }
 }
+
+#[test]
+fn terminal_qr_capture_uses_only_element_screenshot_and_closes_on_request() {
+    let publisher = Arc::new(test_publisher(MockWebDriver::new(vec![
+        value(json!({"sessionId":"terminal-qr"})),
+        value(json!(null)),
+        value(json!([{ELEMENT_KEY:"qr"}])),
+        value(json!("iVBORw0KGgo=")),
+        value(json!(null)),
+    ])));
+    let mut attempt = Arc::clone(&publisher)
+        .start_terminal_qr_login(Platform::Douyin)
+        .unwrap();
+    assert_eq!(attempt.platform(), Platform::Douyin);
+    attempt.close().unwrap();
+    let paths = publisher.transport.paths.lock().unwrap();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("/element/qr/screenshot"))
+    );
+    assert!(!paths.iter().any(|path| path.contains("/cookie")));
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path == "/session/terminal-qr/screenshot")
+    );
+    assert!(paths.last().unwrap().ends_with("/session/terminal-qr"));
+    assert_eq!(publisher.transport.methods.lock().unwrap()[3], "GET");
+}

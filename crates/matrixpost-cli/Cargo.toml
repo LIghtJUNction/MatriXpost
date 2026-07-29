@@ -16,10 +16,12 @@ name = "matrixpost"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 calamine.workspace = true
 clap.workspace = true
 matrixpost-core = { version = "0.4.0", path = "../matrixpost-core" }
+png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 url.workspace = true

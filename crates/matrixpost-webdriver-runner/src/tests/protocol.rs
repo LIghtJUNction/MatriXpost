@@ -12,6 +12,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use tower::ServiceExt;
 use url::Url;
@@ -162,6 +163,197 @@ impl LoginNavigationExecutor for FailingLogin {
     }
 }
 
+#[tokio::test]
+async fn terminal_qr_protocol_is_opt_in_and_rejects_unsupported_platforms() {
+    let unavailable = app(Arc::new(runner_service_with_terminal_qr(None)))
+        .oneshot(
+            Request::post("/v1/login/terminal-qr")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"version": TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION, "platform":"dy"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::OK);
+    assert!(matches!(
+        serde_json::from_slice::<TerminalQrLoginRunnerResponse>(
+            &to_bytes(unavailable.into_body(), usize::MAX).await.unwrap()
+        )
+        .unwrap(),
+        TerminalQrLoginRunnerResponse::Unavailable { .. }
+    ));
+
+    let enabled = app(Arc::new(runner_service_with_terminal_qr(Some(Arc::new(
+        TestTerminalQrExecutor::available(),
+    )))));
+    let unsupported = enabled
+        .oneshot(
+            Request::post("/v1/login/terminal-qr")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"version": TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION, "platform":"fqsp"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn terminal_qr_protocol_refreshes_only_its_opaque_attempt_and_cancels_session() {
+    let executor = Arc::new(TestTerminalQrExecutor::available());
+    let router = app(Arc::new(runner_service_with_terminal_qr(Some(
+        executor.clone(),
+    ))));
+    let start = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/login/terminal-qr")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"version": TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION, "platform":"dy"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let started = serde_json::from_slice::<TerminalQrLoginRunnerResponse>(
+        &to_bytes(start.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let token = match started {
+        TerminalQrLoginRunnerResponse::QrAvailable {
+            attempt_token,
+            png_base64,
+            ..
+        } => {
+            assert_eq!(png_base64, "iVBORw0KGgo=");
+            attempt_token
+        }
+        other => panic!("unexpected terminal QR start response: {other:?}"),
+    };
+    let refresh = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/login/terminal-qr/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"version": TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION, "platform":"dy", "attempt_token":token})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_slice::<TerminalQrLoginRunnerResponse>(
+            &to_bytes(refresh.into_body(), usize::MAX).await.unwrap()
+        )
+        .unwrap(),
+        TerminalQrLoginRunnerResponse::QrAvailable { .. }
+    ));
+    let cancelled = router
+        .oneshot(
+            Request::post("/v1/login/terminal-qr/cancel")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"version": TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION, "platform":"dy", "attempt_token":token})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_slice::<TerminalQrLoginRunnerResponse>(
+            &to_bytes(cancelled.into_body(), usize::MAX).await.unwrap()
+        )
+        .unwrap(),
+        TerminalQrLoginRunnerResponse::Cancelled { .. }
+    ));
+    assert_eq!(executor.closes.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn terminal_qr_idle_attempt_expires_and_closes_without_a_follow_up_request() {
+    let executor = Arc::new(TestTerminalQrExecutor::available());
+    let attempts = Arc::new(TerminalQrAttempts::with_lifetime(Duration::ZERO));
+    let router = app(Arc::new(runner_service_with_terminal_qr_attempts(
+        Some(executor.clone()),
+        attempts,
+    )));
+    let response = router
+        .oneshot(
+            Request::post("/v1/login/terminal-qr")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"version": TERMINAL_QR_LOGIN_RUNNER_PROTOCOL_VERSION, "platform":"dy"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while executor.closes.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("scheduled terminal QR expiry did not close the idle attempt");
+    assert_eq!(executor.closes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn terminal_qr_concurrent_starts_reserve_at_most_four_attempt_slots() {
+    let attempts = Arc::new(TerminalQrAttempts::new());
+    let executor = Arc::new(BlockingTerminalQrExecutor::new(4));
+    let workers = (0..8)
+        .map(|_| {
+            let attempts = Arc::clone(&attempts);
+            let executor: Arc<dyn TerminalQrLoginExecutor> = executor.clone();
+            std::thread::spawn(move || attempts.start(executor, Platform::Douyin))
+        })
+        .collect::<Vec<_>>();
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("terminal QR test worker panicked"))
+        .collect::<Vec<_>>();
+    assert_eq!(executor.starts.load(Ordering::Relaxed), 4);
+    let tokens = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            TerminalQrLoginRunnerResponse::QrAvailable { attempt_token, .. } => {
+                Some(attempt_token.clone())
+            }
+            TerminalQrLoginRunnerResponse::Rejected { .. } => None,
+            other => panic!("unexpected concurrent terminal QR outcome: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tokens.len(), 4);
+    assert_eq!(
+        tokens
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        4
+    );
+    for token in tokens {
+        assert!(matches!(
+            attempts.cancel(Platform::Douyin, &token),
+            TerminalQrLoginRunnerResponse::Cancelled { .. }
+        ));
+    }
+    assert_eq!(executor.closes.load(Ordering::Relaxed), 4);
+}
+
 struct StaticAccountStatus(bool);
 impl AccountStatusExecutor for StaticAccountStatus {
     fn account_readiness(&self, _: Platform) -> Result<bool, String> {
@@ -201,6 +393,8 @@ async fn account_status_endpoint_is_safe_and_reports_unavailable_without_executo
     let ready_service = RunnerService {
         executor: None,
         login_executor: None,
+        terminal_qr_login_executor: None,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
         account_status_executor: Some(Arc::new(StaticAccountStatus(true))),
         review_status_executor: None,
         article_executor: None,
@@ -256,6 +450,8 @@ async fn review_status_endpoint_is_opt_in_safe_and_rejects_non_fanqie_requests()
     let service = RunnerService {
         executor: None,
         login_executor: None,
+        terminal_qr_login_executor: None,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
         account_status_executor: None,
         review_status_executor: Some(Arc::new(StaticReviewStatus(ReviewStatus::Published))),
         article_executor: None,
@@ -423,6 +619,8 @@ async fn remote_media_without_configured_directory_rejects_before_webdriver_sess
     let service = RunnerService {
         executor: Some(executor.clone()),
         login_executor: None,
+        terminal_qr_login_executor: None,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
         account_status_executor: None,
         review_status_executor: None,
         article_executor: None,
@@ -461,6 +659,8 @@ async fn remote_media_http_rejection_never_reflects_url_or_staged_path() {
     let service = RunnerService {
         executor: Some(Arc::new(SentinelFailureExecutor)),
         login_executor: None,
+        terminal_qr_login_executor: None,
+        terminal_qr_attempts: Arc::new(TerminalQrAttempts::new()),
         account_status_executor: None,
         review_status_executor: None,
         article_executor: None,

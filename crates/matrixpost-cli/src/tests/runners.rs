@@ -150,9 +150,14 @@ fn login_parser_selects_only_the_runner_for_its_platform() {
         "dy",
     ])
     .unwrap();
-    let Command::Login { platform } = parsed.command else {
+    let Command::Login {
+        platform,
+        terminal_qr,
+    } = parsed.command
+    else {
         panic!("expected login command")
     };
+    assert!(!terminal_qr);
     let runners = provider_runners(&parsed.provider_runner).unwrap();
     let selected = login_runner(&runners, platform.parse().unwrap()).unwrap();
     assert_eq!(selected.platform, Platform::Douyin);

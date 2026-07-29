@@ -96,6 +96,16 @@ it uses that same attached browser only to open the platform page, then leaves
 the user to complete login manually. It never extracts a profile, cookie, or
 session.
 
+For Douyin (`dy`) and WeChat Channels (`sph`), an explicit terminal QR handoff
+is also available. Start the runner with `--allow-terminal-qr-login`, then add
+`--terminal-qr` to `login`. The CLI refuses non-terminal stdout before asking
+the runner for pixels, validates and renders the QR locally, refreshes a
+bounded runner-owned attempt, and cancels it on timeout or local error. It
+never saves or prints QR PNG/Base64 data, reads browser credentials, or claims
+that scanning completed a login. The runner keeps its temporary WebDriver
+session private, caps concurrent attempts, and closes it on cancellation,
+capture failure, or expiry.
+
 ```bash
 matrixpost-webdriver-runner \
   --bind 127.0.0.1:39001 \
@@ -104,6 +114,13 @@ matrixpost-webdriver-runner \
   --allow-login-navigation
 matrixpost --provider-runner dy=tcp:127.0.0.1:39001 \
   login --platform dy
+matrixpost-webdriver-runner \
+  --bind 127.0.0.1:39003 \
+  --webdriver-endpoint http://127.0.0.1:9515 \
+  --browser-debugger-address 127.0.0.1:9222 \
+  --allow-terminal-qr-login
+matrixpost --provider-runner dy=tcp:127.0.0.1:39003 \
+  login --platform dy --terminal-qr
 matrixpost --provider-runner dy=tcp:127.0.0.1:39001 \
   publish -p dy -f /absolute/path/video.mp4 -t "Title"
 matrixpost-webdriver-runner \

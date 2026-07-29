@@ -342,3 +342,4 @@ fn test_provider(
 include!("publication.rs");
 include!("lifecycle.rs");
 include!("runner.rs");
+include!("terminal_qr.rs");
