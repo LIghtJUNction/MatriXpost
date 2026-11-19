@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "MatriXpost",
+  "version": "0.5.0",
+  "description": "视频与商品的一站式发布工作区。多账号、可恢复队列与 AI 原生接口。",
+  "minimum_chrome_version": "120",
+  "permissions": ["storage", "alarms", "scripting", "activeTab"],
+  "optional_permissions": ["unlimitedStorage"],
+  "optional_host_permissions": ["https://*/*", "http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "打开 MatriXpost" },
+  "options_ui": { "page": "app.html", "open_in_tab": true },
+  "icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self' https: http://127.0.0.1:*; frame-src 'none'"
+  }
+}
