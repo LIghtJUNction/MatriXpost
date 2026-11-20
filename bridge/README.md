@@ -5,7 +5,7 @@ MatriXpost exposes nine MCP tools for preparing content and managing publication
 ## Connect an AI client
 
 1. Load the extension and copy its ID from `chrome://extensions`.
-2. Start the companion with Node.js 22 or later, replacing the placeholders below with the actual extension ID and an absolute path to a new private token file:
+2. Start the companion with Node.js 22 or later, replacing the placeholders below with the actual extension ID and an absolute path to a private token file:
 
    ```sh
    node bridge/cli.mjs serve --extension-id <extension-id> --token-file /absolute/private/path/matrixpost-token
@@ -30,7 +30,7 @@ MatriXpost exposes nine MCP tools for preparing content and managing publication
    }
    ```
 
-Use the same `--port` on `serve` and `mcp` to change the port. MCP can also read `MATRIXPOST_TOKEN` from its process environment. The token file must be a regular file with owner-only permissions on Unix; symlinks are rejected. `serve` creates new token files with mode `0600` and never overwrites existing files. Choose a new token file for a new bridge session. The token is printed once to stderr; MCP stdout contains only JSON-RPC messages.
+Use the same `--port` on `serve` and `mcp` to change the port. MCP can also read `MATRIXPOST_TOKEN` from its process environment. The token file must be a regular file owned by the current user with owner-only permissions on Unix; symlinks are rejected. `serve` creates a missing token file exclusively with mode `0600` and reuses a valid existing file without overwriting it. Restarting with the same file preserves pairing. To rotate the token deliberately, use a new private file and pair again. The token is printed once at startup to stderr; MCP stdout contains only JSON-RPC messages.
 
 ## Tools and outcomes
 
@@ -46,7 +46,7 @@ Use the same `--port` on `serve` and `mcp` to change the port. MCP can also read
 | `jobs_retry` | `jobs.retry` | Retry of an eligible failed job |
 | `jobs_cancel` | `jobs.cancel` | Cancellation of eligible local work |
 
-An AI publication request carries `action: "publish"`; the extension places it in `pending_approval`. A human reviews the exact job in MatriXpost before approving dispatch. `action: "draft"` may create a remote private video or product draft according to the selected adapter, so it is still a write operation. A queue response alone never proves that a platform accepted or published anything.
+An AI publication request carries `action: "publish"`; the extension places it in `awaiting_approval`. A human reviews the exact job in MatriXpost before approving dispatch. `action: "draft"` may create a remote private video or product draft according to the selected adapter, so it is still a write operation. A queue response alone never proves that a platform accepted or published anything.
 
 The bridge exposes no vault, credential, arbitrary HTTP, shell or browser-script tool. Files must already be imported through the extension. Updating an existing draft requires its current `revision`.
 
@@ -58,10 +58,10 @@ Every data request carries `Authorization: Bearer <pairing-token>`. The server b
 | --- | --- | --- |
 | `GET /health` | Paired extension or local client | `{ok, connected, lastPollAt, pending}` |
 | `POST /v1/call` | Local MCP process | `{method, params}` → `{result}` or `{error}` |
-| `GET /v1/poll` | Paired extension | `{requests: [{id, method, params, source: "agent", expiresAt}]}` |
+| `POST /v1/poll` | Paired extension | `{}` → `{requests: [{id, method, params, source: "agent", expiresAt}]}` |
 | `POST /v1/results` | Paired extension | `{id, result}` or `{id, error: {code, message, uncertain?}}` → `{ok: true}` |
 
-Poll once per second while connected and process at most one request from each response. The extension must reject expired requests and dispatch them with a trusted `source: "agent"` context. It must never derive authority from request parameters. Return exactly one result per request. Polling and result submission require the paired extension's Origin header; a local client with the bearer token cannot drain the queue.
+Poll once per second while connected and process at most one request from each response. Polling uses JSON POST because Chromium may omit Origin on a privileged extension GET; POST supplies the browser-generated Origin without synthesizing a forbidden header. The server also accepts legacy GET polling when that request carries the exact extension Origin. The extension must reject expired requests and dispatch them with a trusted `source: "agent"` context. It must never derive authority from request parameters. Return exactly one result per request. Polling and result submission require the paired extension's Origin header; a local client with only the bearer token cannot drain the queue.
 
 Each call waits for at most 24 seconds by default. Requests that expire before polling are removed and will not execute after reconnection. A request delivered before a timeout may already have changed state: the bridge returns `OUTCOME_UNKNOWN` with `uncertain: true`. Inspect drafts and jobs before retrying. The bridge does not redeliver requests or retry platform actions. A late or duplicate result is rejected.
 

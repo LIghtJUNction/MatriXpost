@@ -55,6 +55,7 @@ function platform(id) { return (state.platforms || PLATFORMS).find((item) => ite
 function account(id) { return state.accounts.find((item) => item.id === id); }
 function platformName(id) { return platform(id)?.name || id || '未知平台'; }
 function platformMode(id) { return platform(id)?.mode || 'planned'; }
+function accountMode(item) { return item?.mode === 'browser' ? 'assisted' : platformMode(item?.platform); }
 function statusOf(job) { return job.status || job.state || 'queued'; }
 function prettyError(error) { return error?.message || String(error || '操作未完成，请重试。'); }
 function cleanUrl(value) {
@@ -119,10 +120,11 @@ async function refresh() {
       lastSnapshotError = '';
       $('draft-count').textContent = String(state.drafts.length);
       $('job-count').textContent = String(state.jobs.filter((job) => ['queued', 'scheduled', 'running', 'awaiting_approval'].includes(statusOf(job))).length);
-      $('sidebar-version').textContent = state.version || '0.1.0';
-      $('settings-version').textContent = `版本 ${state.version || '0.1.0'} · 浏览器本地工作区`;
+      $('sidebar-version').textContent = state.version || '0.5.0';
+      $('settings-version').textContent = `版本 ${state.version || '0.5.0'} · 浏览器本地工作区`;
       $('vault-label').textContent = !state.vault.configured ? '设置凭证保险箱' : state.vault.unlocked ? '凭证已解锁' : '凭证已锁定';
       $('vault-open').classList.toggle('unlocked', !!state.vault.unlocked);
+      renderStorageSummary();
       setTheme(state.settings.theme || currentTheme);
       const fingerprint = JSON.stringify(state.accounts) + currentKind;
       if (fingerprint !== accountFingerprint) { accountFingerprint = fingerprint; renderTargets(); }
@@ -258,7 +260,7 @@ function renderTargets() {
   } else {
     $('target-accounts').replaceChildren(...items.map((item) => {
       const input = el('input', { type: 'checkbox', checked: selectedAccounts.has(item.id), 'aria-label': `选择 ${item.label}`, onchange: () => { if (input.checked) selectedAccounts.add(item.id); else selectedAccounts.delete(item.id); renderTargetSummary(); } });
-      const sub = platformMode(item.platform) === 'api' ? (item.hasCredentials ? 'API 独立凭证' : '待添加凭证') : '当前浏览器会话';
+      const sub = accountMode(item) === 'api' ? (item.hasCredentials ? 'API 独立凭证' : '待添加凭证') : '当前浏览器会话';
       return el('label', { class: 'target-account' }, avatar(item.platform), el('span', { class: 'target-account-text' }, el('strong', {}, item.label), el('small', {}, `${platformName(item.platform)} · ${sub}`)), input);
     }));
   }
@@ -375,6 +377,7 @@ function renderJobs() {
   const items = state.jobs.filter((job) => queueFilter === 'all' || (queueFilter === 'active' ? active : queueFilter === 'attention' ? attention : complete).includes(statusOf(job))).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
   $('queue-total').textContent = `${items.length} 个任务`;
   if (!items.length) { $('job-list').replaceChildren(emptyState('queue', state.jobs.length ? '这里还没有任务' : '每一次发布，都有迹可循', state.jobs.length ? '切换筛选查看其他任务。' : '在创作页选好内容和账号，检查计划后开始执行。', state.jobs.length ? null : '去准备内容', () => navigate('compose'))); return; }
+  const reviewStates = new Map([...$('job-list').querySelectorAll('.job-approval-preview')].map((node) => [node.dataset.jobId, { open: node.open, scrollTop: node.querySelector('.job-approval-content')?.scrollTop || 0 }]));
   $('job-list').replaceChildren(...items.map((job) => {
     const status = statusOf(job);
     const targetAccount = account(job.accountId);
@@ -384,14 +387,53 @@ function renderJobs() {
     const invoke = (label, method, className = 'secondary-button') => {
       const node = button(label, className, () => busy(node, async () => { await rpc(method, { id: job.id }); await refresh(); toast(label === '批准发布' ? '已批准此任务，队列将继续执行。' : '任务已更新。'); })); actions.append(node);
     };
-    if (status === 'awaiting_approval') invoke('批准发布', 'jobs.approve', 'primary-button');
     if (job.canRetry === true || (job.canRetry === undefined && ['failed', 'blocked', 'needs_attention'].includes(status))) invoke('重试', 'jobs.retry');
     if (['queued', 'scheduled', 'pending', 'awaiting_approval', 'blocked', 'prepared', 'failed'].includes(status)) invoke('取消', 'jobs.cancel');
     const main = el('div', { class: 'job-main' }, el('div', { class: 'job-title' }, el('h3', {}, job.title || draft?.title || '内容任务'), statePill(jobLabels[status] || status, complete.includes(status) ? 'success' : attention.includes(status) ? (status === 'failed' ? 'error' : 'warning') : '')), el('div', { class: 'job-meta' }, el('span', {}, `${platformName(id)} · ${job.accountLabel || targetAccount?.label || job.account?.label || '账号已移除'}`), el('span', {}, job.action === 'publish' ? '发布 / 上架' : '远端草稿'), el('span', {}, `${date(job.createdAt)} 创建`)));
     if (job.scheduledAt && new Date(job.scheduledAt).getTime() - new Date(job.createdAt).getTime() > 60000) main.append(el('div', { class: 'job-detail' }, `计划时间：${date(job.scheduledAt)}`));
     if (job.error) main.append(el('div', { class: 'job-detail error' }, typeof job.error === 'string' ? job.error : job.error.message || job.error.code || '执行未完成'));
     if (status === 'uncertain') main.append(el('div', { class: 'job-detail' }, '平台可能已收到请求。请先到平台核对结果，避免重复发布。'));
-    if (status === 'awaiting_approval') main.append(el('div', { class: 'job-detail' }, '这项任务由 AI 发起。请核对内容、账号和目标动作后批准。'));
+    if (status === 'awaiting_approval') {
+      main.append(el('div', { class: 'job-detail' }, '这项任务由 AI 发起。以下为创建任务时固定的内容，之后修改草稿不会改变此任务。'));
+      const preview = job.preview;
+      if (preview) {
+        const review = el('details', { class: 'job-approval-preview', open: reviewStates.get(job.id)?.open ?? true, 'data-job-id': job.id }, el('summary', {}, '核对本次发布的完整内容'));
+        const content = el('div', { class: 'job-approval-content', tabindex: 0, 'aria-label': '本次发布的固定内容快照' });
+        const fields = el('dl', { class: 'job-approval-fields' });
+        const add = (name, value) => fields.append(el('dt', {}, name), el('dd', {}, value == null || value === '' ? '未填写' : String(value)));
+        add('目标平台', platformName(id));
+        add('目标账号', job.accountLabel || targetAccount?.label || '账号已移除');
+        add('目标动作', job.action === 'publish' ? (job.kind === 'product' ? '上架商品' : '发布视频') : '保存平台草稿 / 私密视频');
+        add('内容版本', job.draftRevision != null ? `修订 ${job.draftRevision}` : '任务固定快照');
+        add('标题', preview.title || job.title);
+        add('完整描述', preview.description);
+        add('全部标签', (preview.tags || []).join('、') || '无');
+        if (job.kind === 'product') {
+          const product = preview.product || {};
+          add('价格与币种', `${product.price ?? '未填写'} ${product.currency || ''}`.trim());
+          add('库存数量', product.quantity ?? 0);
+          add('SKU', product.sku);
+          add('品牌 / 供应商', product.vendor);
+          add('商品类型', product.productType);
+          add('全部商品图片', (product.images || []).join('\n') || '无');
+          if (id === 'shopify') {
+            add('发布渠道 ID', product.publicationId);
+            add('管理库存', product.trackInventory ? '是' : '否');
+            add('库存地点 ID', product.locationId);
+          }
+        } else {
+          const privacyLabels = { private: '私密', unlisted: '不公开列出', public: '公开' };
+          add('视频可见性', job.action === 'draft' ? '私密（平台草稿）' : privacyLabels[preview.video?.privacy] || preview.video?.privacy || '未指定');
+          add('视频分类 ID', preview.video?.categoryId);
+          add('面向儿童', preview.video?.madeForKids ? '是' : '否');
+          add('本地素材', (preview.assetIds || []).map((assetId) => { const asset = state.assets.find((item) => item.id === assetId); return asset ? `${asset.name} · ${bytes(asset.size)} · ${assetId}` : `素材 ID：${assetId}`; }).join('\n') || '无');
+        }
+        content.append(fields);
+        const approve = button('已核对以上内容，批准发布', 'primary-button', () => busy(approve, async () => { await rpc('jobs.approve', { id: job.id }); await refresh(); toast('已批准此任务，队列将继续执行。'); }));
+        review.append(content, el('div', { class: 'job-approval-actions' }, approve));
+        main.append(review);
+      } else main.append(el('div', { class: 'job-detail error' }, '尚未载入任务的固定内容快照，暂时无法批准。请刷新工作区。'));
+    }
     if (job.result?.status) main.append(el('div', { class: 'job-detail' }, `平台状态：${job.result.status}${job.result.remoteId ? ` · ID ${job.result.remoteId}` : ''}`));
     if (status === 'running' || (status === 'queued' && Number(job.progress) > 0)) main.append(el('div', { class: 'job-detail' }, `执行进度：${Number(job.progress || 0)}%${job.stage ? ` · ${job.stage}` : ''}`));
     const resultUrl = cleanUrl(job.result?.url || job.result?.remoteUrl);
@@ -402,12 +444,13 @@ function renderJobs() {
     }
     return el('article', { class: 'job-card' }, avatar(id), main, actions);
   }));
+  $('job-list').querySelectorAll('.job-approval-preview').forEach((node) => { const previous = reviewStates.get(node.dataset.jobId); if (previous) node.querySelector('.job-approval-content').scrollTop = previous.scrollTop; });
 }
 
 function renderAccounts() {
   if (!state.accounts.length) { $('account-list').replaceChildren(emptyState('accounts', '连接你的第一个账号', '为品牌、店铺或个人频道取一个好认的名字，然后按平台选择授权方式。', '添加账号', () => openAccountDialog())); return; }
   $('account-list').replaceChildren(...state.accounts.map((item) => {
-    const mode = platformMode(item.platform);
+    const mode = accountMode(item);
     const note = mode === 'api' ? (item.hasCredentials ? '已保存加密凭证' : '尚未添加 API 凭证') : '当前浏览器登录状态';
     const remove = button('移除', 'text-button', () => busy(remove, async () => { if (!window.confirm(`移除账号「${item.label}」及其本地凭证？平台账号本身不会被删除。`)) return; await rpc('accounts.remove', { id: item.id }); await refresh(); toast('账号已移除。'); }));
     return el('article', { class: 'account-card' }, el('div', { class: 'card-top' }, avatar(item.platform, true), el('div', {}, el('h3', {}, item.label), el('span', { class: 'account-platform-name' }, platformName(item.platform)))), el('div', { class: 'account-details' }, note, item.endpoint ? el('span', { class: 'muted' }, item.endpoint) : null, item.remoteAccountId ? el('span', { class: 'muted' }, `账号标识：${item.remoteAccountId}`) : null), el('div', { class: 'card-bottom' }, statePill(modeLabels[mode] || mode), button('编辑', 'secondary-button', () => openAccountDialog(item)), remove));
@@ -427,22 +470,23 @@ function fillPlatformSelect(selected) {
 function renderCredentialFields() {
   const selected = platform($('account-platform').value);
   const editing = !!$('account-id').value;
-  const isApi = selected?.mode === 'api';
+  const existing = account($('account-id').value);
+  const isApi = selected?.mode === 'api' && existing?.mode !== 'browser';
   $('account-mode-note').textContent = isApi ? '使用平台官方 API。每个账号使用自己的授权凭证，密钥加密保存在本地保险箱。' : '打开平台创作页并辅助准备内容。账号代表当前浏览器登录状态；普通标签页之间不会隔离账号。';
   $('account-endpoint-field').hidden = !['woocommerce', 'shopify'].includes(selected?.id);
   $('account-endpoint').required = ['woocommerce', 'shopify'].includes(selected?.id);
   $('account-endpoint').placeholder = selected?.id === 'shopify' ? 'https://your-store.myshopify.com' : 'https://your-shop.example.com';
   $('account-remote-field').hidden = !isApi;
-  const fields = selected?.credentialFields || [];
+  const fields = isApi ? selected?.credentialFields || [] : [];
   $('account-credentials').replaceChildren();
   if (!fields.length) return;
-  $('account-credentials').append(el('div', { class: 'credentials-heading' }, el('strong', {}, '平台授权凭证'), el('span', {}, editing ? '留空保留已有凭证' : '可稍后补充')));
+  $('account-credentials').append(el('div', { class: 'credentials-heading' }, el('strong', {}, '平台授权凭证'), !state.vault.unlocked ? button(state.vault.configured ? '解锁保险箱' : '设置保险箱', 'inline-link', openVaultDialog) : el('span', {}, editing ? '留空保留已有凭证' : '可稍后补充')));
   for (const field of fields) {
     const key = field.key || field.name;
     const id = `credential-${key}`;
     $('account-credentials').append(el('div', { class: 'field' }, el('label', { htmlFor: id }, field.label || key), el('input', { id, name: key, type: 'password', autocomplete: 'off', placeholder: field.placeholder || (editing ? '留空以保留已有凭证' : '粘贴平台授权凭证'), 'data-credential': key })));
   }
-  if (!state.vault.unlocked) $('account-credentials').append(el('p', { class: 'field-hint' }, state.vault.configured ? '填写凭证前，请先通过顶部按钮解锁保险箱。也可先保存账号描述。' : '填写凭证前，请先通过顶部按钮设置保险箱。也可先保存账号描述。'));
+  if (!state.vault.unlocked) $('account-credentials').append(el('p', { class: 'field-hint', id: 'account-vault-note' }, state.vault.configured ? '请先解锁保险箱。也可不填写凭证，先保存账号描述。' : '请先设置保险箱。也可不填写凭证，先保存账号描述。'));
 }
 
 function openAccountDialog(item, selectedPlatform) {
@@ -476,15 +520,16 @@ async function saveAccount() {
   $('account-credentials').querySelectorAll('[data-credential]').forEach((input) => { if (input.value.trim()) credentials[input.dataset.credential] = input.value.trim(); });
   if (Object.keys(credentials).length && !state.vault.unlocked) throw new Error('请先设置并解锁凭证保险箱，再添加平台授权。');
   const endpoint = $('account-endpoint-field').hidden ? '' : $('account-endpoint').value.trim();
-  let origins = selected.mode === 'api' ? (selected.hosts || []) : [];
+  const effectiveMode = account(id)?.mode || (selected.mode === 'api' ? 'api' : 'browser');
+  let origins = effectiveMode === 'api' ? (selected.hosts || []) : [];
   if (endpoint) {
     let url;
     try { url = new URL(endpoint); } catch { throw new Error('店铺地址需要是完整的 HTTPS 地址。'); }
     if (url.protocol !== 'https:' || url.username || url.password) throw new Error('店铺地址需要使用 HTTPS，且不能包含用户名或密码。');
-    origins = [`https://${url.hostname}/*`];
+    if (effectiveMode === 'api') origins = [`https://${url.hostname}/*`];
   }
   await requestOrigins(origins);
-  const savedAccount = { ...(id ? { id } : {}), platform: selected.id, label: $('account-label').value.trim(), endpoint, remoteAccountId: $('account-remote').value.trim(), mode: selected.mode === 'api' ? 'api' : 'browser' };
+  const savedAccount = { ...(id ? { id } : {}), platform: selected.id, label: $('account-label').value.trim(), endpoint, remoteAccountId: $('account-remote').value.trim(), mode: effectiveMode };
   await rpc('accounts.save', { account: savedAccount, ...(Object.keys(credentials).length ? { credentials } : {}) });
   $('account-form').reset();
   $('account-dialog').close();
@@ -519,6 +564,7 @@ async function submitVault() {
   $('vault-form').reset();
   $('vault-dialog').close();
   await refresh();
+  if ($('account-vault-note')) $('account-vault-note').textContent = state.vault.unlocked ? '保险箱已解锁，可保存平台授权凭证。' : '保险箱已锁定。保存凭证前请先解锁。';
   toast(state.vault.unlocked ? '凭证保险箱已解锁。' : '凭证保险箱已锁定。');
 }
 
@@ -537,12 +583,14 @@ function renderPlatforms() {
 }
 
 function updateBridge(detail = {}) {
-  currentBridge = { ...currentBridge, ...detail };
+  const previousError = currentBridge.error;
+  currentBridge = { connected: !!detail.connected, url: detail.url || null, error: detail.error || null };
+  currentBridge.active = currentBridge.connected || !!currentBridge.url;
   $('bridge-state').textContent = currentBridge.connected ? '已连接' : detail.error ? '连接已中断' : '未连接';
   $('bridge-state').className = `state-pill ${currentBridge.connected ? 'success' : detail.error ? 'error' : ''}`;
-  $('bridge-disconnect').disabled = !currentBridge.connected;
-  $('bridge-connect').textContent = currentBridge.connected ? '重新配对' : '连接 Agent';
-  if (detail.error) toast(prettyError(detail.error), true);
+  $('bridge-disconnect').disabled = !currentBridge.active;
+  $('bridge-connect').textContent = currentBridge.active ? '重新配对' : '连接 Agent';
+  if (detail.error && detail.error !== previousError) toast(prettyError(detail.error), true);
 }
 
 async function runCommand() {
@@ -577,6 +625,27 @@ async function exportBackup() {
   document.body.append(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
   toast('备份已导出，不包含凭证和视频文件。');
+}
+
+function renderStorageSummary() {
+  const total = state.assets.reduce((sum, asset) => sum + (Number.isFinite(asset.size) && asset.size > 0 ? asset.size : 0), 0);
+  $('asset-storage-summary').textContent = `${state.assets.length} 个文件 · ${bytes(total)}`;
+}
+
+async function readStoragePermission() {
+  if (!globalThis.chrome?.permissions?.contains) return;
+  try {
+    const allowed = await chrome.permissions.contains({ permissions: ['unlimitedStorage'] });
+    $('storage-permission-status').textContent = allowed ? '已允许较大素材存储。实际可用容量仍受设备剩余空间限制。' : '当前为默认存储配额。需要保存较大视频时可手动授权。';
+    $('storage-permission').disabled = allowed;
+  } catch { $('storage-permission-status').textContent = '暂时无法读取存储权限状态。'; }
+}
+
+async function pruneAssets() {
+  const result = await rpc('assets.prune');
+  await refresh();
+  renderStorageSummary();
+  toast(result.removed ? `已清理 ${result.removed} 个未使用素材，释放 ${bytes(result.bytes || 0)}。` : '没有可清理的未使用素材。');
 }
 
 async function importBackup(file) {
@@ -619,13 +688,25 @@ $('account-form').addEventListener('submit', (event) => { event.preventDefault()
 $('vault-form').addEventListener('submit', (event) => { event.preventDefault(); showError('vault-error', ''); busy($('vault-submit'), submitVault, { errorId: 'vault-error' }); });
 $('account-dialog').addEventListener('close', () => { $('account-credentials').querySelectorAll('input').forEach((node) => { node.value = ''; }); });
 $('vault-dialog').addEventListener('close', () => $('vault-form').reset());
-$('settings-open').addEventListener('click', () => { showError('settings-error', ''); $('settings-dialog').showModal(); });
+$('settings-open').addEventListener('click', () => { showError('settings-error', ''); showError('storage-error', ''); renderStorageSummary(); $('settings-dialog').showModal(); readStoragePermission(); });
 document.querySelectorAll('button[data-theme]').forEach((node) => node.addEventListener('click', () => busy(node, async () => { await rpc('settings.save', { settings: { theme: node.dataset.theme } }); setTheme(node.dataset.theme); await refresh(); })));
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (currentTheme === 'system') setTheme('system'); });
 $('backup-export').addEventListener('click', () => busy($('backup-export'), exportBackup, { errorId: 'settings-error' }));
+$('assets-prune').addEventListener('click', () => { showError('storage-error', ''); busy($('assets-prune'), pruneAssets, { errorId: 'storage-error' }); });
+$('storage-permission').addEventListener('click', async () => {
+  showError('storage-error', '');
+  await busy($('storage-permission'), async () => {
+    if (!globalThis.chrome?.permissions?.request) throw new Error('请在已安装的 MatriXpost 扩展中授予存储权限。');
+    // No asynchronous work before this request: retain the explicit button gesture.
+    const allowed = await chrome.permissions.request({ permissions: ['unlimitedStorage'] });
+    $('storage-permission-status').textContent = allowed ? '已允许较大素材存储。实际可用容量仍受设备剩余空间限制。' : '未授予额外存储权限，继续使用默认配额。';
+    toast(allowed ? '已允许较大素材存储。' : '未更改存储权限。');
+  }, { errorId: 'storage-error' });
+  await readStoragePermission();
+});
 $('backup-file').addEventListener('change', async () => { showError('settings-error', ''); try { await importBackup($('backup-file').files[0]); } catch (error) { showError('settings-error', prettyError(error)); } finally { $('backup-file').value = ''; } });
 $('bridge-form').addEventListener('submit', (event) => { event.preventDefault(); busy($('bridge-connect'), async () => { const result = await connectBridge({ url: $('bridge-url').value.trim(), token: $('bridge-token').value.trim() }); updateBridge(result || { connected: true }); $('bridge-token').value = ''; toast('Agent 桥接已连接。'); }); });
-$('bridge-disconnect').addEventListener('click', () => busy($('bridge-disconnect'), async () => { const result = await disconnectBridge(); updateBridge(result || { connected: false }); toast('Agent 桥接已断开。'); }));
+$('bridge-disconnect').addEventListener('click', async () => { await busy($('bridge-disconnect'), async () => { const result = await disconnectBridge(); updateBridge(result || { connected: false }); toast('Agent 桥接已断开。'); }); updateBridge(currentBridge); });
 window.addEventListener('matrixpost:bridge', (event) => updateBridge(event.detail));
 $('ai-methods-load').addEventListener('click', () => busy($('ai-methods-load'), loadMethods));
 $('command-run').addEventListener('click', () => busy($('command-run'), runCommand));

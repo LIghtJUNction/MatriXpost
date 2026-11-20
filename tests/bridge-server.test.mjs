@@ -71,6 +71,18 @@ test('extension-only routes reject local callers even with the pairing token', a
   assert.equal((await request('/v1/results', { method: 'POST', body: { id: 'id', result: {} } })).status, 403);
 });
 
+test('JSON POST polling requires the browser extension origin and returns bounded diagnostics', async (t) => {
+  const events = [];
+  const { request, bridge } = await setup(t, { onEvent: (event) => events.push(event) });
+  assert.equal((await request('/v1/poll', { method: 'POST', body: {} })).status, 403);
+  assert.equal((await request('/v1/poll', { method: 'POST', ext: true, body: { unexpected: true } })).status, 400);
+  const response = await request('/v1/poll', { method: 'POST', ext: true, body: {} });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { requests: [] });
+  assert.ok(events.some((event) => event.route === '/v1/poll' && event.method === 'POST' && event.origin === 'paired-extension' && event.status === 200));
+  assert.ok(!JSON.stringify(events).includes(bridge.token));
+});
+
 test('delivers an authenticated call exactly once and rejects replayed results', async (t) => {
   const { request, enqueue, poll, bridge } = await setup(t);
   const awaiting = enqueue();

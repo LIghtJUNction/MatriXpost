@@ -6,6 +6,16 @@ export async function executeWooCommerce({ draft, account, credentials, action, 
   const key = needCredential(credentials, 'consumerKey');
   const secret = needCredential(credentials, 'consumerSecret');
   const product = draft.product || {};
+  if (checkpoint.promote) {
+    if (action !== 'publish' || !/^[1-9]\d*$/.test(checkpoint.remoteId || '')) fail('INVALID_CHECKPOINT', '远端草稿发布任务缺少有效商品 ID。');
+    const response = await request(`${endpoint}/wp-json/wc/v3/products/${checkpoint.remoteId}`, {
+      method: 'PUT', headers: { Authorization: basicAuth(key, secret), 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'publish' }),
+    }, { fetchImpl, signal });
+    const data = await readJson(response);
+    if (String(data.id) !== checkpoint.remoteId || data.status !== 'publish') fail('PUBLICATION_UNCONFIRMED', '店铺未确认原商品上架，请检查平台后台。', { uncertain: true });
+    const result = { remoteId: checkpoint.remoteId, url: safeLink(data.permalink, `${endpoint}/wp-admin/post.php?post=${data.id}&action=edit`), status: 'published', platformStatus: data.status };
+    return { done: true, checkpoint: { ...checkpoint, result }, result };
+  }
   if (!checkpoint.currencyVerified) {
     const response = await request(`${endpoint}/wp-json/wc/v3/settings/general/woocommerce_currency`, {
       method: 'GET', headers: { Authorization: basicAuth(key, secret) },

@@ -2,6 +2,7 @@ import { needCredential, request, readJson, fail, AdapterError } from './common.
 
 export const YOUTUBE_CHUNK_SIZE = 8 * 1024 * 1024;
 const UPLOAD_URL = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status';
+const VIDEO_URL = 'https://www.googleapis.com/youtube/v3/videos';
 
 export function youtubeSession(value) {
   let url;
@@ -40,6 +41,36 @@ async function finish(response, checkpoint, privacy) {
 export async function executeYouTube({ draft, credentials, action, checkpoint = {}, asset, fetchImpl, signal }) {
   if (checkpoint.result) return { done: true, checkpoint, result: checkpoint.result };
   const accessToken = needCredential(credentials, 'accessToken');
+  if (checkpoint.promote) {
+    if (action !== 'publish' || !/^[A-Za-z0-9_-]{6,64}$/.test(checkpoint.remoteId || '')) fail('INVALID_CHECKPOINT', '已有视频发布任务缺少有效视频 ID。');
+    const headers = { Authorization: `Bearer ${accessToken}` };
+    const currentResponse = await request(`${VIDEO_URL}?part=status&id=${encodeURIComponent(checkpoint.remoteId)}`, { method: 'GET', headers }, { fetchImpl, signal, mutating: false });
+    const currentData = await readJson(currentResponse, { mutating: false });
+    const current = currentData.items?.find((item) => item.id === checkpoint.remoteId);
+    if (!current?.status) fail('VIDEO_NOT_FOUND', '找不到该私密视频，或当前授权无法读取它。请核对账号与 youtube.force-ssl 授权。');
+    if (['failed', 'rejected', 'deleted'].includes(current.status.uploadStatus)) fail('VIDEO_REJECTED', 'YouTube 已拒绝或移除该视频，请在 YouTube Studio 查看原因。');
+    const privacy = draft.video?.privacy || 'private';
+    // videos.update replaces mutable fields within each requested part. Preserve
+    // current writable status fields instead of resetting license or embedding.
+    const status = {};
+    for (const key of ['embeddable', 'license', 'publicStatsViewable', 'selfDeclaredMadeForKids', 'containsSyntheticMedia']) {
+      if (current.status[key] !== undefined) status[key] = current.status[key];
+    }
+    if (privacy === 'private' && current.status.publishAt) status.publishAt = current.status.publishAt;
+    status.privacyStatus = privacy;
+    const response = await request(`${VIDEO_URL}?part=status`, {
+      method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ id: checkpoint.remoteId, status }),
+    }, { fetchImpl, signal });
+    const data = await readJson(response);
+    if (data.id !== checkpoint.remoteId || data.status?.privacyStatus !== privacy) fail('VISIBILITY_UNCONFIRMED', 'YouTube 未确认目标视频可见性，请核对 YouTube Studio。', { uncertain: true });
+    if (['failed', 'rejected', 'deleted'].includes(data.status.uploadStatus)) fail('VIDEO_REJECTED', 'YouTube 已拒绝或移除该视频，请在 YouTube Studio 查看原因。');
+    const result = {
+      remoteId: checkpoint.remoteId, url: `https://www.youtube.com/watch?v=${encodeURIComponent(checkpoint.remoteId)}`,
+      status: data.status.uploadStatus === 'processed' ? (privacy === 'private' ? 'draft' : 'published') : 'processing',
+      platformStatus: data.status.uploadStatus || 'uploaded', privacy,
+    };
+    return { done: true, checkpoint: { ...checkpoint, result }, result };
+  }
   if (!asset || !Number.isSafeInteger(asset.size) || asset.size <= 0 || typeof asset.slice !== 'function') fail('ASSET_REQUIRED', '请选择需要上传的视频文件。');
   const mime = asset.type || 'application/octet-stream';
   if (!/^video\//.test(mime) && mime !== 'application/octet-stream') fail('INVALID_MEDIA', 'YouTube 上传需要视频文件。');

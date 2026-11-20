@@ -53,7 +53,7 @@ function tokenEquals(supplied, token) {
 }
 
 /** A custom loopback transport for the extension; MCP itself is served over stdio. */
-export function createBridge({ extensionId, token = randomBytes(32).toString('hex'), requestTimeoutMs = 24000, maxPending = 32, maxBodyBytes = DEFAULT_MAX_BODY } = {}) {
+export function createBridge({ extensionId, token = randomBytes(32).toString('hex'), requestTimeoutMs = 24000, maxPending = 32, maxBodyBytes = DEFAULT_MAX_BODY, onEvent } = {}) {
   if (typeof extensionId !== 'string' || !/^[a-p]{32}$/.test(extensionId)) {
     throw new BridgeError('EXTENSION_ID_REQUIRED', 'An exact Chrome extension ID (32 a-p characters) is required.');
   }
@@ -76,6 +76,13 @@ export function createBridge({ extensionId, token = randomBytes(32).toString('he
   }
 
   const server = http.createServer(async (request, response) => {
+    response.once('finish', () => {
+      if (typeof onEvent !== 'function') return;
+      // Optional bounded diagnostics for local tests: never emit headers, body, URLs with queries or tokens.
+      try { onEvent({ at: Date.now(), route: ['/health', '/v1/poll', '/v1/results', '/v1/call'].includes(request.url) ? request.url : 'other',
+        method: request.method, origin: request.headers.origin === undefined ? 'absent' : request.headers.origin === origin ? 'paired-extension' : 'other', status: response.statusCode }); }
+      catch { /* Diagnostics must not affect request outcomes. */ }
+    });
     try {
       if (closing) throw new BridgeError('SHUTTING_DOWN', 'Bridge is shutting down.', 503);
       const address = server.address();
@@ -108,8 +115,12 @@ export function createBridge({ extensionId, token = randomBytes(32).toString('he
         writeJson(response, 200, { ok: true, connected: lastPollAt > 0 && Date.now() - lastPollAt <= 5000, lastPollAt: lastPollAt || null, pending: pending.size });
         return;
       }
-      if (request.url === '/v1/poll' && request.method === 'GET') {
+      if (request.url === '/v1/poll' && ['GET', 'POST'].includes(request.method)) {
         if (requestOrigin !== origin) throw new BridgeError('EXTENSION_ONLY', 'Only the paired extension may poll.', 403);
+        if (request.method === 'POST') {
+          const payload = await readJson(request, 1024);
+          if (!isObject(payload) || Object.keys(payload).length) throw new BridgeError('INVALID_POLL', 'Poll body must be an empty JSON object.');
+        }
         lastPollAt = Date.now();
         const entry = [...pending.values()].find((candidate) => !candidate.delivered && candidate.expiresAt > Date.now());
         if (entry) entry.delivered = true;

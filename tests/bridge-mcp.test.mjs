@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { mkdtemp, writeFile, chmod, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, stat, chmod, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { runMcp } from '../bridge/mcp.mjs';
-import { readPrivateToken } from '../bridge/cli.mjs';
+import { readPrivateToken, loadOrCreatePrivateToken } from '../bridge/cli.mjs';
 import { createBridge } from '../bridge/server.mjs';
 
 const token = 'a'.repeat(64);
@@ -71,7 +71,7 @@ test('forwards only validated calls with bearer authentication and marks publish
       assert.equal(options.headers.Authorization, `Bearer ${token}`);
       assert.equal(JSON.parse(options.body).method, 'jobs.enqueue');
       assert.equal(options.redirect, 'error');
-      return new Response(JSON.stringify({ result: [{ id: 'job-1', status: 'pending_approval' }] }));
+      return new Response(JSON.stringify({ result: [{ id: 'job-1', state: 'awaiting_approval' }] }));
     },
   });
   assert.equal(calls, 1);
@@ -79,6 +79,20 @@ test('forwards only validated calls with bearer authentication and marks publish
   assert.equal(response.structuredContent.approvalRequired, true);
   assert.equal(response.isError, false);
   assert.equal(replies.find((reply) => reply.id === 3).error.code, -32602);
+});
+
+test('accepts Shopify inventory location and tracking fields without widening tool authority', async () => {
+  const replies = await conversation([init(), request(2, 'tools/call', { name: 'drafts_save', arguments: { draft: {
+    kind: 'product', title: 'Inventory fixture', product: { price: '12.00', currency: 'USD', quantity: 3, locationId: 'gid://shopify/Location/123', trackInventory: true },
+  } } })], {
+    fetchImpl: async (_url, options) => {
+      const draft = JSON.parse(options.body).params.draft;
+      assert.equal(draft.product.locationId, 'gid://shopify/Location/123');
+      assert.equal(draft.product.trackInventory, true);
+      return new Response(JSON.stringify({ result: draft }));
+    },
+  });
+  assert.equal(replies.find((reply) => reply.id === 2).result.isError, false);
 });
 
 test('reports transport failure as uncertain for writes and does not auto-retry', async () => {
@@ -124,6 +138,33 @@ test('private token files reject world-readable permissions and symlinks', async
   }
 });
 
+test('bridge restart safely reuses an existing private pairing token', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'matrixpost-bridge-pairing-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'token');
+  const first = await loadOrCreatePrivateToken(path);
+  assert.equal(first.created, true);
+  if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777, 0o600);
+  const original = await readFile(path, 'utf8');
+  let server = createBridge({ extensionId: 'abcdefghijklmnopabcdefghijklmnop', token: first.token });
+  const initial = await server.listen(0);
+  assert.equal((await fetch(`${initial}/health`, { headers: { Authorization: `Bearer ${first.token}` } })).status, 200);
+  await server.close();
+  const second = await loadOrCreatePrivateToken(path);
+  assert.equal(second.created, false);
+  assert.equal(second.token, first.token);
+  assert.equal(await readFile(path, 'utf8'), original);
+  server = createBridge({ extensionId: 'abcdefghijklmnopabcdefghijklmnop', token: second.token });
+  t.after(() => server.close());
+  const restarted = await server.listen(0);
+  assert.equal((await fetch(`${restarted}/health`, { headers: { Authorization: `Bearer ${first.token}` } })).status, 200);
+  if (process.platform !== 'win32') {
+    await chmod(path, 0o644);
+    await assert.rejects(() => loadOrCreatePrivateToken(path), /private regular file/);
+    assert.equal(await readFile(path, 'utf8'), original);
+  }
+});
+
 test('completes a real MCP to HTTP to extension-poll round trip', async (t) => {
   const extensionId = 'abcdefghijklmnopabcdefghijklmnop';
   const bridge = createBridge({ extensionId });
@@ -138,7 +179,7 @@ test('completes a real MCP to HTTP to extension-poll round trip', async (t) => {
   for (let attempt = 0; attempt < 100 && !bridge.pendingCount; attempt++) await delay(5);
   assert.equal(bridge.pendingCount, 1);
   const headers = { Authorization: `Bearer ${bridge.token}`, Origin: `chrome-extension://${extensionId}` };
-  const { requests } = await (await fetch(`${url}/v1/poll`, { headers })).json();
+  const { requests } = await (await fetch(`${url}/v1/poll`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: '{}' })).json();
   assert.equal(requests[0].method, 'drafts.save');
   assert.equal(requests[0].source, 'agent');
   assert.equal(requests[0].params.draft.title, 'Bridge round trip');

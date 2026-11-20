@@ -74,6 +74,9 @@ function outcome(endpoint, checkpoint, action) {
 
 export async function executeShopify({ draft, account, credentials, action, checkpoint = {}, fetchImpl, signal }) {
   if (checkpoint.result) return { done: true, checkpoint, result: checkpoint.result };
+  if (checkpoint.promote && (action !== 'publish' || !validGid(checkpoint.remoteId, 'Product') || !checkpoint.priceApplied || !checkpoint.currencyVerified)) {
+    fail('INVALID_CHECKPOINT', '原位发布需要已创建并设置价格的 Shopify 草稿，不能重新创建商品。');
+  }
   const endpoint = shopEndpoint(account);
   const token = needCredential(credentials, 'accessToken');
   const product = draft.product || {};

@@ -11,7 +11,7 @@ export const PLATFORMS = Object.freeze([
     home: 'https://www.youtube.com', composeUrl: 'https://studio.youtube.com',
     description: '官方 API 分片上传；需要独立 OAuth access token，上传完成后仍可能由平台处理。',
     limits: { title: 100, description: 5000, tags: 500 },
-    credentialFields: [{ key: 'accessToken', label: 'OAuth access token', type: 'password', placeholder: '需要 youtube.upload 授权' }],
+    credentialFields: [{ key: 'accessToken', label: 'OAuth access token', type: 'password', placeholder: '上传需 youtube.upload；已有视频改可见性需 youtube.force-ssl' }],
     hosts: ['https://www.googleapis.com/*'],
   },
   portal('bilibili', '哔哩哔哩', 'video', 'https://www.bilibili.com', 'https://member.bilibili.com/platform/upload/video/frame'),

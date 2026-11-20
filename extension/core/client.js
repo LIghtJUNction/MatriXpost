@@ -47,13 +47,15 @@ export async function connectBridge({url='http://127.0.0.1:43176',token}) {
   const response=await fetch(state.url+'/health',{headers,signal:AbortSignal.timeout(5000),credentials:'omit',redirect:'error'});
   if(!response.ok) throw new AppError('BRIDGE_CONNECT_FAILED','桥接连接失败，请检查配对码和扩展 ID。');
   bridge=state;
-  const poll=async()=>{
+  const poll=async(initial=false)=>{
     if(bridge!==state) return;
     let next=700;
     try {
-      const response=await fetch(state.url+'/v1/poll',{headers,credentials:'omit',redirect:'error',
+      // Privileged Chromium extension GETs may omit Origin. A JSON POST retains the
+      // browser-generated Origin, so the companion can enforce the exact paired extension.
+      const response=await fetch(state.url+'/v1/poll',{method:'POST',body:'{}',headers,credentials:'omit',redirect:'error',
         signal:AbortSignal.any([state.controller.signal,AbortSignal.timeout(5000)])});
-      if(!response.ok) throw new Error('poll failed');
+      if(!response.ok) throw new AppError('BRIDGE_CONNECT_FAILED',`桥接拒绝扩展轮询（HTTP ${response.status}），请检查配对码和扩展 ID。`);
       const data=await response.json();
       for(const request of data.requests??[]) {
         if(bridge!==state) break;
@@ -63,17 +65,22 @@ export async function connectBridge({url='http://127.0.0.1:43176',token}) {
           if(!Number.isFinite(deadline)||deadline<=Date.now()) throw new AppError('REQUEST_EXPIRED','AI 请求已过期。');
           result=await rpc(request.method,request.params??{},'agent');
         } catch(e) { error={code:e.code??'REQUEST_FAILED',message:e.code?e.message:'AI 请求未完成。'}; }
-        await fetch(state.url+'/v1/results',{method:'POST',headers,body:JSON.stringify({id:request.id,...(error?{error}:{result})}),
+        const posted=await fetch(state.url+'/v1/results',{method:'POST',headers,body:JSON.stringify({id:request.id,...(error?{error}:{result})}),
           credentials:'omit',redirect:'error',signal:AbortSignal.any([state.controller.signal,AbortSignal.timeout(5000)])});
+        if(!posted.ok) throw new AppError('BRIDGE_RESULT_REJECTED',`桥接未接受执行回执（HTTP ${posted.status}）。请先检查已有草稿和任务，再重试。`);
       }
       update({connected:true,url:state.url});
-    } catch {
+    } catch(error) {
       if(bridge!==state) return;
+      if(initial) {
+        disconnectBridge();
+        throw error?.code ? error : new AppError('BRIDGE_CONNECT_FAILED','无法与桥接完成扩展身份验证，请检查配对码、扩展 ID 和本机连接。');
+      }
       next=5000;update({connected:false,url:state.url,error:'连接中断，正在重连。'});
     }
-    if(bridge===state) state.timer=setTimeout(poll,next);
+    if(bridge===state) state.timer=setTimeout(()=>poll(),next);
   };
-  state.timer=setTimeout(poll,0);update({connected:true,url:state.url});
+  await poll(true);
   return {connected:true,url:state.url};
 }
 globalThis.addEventListener?.('pagehide',()=>disconnectBridge());

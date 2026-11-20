@@ -1,7 +1,7 @@
 import { AppError,assert,publicError } from './errors.js';
 import { VERSION,MAX_BATCH,ACTIVE_STATES,plain,text,id,strings,httpsUrl,uuid,now,normalizeDraft,safeAccount,safeJob,safeAsset,jobKey,parseSchedule } from './model.js';
 import { PLATFORMS } from './catalog.js';
-import { validateTarget,requiredOrigins,executeStep,canResumeAfterInterruption } from '../adapters/index.js';
+import { validateTarget,requiredOrigins,executeStep,canResumeAfterInterruption,promoteDraftCheckpoint } from '../adapters/index.js';
 import { Vault } from './vault.js';
 
 export const AGENT_METHODS=new Set(['platforms.list','accounts.list','drafts.list','drafts.save','publish.preview','jobs.enqueue','jobs.list','jobs.retry','jobs.cancel']);
@@ -13,7 +13,7 @@ export const METHODS=[
 ].map(([name,description])=>({name,description}));
 
 export class Engine {
-  constructor({store,session,platforms=PLATFORMS,adapter={validateTarget,requiredOrigins,executeStep,canResumeAfterInterruption},permissions=async()=>true,openTab=async()=>({}),preparePage=null}) {
+  constructor({store,session,platforms=PLATFORMS,adapter={validateTarget,requiredOrigins,executeStep,canResumeAfterInterruption,promoteDraftCheckpoint},permissions=async()=>true,openTab=async()=>({}),preparePage=null}) {
     this.store=store; this.vault=new Vault(store,session); this.platforms=platforms; this.adapter=adapter;
     this.permissions=permissions; this.openTab=openTab; this.preparePage=preparePage;
     this.tail=Promise.resolve(); this.ticking=false; this.instance=uuid();
@@ -62,6 +62,7 @@ export class Engine {
       case 'assisted.prepare': return this.assisted(p);
       case 'assisted.fill': return this.fillAssisted(p);
       case 'assets.delete': return this.deleteAsset(p.id);
+      case 'assets.prune': return this.pruneAssets();
       case 'settings.save': return this.saveSettings(p.settings);
       case 'backup.export': return this.export();
       case 'backup.import': return this.import(p.data);
@@ -176,11 +177,19 @@ export class Engine {
       const key=jobKey(draft,account,preview.action);
       const duplicate=previous.find(j=>j.key===key&&j.state!=='cancelled');
       if(duplicate) { jobs.push(safeJob(duplicate)); continue; }
+      const other=previous.find(j=>j.draftId===draft.id&&j.draftRevision===draft.revision&&j.accountId===account.id&&
+        j.action!==preview.action&&['queued','running','blocked','awaiting_approval','failed','uncertain'].includes(j.state));
+      assert(!other,'TARGET_BUSY','该内容在此账号还有未结束的任务，请先完成或取消原任务。');
+      assert(!(preview.action==='draft'&&previous.some(j=>j.draftId===draft.id&&j.draftRevision===draft.revision&&
+        j.accountId===account.id&&j.action==='publish'&&j.state==='succeeded')),'ALREADY_PUBLISHED','该版本已经提交发布。修改内容后可创建新版本草稿。');
       const state=target.mode==='assisted'?'prepared':source==='agent'&&preview.action==='publish'?'awaiting_approval':'queued';
+      const savedRemoteDraft=preview.action==='publish'&&target.mode==='api'?previous.find(j=>j.draftId===draft.id&&
+        j.draftRevision===draft.revision&&j.accountId===account.id&&j.action==='draft'&&j.state==='succeeded'):null;
+      const checkpoint=savedRemoteDraft?this.adapter.promoteDraftCheckpoint(account.platform,savedRemoteDraft.checkpoint):{};
       const job={id:uuid(),key,draftId:draft.id,draftRevision:draft.revision,accountId:account.id,
         accountRevision:account.revision,accountLabel:account.label,platform:account.platform,title:draft.title,kind:draft.kind,
         action:preview.action,mode:target.mode,state,source,scheduledAt,createdAt:now(),updatedAt:now(),attempts:0,
-        content:structuredClone(draft),accountSnapshot:safeAccount(account),checkpoint:{},error:null,result:null};
+        content:structuredClone(draft),accountSnapshot:safeAccount(account),checkpoint,error:null,result:null};
       if(state==='prepared') job.result={status:'prepared',note:'内容已准备，请在平台页面完成上传和提交。'};
       ops.push({store:'jobs',value:job}); jobs.push(safeJob(job));
     }
@@ -237,7 +246,7 @@ export class Engine {
           const encrypted=await this.need('secrets',account.id);
           credentials=await this.vault.open(encrypted.envelope,account.id);
           assert(await this.permissions(this.adapter.requiredOrigins(account)),'HOST_PERMISSION_REQUIRED','平台访问权限已撤回。');
-          asset=job.content.assetIds[0]?(await this.need('assets',job.content.assetIds[0])).blob:null;
+          asset=!job.checkpoint.promote&&job.content.assetIds[0]?(await this.need('assets',job.content.assetIds[0])).blob:null;
           job.state='running';job.inFlight={at:now(),instance:this.instance};job.attempts++;job.updatedAt=now();
           await this.store.put('jobs',job);return true;
         } catch(e) {
@@ -297,9 +306,19 @@ export class Engine {
   async deleteAsset(assetId) {
     await this.need('assets',assetId);
     const drafts=await this.store.all('drafts'),jobs=await this.store.all('jobs');
-    assert(!drafts.some(d=>d.assetIds.includes(assetId))&&!jobs.some(j=>ACTIVE_STATES.includes(j.state)&&j.content.assetIds.includes(assetId)),
+    assert(!drafts.some(d=>d.assetIds.includes(assetId))&&!jobs.some(j=>!['succeeded','cancelled','prepared'].includes(j.state)&&j.content.assetIds.includes(assetId)),
       'ASSET_IN_USE','请先从草稿和待执行任务中移除此素材。');
     await this.store.delete('assets',assetId);return {deleted:true};
+  }
+  async pruneAssets() {
+    const [drafts,jobs,assets]=await Promise.all([this.store.all('drafts'),this.store.all('jobs'),this.store.all('assets')]);
+    const referenced=new Set(drafts.flatMap(d=>d.assetIds));
+    for(const job of jobs) if(!['succeeded','cancelled','prepared'].includes(job.state)) {
+      for(const aid of job.content.assetIds) referenced.add(aid);
+    }
+    const unused=assets.filter(a=>!referenced.has(a.id));
+    await this.store.batch(unused.map(a=>({store:'assets',delete:true,id:a.id})));
+    return {removed:unused.length,bytes:unused.reduce((n,a)=>n+a.size,0)};
   }
   async saveSettings(settings) {
     plain(settings,'设置');

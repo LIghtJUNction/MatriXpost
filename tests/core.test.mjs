@@ -13,6 +13,7 @@ async function fixture(executeStep) {
   const store=new MemoryStore(),session=new MemorySession();let calls=0;
   const adapter={validateTarget:()=>[],requiredOrigins:()=>['https://shop.example.com/*'],
     canResumeAfterInterruption:(p,cp)=>cp.resumable===true,
+    promoteDraftCheckpoint:(p,cp)=>({remoteId:cp.remoteId,promote:true}),
     executeStep:async options=>{calls++;return executeStep?executeStep(options):{done:true,checkpoint:{remoteId:'123'},result:{remoteId:'123',url:'https://shop.example.com/item/123',status:'published'}};}};
   const engine=new Engine({store,session,platforms,adapter,permissions:async()=>true,openTab:async url=>({tabId:99,url})});
   await engine.dispatch('vault.setup',{passphrase:password});
@@ -145,9 +146,36 @@ test('backup import is additive, resets media/credentials and never restores exe
   assert.equal((await store.all('drafts')).length,2);
 });
 
+test('publishing an existing remote draft reuses its resource and preserves original history',async()=>{
+  const observed=[];
+  const {engine,store,account,draft}=await fixture(async options=>{
+    observed.push(options);
+    return {done:true,checkpoint:{remoteId:'existing-item',result:{remoteId:'existing-item',status:options.action==='draft'?'draft':'published'}},result:{remoteId:'existing-item',status:options.action==='draft'?'draft':'published'}};
+  });
+  const [first]=await engine.dispatch('jobs.enqueue',{draftId:draft.id,accountIds:[account.id],action:'draft'});await engine.tick();
+  const [second]=await engine.dispatch('jobs.enqueue',{draftId:draft.id,accountIds:[account.id],action:'publish'});await engine.tick();
+  assert.equal(observed[1].checkpoint.remoteId,'existing-item');assert.equal(observed[1].checkpoint.promote,true);
+  assert.equal((await store.get('jobs',first.id)).result.status,'draft');assert.equal((await store.get('jobs',second.id)).result.status,'published');
+});
+
+test('different actions cannot create the same remote resource concurrently',async()=>{
+  const {engine,account,draft}=await fixture();
+  await engine.dispatch('jobs.enqueue',{draftId:draft.id,accountIds:[account.id],action:'draft'});
+  await assert.rejects(engine.dispatch('jobs.enqueue',{draftId:draft.id,accountIds:[account.id],action:'publish'}),{code:'TARGET_BUSY'});
+});
+
 test('model validates money, links, quantities, and preserves data as inert text',()=>{
   const d=normalizeDraft({...draftInput,title:'<script>bad()</script>'});assert.equal(d.title,'<script>bad()</script>');
   assert.throws(()=>normalizeDraft({...draftInput,product:{price:'NaN'}}),{code:'INVALID_PRICE'});
   assert.throws(()=>normalizeDraft({...draftInput,product:{quantity:-1}}),{code:'INVALID_QUANTITY'});
   assert.throws(()=>normalizeDraft({...draftInput,product:{images:['javascript:bad()']}}),{code:'INVALID_URL'});
+});
+
+test('asset cleanup removes only unreferenced copies and preserves failed-job media',async()=>{
+  const {engine,store}=await fixture();
+  for(const id of ['draft-media','orphan-media','failed-media']) await store.put('assets',{id,name:id,size:4,type:'video/mp4',blob:new Blob(['data'])});
+  await engine.dispatch('drafts.save',{draft:{kind:'video',title:'Keep media',assetIds:['draft-media']}});
+  await store.put('jobs',{id:'failed-upload',state:'failed',content:{assetIds:['failed-media']}});
+  assert.deepEqual(await engine.dispatch('assets.prune'),{removed:1,bytes:4});
+  assert(await store.get('assets','draft-media'));assert(await store.get('assets','failed-media'));assert.equal(await store.get('assets','orphan-media'),undefined);
 });

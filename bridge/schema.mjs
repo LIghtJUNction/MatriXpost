@@ -23,6 +23,7 @@ const draft = object({
     quantity: { type: 'integer', minimum: 0, maximum: 2147483647 },
     images: { type: 'array', items: text(4096), maxItems: 32 },
     vendor: text(255), productType: text(255), publicationId: text(255),
+    locationId: text(255), trackInventory: { type: 'boolean' },
   }),
 }, ['kind', 'title']);
 

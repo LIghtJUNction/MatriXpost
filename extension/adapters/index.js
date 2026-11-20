@@ -60,8 +60,36 @@ export function validateTarget(draft, account, action) {
 
 export function canResumeAfterInterruption(platform, checkpoint = {}) {
   if (checkpoint.result) return true;
+  if (checkpoint.promote) {
+    if (platform === 'woocommerce') return /^[1-9]\d*$/.test(checkpoint.remoteId || '');
+    if (platform === 'shopify') return validGid(checkpoint.remoteId, 'Product') && checkpoint.priceApplied === true;
+    if (platform === 'youtube') return /^[A-Za-z0-9_-]{6,64}$/.test(checkpoint.remoteId || '');
+  }
   if (platform !== 'youtube' || !checkpoint.sessionUrl) return false;
   try { youtubeSession(checkpoint.sessionUrl); return true; } catch { return false; }
+}
+
+/** Convert a confirmed remote draft to an update-only task, never a create. */
+export function promoteDraftCheckpoint(platform, checkpoint = {}) {
+  const remoteId = checkpoint.remoteId || checkpoint.result?.remoteId;
+  const unavailable = () => fail('PROMOTION_UNAVAILABLE', '没有可核实的远端草稿，无法将该任务转为原位发布。');
+  if (checkpoint.remoteId && checkpoint.result?.remoteId && checkpoint.remoteId !== checkpoint.result.remoteId) return unavailable();
+  if (platform === 'youtube') {
+    if (!['processing', 'draft'].includes(checkpoint.result?.status) || checkpoint.result?.privacy !== 'private' || !/^[A-Za-z0-9_-]{6,64}$/.test(remoteId || '')) return unavailable();
+    // The original upload capability is unnecessary when changing visibility.
+    return { remoteId, promote: true, stage: 'publish_existing', total: checkpoint.total, offset: checkpoint.total };
+  }
+  if (checkpoint.result?.status !== 'draft') return unavailable();
+  if (platform === 'woocommerce') {
+    if (!/^[1-9]\d*$/.test(remoteId || '')) return unavailable();
+    return { remoteId, promote: true, stage: 'publish_existing' };
+  }
+  if (platform === 'shopify') {
+    if (!validGid(remoteId, 'Product') || !validGid(checkpoint.variantId, 'ProductVariant') || !validGid(checkpoint.inventoryItemId, 'InventoryItem') || !checkpoint.priceApplied || !checkpoint.currencyVerified) return unavailable();
+    const { result, active, ...reusable } = checkpoint;
+    return { ...reusable, remoteId, promote: true, stage: 'activate_product' };
+  }
+  return unavailable();
 }
 
 export async function executeStep(options) {

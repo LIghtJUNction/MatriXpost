@@ -2,10 +2,11 @@
 import { open, constants } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { createBridge } from './server.mjs';
 import { runMcp } from './mcp.mjs';
 
-const HELP = `MatriXpost local AI bridge (Node.js 22+)\n\n  node bridge/cli.mjs serve --extension-id <ID> [--port 43176] [--token-file <private-new-file>]\n  node bridge/cli.mjs mcp [--port 43176] [--token-file <private-file>]\n\nCopy the extension ID from chrome://extensions. Serve prints a new pairing token\nto stderr; paste it into MatriXpost's AI bridge settings. MCP reads that token from\nMATRIXPOST_TOKEN or a private token file. Keep the extension workspace open.\nThe companion accepts only 127.0.0.1 and the explicitly paired extension origin.\n`;
+const HELP = `MatriXpost local AI bridge (Node.js 22+)\n\n  node bridge/cli.mjs serve --extension-id <ID> [--port 43176] [--token-file <private-file>]\n  node bridge/cli.mjs mcp [--port 43176] [--token-file <private-file>]\n\nCopy the extension ID from chrome://extensions. Serve prints the pairing token\nto stderr; paste it into MatriXpost's AI bridge settings. A private token file is\ncreated if missing and safely reused on restart. MCP reads that token from\nMATRIXPOST_TOKEN or the private file. Keep the extension workspace open.\nThe companion accepts only 127.0.0.1 and the explicitly paired extension origin.\n`;
 
 function parseArgs(argv) {
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') return { mode: 'help' };
@@ -31,13 +32,27 @@ export async function readPrivateToken(path) {
   const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const stat = await file.stat();
-    if (!stat.isFile() || stat.size > 1024 || (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)) {
+    if (!stat.isFile() || stat.size > 1024 || (process.platform !== 'win32' && ((stat.mode & 0o077) !== 0 || stat.uid !== process.getuid()))) {
       throw new Error('Token file must be a private regular file (chmod 600).');
     }
     const token = (await file.readFile('utf8')).trim();
     if (!/^[a-zA-Z0-9_-]{43,128}$/.test(token)) throw new Error('Token file does not contain a valid pairing token.');
     return token;
   } finally { await file.close(); }
+}
+
+export async function loadOrCreatePrivateToken(path) {
+  let file;
+  try { file = await open(path, 'wx', 0o600); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    // An existing file must pass the same no-symlink, owner and mode checks as MCP.
+    return { token: await readPrivateToken(path), created: false };
+  }
+  const token = randomBytes(32).toString('hex');
+  try { await file.writeFile(`${token}\n`, 'utf8'); await file.sync(); }
+  finally { await file.close(); }
+  return { token, created: true };
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -48,18 +63,11 @@ export async function main(argv = process.argv.slice(2)) {
     await runMcp({ token, port: options.port });
     return;
   }
-  const bridge = createBridge({ extensionId: options.extensionId });
+  if (!/^[a-p]{32}$/.test(options.extensionId ?? '')) throw new Error('An exact Chrome extension ID (32 a-p characters) is required.');
+  const pairing = options.tokenFile ? await loadOrCreatePrivateToken(options.tokenFile) : null;
+  const bridge = createBridge({ extensionId: options.extensionId, ...(pairing ? { token: pairing.token } : {}) });
   const url = await bridge.listen(options.port);
-  try {
-    if (options.tokenFile) {
-      const file = await open(options.tokenFile, 'wx', 0o600);
-      try { await file.writeFile(`${bridge.token}\n`, 'utf8'); } finally { await file.close(); }
-    }
-  } catch {
-    await bridge.close();
-    throw new Error('Could not create a new private token file. Existing files are never overwritten.');
-  }
-  process.stderr.write(`MatriXpost bridge: ${url}\nExtension: ${options.extensionId}\nPairing token: ${bridge.token}\n`);
+  process.stderr.write(`MatriXpost bridge: ${url}\nExtension: ${options.extensionId}\nPairing token: ${bridge.token}\n${pairing && !pairing.created ? 'Reused the existing private pairing token.\n' : ''}`);
   let stopping = false;
   const stop = async () => {
     if (stopping) return;

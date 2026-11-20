@@ -37,7 +37,7 @@ export async function runMcp({ input = process.stdin, output = process.stdout, t
       return {
         protocolVersion: VERSIONS.includes(message.params.protocolVersion) ? message.params.protocolVersion : VERSIONS[0],
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'matrixpost', version: '0.1.0' },
+        serverInfo: { name: 'matrixpost', version: '0.5.0' },
         instructions: 'MatriXpost prepares video and product drafts and queues account-specific jobs. Open the extension and connect its local bridge. AI publish requests wait for approval in the extension. Credentials and vault controls are not exposed. A timeout after dispatch is uncertain: inspect existing drafts and jobs before retrying.',
       };
     }

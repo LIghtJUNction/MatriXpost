@@ -74,7 +74,9 @@ export function safeJob(job) {
   const cp=checkpoint??{};
   return {...safe,progress:cp.total?Math.min(100,Math.floor((cp.offset??0)*100/cp.total)):job.state==='succeeded'?100:0,
     stage:cp.stage??'',remoteId:job.result?.remoteId??cp.remoteId??cp.productId??null,
-    canRetry:['failed','blocked'].includes(job.state)&&job.error?.code!=='ACCOUNT_CHANGED'};
+    canRetry:['failed','blocked'].includes(job.state)&&job.error?.code!=='ACCOUNT_CHANGED',
+    ...(job.state==='awaiting_approval'&&content?{preview:{title:content.title,description:content.description,
+      tags:content.tags,video:content.video,product:content.product,assetIds:content.assetIds}}:{})};
 }
 export function safeAsset(asset) {
   const {id,name,size,type,createdAt}=asset;

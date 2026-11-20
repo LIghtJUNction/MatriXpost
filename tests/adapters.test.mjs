@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { executeStep, validateTarget, requiredOrigins, canResumeAfterInterruption } from '../extension/adapters/index.js';
+import { executeStep, validateTarget, requiredOrigins, canResumeAfterInterruption, promoteDraftCheckpoint } from '../extension/adapters/index.js';
 import { publicHttps, AdapterError } from '../extension/adapters/common.js';
 import { YOUTUBE_CHUNK_SIZE } from '../extension/adapters/youtube.js';
 import { PLATFORMS } from '../extension/core/catalog.js';
@@ -255,4 +255,65 @@ test('Shopify activates a previously inactive stock location with the intended q
   assert.equal(result.result.inventoryApplied, true);
   assert.match(net.calls[4].body.query, /inventoryActivate/);
   assert.equal(net.calls[4].body.variables.quantity, 3);
+});
+
+test('WooCommerce draft promotion updates the original product without creating another', async () => {
+  const credentials = { consumerKey: 'key', consumerSecret: 'secret' };
+  const create = fixture([json({ value: 'USD' }), json({ id: 123, status: 'draft' }, 201)]);
+  const draftResult = await runToDone({ draft: product(), account: woo, credentials, action: 'draft', fetchImpl: create.fetchImpl });
+  const checkpoint = promoteDraftCheckpoint('woocommerce', draftResult.checkpoint);
+  assert.equal(draftResult.checkpoint.result.status, 'draft', 'The original history is immutable');
+  assert.equal(checkpoint.result, undefined);
+  const publish = fixture([json({ id: 123, status: 'publish' })]);
+  const result = await runToDone({ draft: product(), account: woo, credentials, action: 'publish', checkpoint, fetchImpl: publish.fetchImpl });
+  assert.equal(result.result.remoteId, '123');
+  assert.equal(result.result.status, 'published');
+  assert.equal(publish.calls.length, 1);
+  assert.equal(publish.calls[0].options.method, 'PUT');
+  assert.ok(publish.calls[0].url.endsWith('/products/123'));
+  assert.deepEqual(publish.calls[0].body, { status: 'publish' });
+});
+
+test('Shopify draft promotion skips creation and price writes and publishes the original product', async () => {
+  const draft = product({ publicationId });
+  const credentials = { accessToken: 'token' };
+  const create = fixture([shopCurrency(), shopCreated(), shopPriced()]);
+  const draftResult = await runToDone({ draft, account: shopify, credentials, action: 'draft', fetchImpl: create.fetchImpl });
+  const checkpoint = promoteDraftCheckpoint('shopify', draftResult.checkpoint);
+  const publish = fixture([shopActive(), shopPublished()]);
+  const result = await runToDone({ draft, account: shopify, credentials, action: 'publish', checkpoint, fetchImpl: publish.fetchImpl });
+  assert.equal(result.result.remoteId, productId);
+  assert.equal(result.result.status, 'published');
+  assert.equal(publish.calls.length, 2);
+  assert.ok(publish.calls.every((call) => !call.body.query.includes('productCreate') && !call.body.query.includes('productVariantsBulkUpdate')));
+  assert.equal(publish.calls[0].body.variables.product.id, productId);
+  assert.equal(publish.calls[1].body.variables.id, productId);
+});
+
+test('YouTube draft promotion changes the same video visibility without uploading and preserves writable status', async () => {
+  const draft = video({ video: { privacy: 'public', madeForKids: false } });
+  const checkpoint = promoteDraftCheckpoint('youtube', {
+    sessionUrl, remoteId: 'AbCdEf12345', total: 5, offset: 5,
+    result: { remoteId: 'AbCdEf12345', status: 'processing', privacy: 'private' },
+  });
+  assert.equal(checkpoint.sessionUrl, undefined, 'Promotion no longer needs the upload capability');
+  const net = fixture([
+    json({ items: [{ id: 'AbCdEf12345', status: { uploadStatus: 'processed', privacyStatus: 'private', license: 'creativeCommon', embeddable: false, publicStatsViewable: false, containsSyntheticMedia: true } }] }),
+    json({ id: 'AbCdEf12345', status: { uploadStatus: 'processed', privacyStatus: 'public' } }),
+  ]);
+  const result = await runToDone({ draft, account: youtube, credentials: { accessToken: 'token-with-force-ssl' }, action: 'publish', checkpoint, asset: null, fetchImpl: net.fetchImpl });
+  assert.equal(result.result.remoteId, 'AbCdEf12345');
+  assert.equal(result.result.status, 'published');
+  assert.equal(net.calls.length, 2);
+  assert.ok(net.calls.every((call) => !call.url.includes('/upload/')));
+  assert.equal(net.calls[1].options.method, 'PUT');
+  assert.deepEqual(net.calls[1].body, { id: 'AbCdEf12345', status: { license: 'creativeCommon', embeddable: false, publicStatsViewable: false, containsSyntheticMedia: true, privacyStatus: 'public' } });
+});
+
+test('promotion refuses unverified or contradictory remote IDs instead of recreating resources', async () => {
+  for (const platform of ['youtube', 'woocommerce', 'shopify']) {
+    assert.throws(() => promoteDraftCheckpoint(platform, {}), (error) => error.code === 'PROMOTION_UNAVAILABLE');
+  }
+  assert.throws(() => promoteDraftCheckpoint('woocommerce', { remoteId: '1', result: { remoteId: '2', status: 'draft' } }), (error) => error.code === 'PROMOTION_UNAVAILABLE');
+  await assert.rejects(() => executeStep({ draft: product({ publicationId }), account: shopify, credentials: { accessToken: 'token' }, action: 'publish', checkpoint: { promote: true }, fetchImpl: () => assert.fail('Never create') }), (error) => error.code === 'INVALID_CHECKPOINT');
 });
