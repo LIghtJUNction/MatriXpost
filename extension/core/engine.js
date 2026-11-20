@@ -26,6 +26,19 @@ export class Engine {
     const next=this.tail.then(fn,fn);
     this.tail=next.catch(()=>{}); return next;
   }
+  hasRemoteContent(job) {
+    const checkpoint=job.checkpoint??{};
+    return Boolean(checkpoint.remoteId||checkpoint.productId||checkpoint.sessionUrl||checkpoint.result);
+  }
+  publicJob(job) {
+    const view=safeJob(job);
+    const hasRemoteContent=this.hasRemoteContent(job);
+    const resumable=this.adapter.canResumeAfterInterruption(job.platform,job.checkpoint??{});
+    return {...view,hasRemoteContent,canRetry:job.error?.code!=='ACCOUNT_CHANGED'&&(
+      ['failed','blocked'].includes(job.state)||
+      (job.state==='uncertain'&&resumable)||
+      (job.state==='cancelled'&&hasRemoteContent&&resumable))};
+  }
   async need(store,value) {
     const record=await this.store.get(store,id(value));
     assert(record,'NOT_FOUND','记录不存在或已经删除。'); return record;
@@ -45,7 +58,7 @@ export class Engine {
       case 'platforms.list': return this.platforms;
       case 'accounts.list': return (await this.store.all('accounts')).map(safeAccount);
       case 'drafts.list': return (await this.store.all('drafts')).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt));
-      case 'jobs.list': return (await this.store.all('jobs')).map(safeJob).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
+      case 'jobs.list': return (await this.store.all('jobs')).map(job=>this.publicJob(job)).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
       case 'drafts.save': return this.saveDraft(p.draft);
       case 'drafts.delete': return this.deleteDraft(p.id);
       case 'accounts.save': return this.saveAccount(p.account,p.credentials);
@@ -75,7 +88,7 @@ export class Engine {
       this.store.get('settings','preferences'),this.vault.status()
     ]);
     return {version:VERSION,platforms:this.platforms,drafts:drafts.sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)),
-      accounts:accounts.map(safeAccount),jobs:jobs.map(safeJob).sort((a,b)=>b.createdAt.localeCompare(a.createdAt)),
+      accounts:accounts.map(safeAccount),jobs:jobs.map(job=>this.publicJob(job)).sort((a,b)=>b.createdAt.localeCompare(a.createdAt)),
       assets:assets.map(safeAsset),settings:settings?.value??{theme:'light'},vault};
   }
   async saveDraft(input) {
@@ -175,11 +188,12 @@ export class Engine {
     for(const target of preview.targets) {
       const account=await this.need('accounts',target.accountId);
       const key=jobKey(draft,account,preview.action);
-      const duplicate=previous.find(j=>j.key===key&&j.state!=='cancelled');
-      if(duplicate) { jobs.push(safeJob(duplicate)); continue; }
+      const duplicate=previous.find(j=>j.key===key&&(j.state!=='cancelled'||this.hasRemoteContent(j)));
+      if(duplicate) { jobs.push(this.publicJob(duplicate)); continue; }
       const other=previous.find(j=>j.draftId===draft.id&&j.draftRevision===draft.revision&&j.accountId===account.id&&
-        j.action!==preview.action&&['queued','running','blocked','awaiting_approval','failed','uncertain'].includes(j.state));
-      assert(!other,'TARGET_BUSY','该内容在此账号还有未结束的任务，请先完成或取消原任务。');
+        j.action!==preview.action&&(['queued','running','blocked','awaiting_approval','failed','uncertain'].includes(j.state)||
+          (j.state==='cancelled'&&this.hasRemoteContent(j))));
+      assert(!other,'TARGET_BUSY','该内容在此账号已有未完成的任务。若平台已创建内容，请继续原任务，避免重复创建。');
       assert(!(preview.action==='draft'&&previous.some(j=>j.draftId===draft.id&&j.draftRevision===draft.revision&&
         j.accountId===account.id&&j.action==='publish'&&j.state==='succeeded')),'ALREADY_PUBLISHED','该版本已经提交发布。修改内容后可创建新版本草稿。');
       const state=target.mode==='assisted'?'prepared':source==='agent'&&preview.action==='publish'?'awaiting_approval':'queued';
@@ -191,7 +205,7 @@ export class Engine {
         action:preview.action,mode:target.mode,state,source,scheduledAt,createdAt:now(),updatedAt:now(),attempts:0,
         content:structuredClone(draft),accountSnapshot:safeAccount(account),checkpoint,error:null,result:null};
       if(state==='prepared') job.result={status:'prepared',note:'内容已准备，请在平台页面完成上传和提交。'};
-      ops.push({store:'jobs',value:job}); jobs.push(safeJob(job));
+      ops.push({store:'jobs',value:job}); jobs.push(this.publicJob(job));
     }
     await this.store.batch(ops); return jobs;
   }
@@ -199,26 +213,27 @@ export class Engine {
     const job=await this.need('jobs',jobId);
     assert(job.state==='awaiting_approval','INVALID_STATE','此任务无需确认。');
     job.state='queued'; job.approvedAt=now(); job.updatedAt=now();
-    await this.store.put('jobs',job); return safeJob(job);
+    await this.store.put('jobs',job); return this.publicJob(job);
   }
   async retry(jobId,source) {
     const job=await this.need('jobs',jobId);
-    assert(['failed','blocked','uncertain'].includes(job.state),'INVALID_STATE','仅可重试失败或受阻的任务。');
-    assert(job.state!=='uncertain' || this.adapter.canResumeAfterInterruption(job.platform,job.checkpoint),
+    assert(['failed','blocked','uncertain'].includes(job.state)||
+      (job.state==='cancelled'&&this.hasRemoteContent(job)),'INVALID_STATE','仅可继续失败、受阻或已有远端内容的已取消任务。');
+    assert(!['uncertain','cancelled'].includes(job.state) || this.adapter.canResumeAfterInterruption(job.platform,job.checkpoint),
       'OUTCOME_UNCERTAIN','平台可能已经接收该请求。请先到平台核对，避免重复发布。');
     assert(job.error?.code!=='ACCOUNT_CHANGED','ACCOUNT_CHANGED','目标账号已修改，请为当前草稿创建新任务。');
     if(source==='agent'&&job.action==='publish') {
       job.state='awaiting_approval'; job.approvedAt=null;
     } else job.state='queued';
     job.error=null; job.updatedAt=now(); job.scheduledAt=now(); job.inFlight=null;
-    await this.store.put('jobs',job); return safeJob(job);
+    await this.store.put('jobs',job); return this.publicJob(job);
   }
   async cancel(jobId) {
     const job=await this.need('jobs',jobId);
     assert(['queued','blocked','awaiting_approval','prepared','failed'].includes(job.state),'INVALID_STATE',
       '当前请求已发出或已完成，请先查看平台结果。');
     job.state='cancelled'; job.updatedAt=now();
-    await this.store.put('jobs',job); return safeJob(job);
+    await this.store.put('jobs',job); return this.publicJob(job);
   }
   async recover() {
     return this.exclusive(async()=>{
@@ -253,7 +268,7 @@ export class Engine {
           job.state='blocked';job.error=publicError(e);job.updatedAt=now();await this.store.put('jobs',job);return false;
         }
       });
-      if(!ready) return {idle:!job,...(job?{job:safeJob(job)}:{})};
+      if(!ready) return {idle:!job,...(job?{job:this.publicJob(job)}:{})};
       let result,error;
       try {
         result=await this.adapter.executeStep({draft:job.content,account,credentials,checkpoint:job.checkpoint,asset,
@@ -263,7 +278,7 @@ export class Engine {
       credentials=null;
       return await this.exclusive(async()=>{
         const current=await this.need('jobs',job.id);
-        if(current.state!=='running') return {job:safeJob(current)};
+        if(current.state!=='running') return {job:this.publicJob(current)};
         current.inFlight=null;current.updatedAt=now();
         if(error) {
           current.state=error.uncertain?'uncertain':'failed';
@@ -274,7 +289,7 @@ export class Engine {
           current.state=result.done?'succeeded':'queued';
           if(result.done) { current.result=result.result??{status:'accepted'};current.completedAt=now(); }
         }
-        await this.store.put('jobs',current);return {job:safeJob(current)};
+        await this.store.put('jobs',current);return {job:this.publicJob(current)};
       });
     } finally { credentials=null; this.ticking=false; }
   }
@@ -306,14 +321,16 @@ export class Engine {
   async deleteAsset(assetId) {
     await this.need('assets',assetId);
     const drafts=await this.store.all('drafts'),jobs=await this.store.all('jobs');
-    assert(!drafts.some(d=>d.assetIds.includes(assetId))&&!jobs.some(j=>!['succeeded','cancelled','prepared'].includes(j.state)&&j.content.assetIds.includes(assetId)),
-      'ASSET_IN_USE','请先从草稿和待执行任务中移除此素材。');
+    assert(!drafts.some(d=>d.assetIds.includes(assetId))&&!jobs.some(j=>(!['succeeded','cancelled','prepared'].includes(j.state)||
+      (j.state==='cancelled'&&this.hasRemoteContent(j)))&&j.content.assetIds.includes(assetId)),
+      'ASSET_IN_USE','素材仍被草稿或可继续的任务使用。');
     await this.store.delete('assets',assetId);return {deleted:true};
   }
   async pruneAssets() {
     const [drafts,jobs,assets]=await Promise.all([this.store.all('drafts'),this.store.all('jobs'),this.store.all('assets')]);
     const referenced=new Set(drafts.flatMap(d=>d.assetIds));
-    for(const job of jobs) if(!['succeeded','cancelled','prepared'].includes(job.state)) {
+    for(const job of jobs) if(!['succeeded','cancelled','prepared'].includes(job.state)||
+      (job.state==='cancelled'&&this.hasRemoteContent(job))) {
       for(const aid of job.content.assetIds) referenced.add(aid);
     }
     const unused=assets.filter(a=>!referenced.has(a.id));

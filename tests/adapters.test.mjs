@@ -130,7 +130,7 @@ test('YouTube initializes private draft upload and checkpoints before sending me
   assert.equal(result.checkpoint.sessionUrl, sessionUrl);
   assert.equal(result.checkpoint.offset, 0);
   assert.equal(canResumeAfterInterruption('youtube', result.checkpoint), true);
-  assert.equal(canResumeAfterInterruption('woocommerce', {}), false);
+  assert.equal(canResumeAfterInterruption('woocommerce', { currencyVerified: true }), false);
 });
 
 test('YouTube refuses an upload Location that would steal the OAuth token', async () => {
@@ -316,4 +316,37 @@ test('promotion refuses unverified or contradictory remote IDs instead of recrea
   }
   assert.throws(() => promoteDraftCheckpoint('woocommerce', { remoteId: '1', result: { remoteId: '2', status: 'draft' } }), (error) => error.code === 'PROMOTION_UNAVAILABLE');
   await assert.rejects(() => executeStep({ draft: product({ publicationId }), account: shopify, credentials: { accessToken: 'token' }, action: 'publish', checkpoint: { promote: true }, fetchImpl: () => assert.fail('Never create') }), (error) => error.code === 'INVALID_CHECKPOINT');
+});
+
+test('recovery distinguishes currency reads, unknown creates and fixed Shopify mutations',()=>{
+  const ids={currencyVerified:true,remoteId:'gid://shopify/Product/12',
+    variantId:'gid://shopify/ProductVariant/34',inventoryItemId:'gid://shopify/InventoryItem/56'};
+  assert.equal(canResumeAfterInterruption('woocommerce',{}),true);
+  assert.equal(canResumeAfterInterruption('shopify',{}),true);
+  assert.equal(canResumeAfterInterruption('woocommerce',{currencyVerified:true,stage:'create_product'}),false);
+  assert.equal(canResumeAfterInterruption('shopify',{currencyVerified:true,stage:'create_product'}),false);
+  assert.equal(canResumeAfterInterruption('youtube',{}),false);
+  assert.equal(canResumeAfterInterruption('shopify',ids),true);
+  assert.equal(canResumeAfterInterruption('shopify',{...ids,variantId:undefined}),false);
+  assert.equal(canResumeAfterInterruption('shopify',{...ids,currencyVerified:false}),false);
+  assert.equal(canResumeAfterInterruption('shopify',{...ids,priceApplied:true,inventoryObserved:true}),false);
+  assert.equal(canResumeAfterInterruption('shopify',{...ids,priceApplied:true,inventoryObserved:true,
+    inventoryMutationKey:'12345678-1234-1234-1234-123456789abc'}),true);
+});
+
+test('resuming a Shopify price step updates the saved variant without another productCreate',async()=>{
+  const checkpoint={currencyVerified:true,remoteId:'gid://shopify/Product/12',
+    variantId:'gid://shopify/ProductVariant/34',inventoryItemId:'gid://shopify/InventoryItem/56',stage:'set_price'};
+  const net=fixture([json({data:{productVariantsBulkUpdate:{
+    productVariants:[{id:checkpoint.variantId,price:'12.90'}],userErrors:[]
+  }}})]);
+  assert.equal(canResumeAfterInterruption('shopify',checkpoint),true);
+  const step=await executeStep({draft:product(),account:shopify,credentials:{accessToken:'fixture'},
+    action:'draft',checkpoint,fetchImpl:net.fetchImpl});
+  assert.equal(step.checkpoint.remoteId,checkpoint.remoteId);
+  assert.equal(step.checkpoint.priceApplied,true);
+  assert.equal(net.calls.length,1);
+  assert.equal(net.calls[0].body.variables.productId,checkpoint.remoteId);
+  assert.equal(net.calls[0].body.variables.variants[0].id,checkpoint.variantId);
+  assert(!net.calls[0].body.query.includes('productCreate'));
 });

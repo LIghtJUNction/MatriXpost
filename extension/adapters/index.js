@@ -65,6 +65,19 @@ export function canResumeAfterInterruption(platform, checkpoint = {}) {
     if (platform === 'shopify') return validGid(checkpoint.remoteId, 'Product') && checkpoint.priceApplied === true;
     if (platform === 'youtube') return /^[A-Za-z0-9_-]{6,64}$/.test(checkpoint.remoteId || '');
   }
+  // Currency discovery is a separate read-only step. No create request can have
+  // been sent until currencyVerified is persisted.
+  if (['woocommerce', 'shopify'].includes(platform) && !checkpoint.currencyVerified &&
+      !checkpoint.remoteId && !checkpoint.productId && !checkpoint.sessionUrl) return true;
+  if (platform === 'shopify') {
+    // Every later mutation targets these saved IDs. Inventory mutations also
+    // reuse the key persisted before dispatch, including after a lost response.
+    if (checkpoint.currencyVerified !== true || !validGid(checkpoint.remoteId, 'Product') ||
+        !validGid(checkpoint.variantId, 'ProductVariant') || !validGid(checkpoint.inventoryItemId, 'InventoryItem')) return false;
+    if (checkpoint.inventoryObserved && !checkpoint.inventoryCompleted &&
+        !/^[0-9a-f-]{36}$/i.test(checkpoint.inventoryMutationKey || '')) return false;
+    return true;
+  }
   if (platform !== 'youtube' || !checkpoint.sessionUrl) return false;
   try { youtubeSession(checkpoint.sessionUrl); return true; } catch { return false; }
 }

@@ -179,3 +179,97 @@ test('asset cleanup removes only unreferenced copies and preserves failed-job me
   assert.deepEqual(await engine.dispatch('assets.prune'),{removed:1,bytes:4});
   assert(await store.get('assets','draft-media'));assert(await store.get('assets','failed-media'));assert.equal(await store.get('assets','orphan-media'),undefined);
 });
+
+test('cancelled tasks retain remote checkpoints and re-enqueue never recreates their content',async()=>{
+  let creates=0;
+  const {engine,store,account,draft}=await fixture(async({checkpoint})=>{
+    if(!checkpoint.remoteId) {
+      creates++;
+      return {done:false,checkpoint:{remoteId:'existing-product',resumable:true,stage:'set_price'}};
+    }
+    return {done:true,checkpoint:{...checkpoint,result:{remoteId:checkpoint.remoteId,status:'draft'}},
+      result:{remoteId:checkpoint.remoteId,status:'draft'}};
+  });
+  const params={draftId:draft.id,accountIds:[account.id],action:'draft'};
+  const [first]=await engine.dispatch('jobs.enqueue',params);
+  await engine.tick();
+  const stopped=await engine.dispatch('jobs.cancel',{id:first.id});
+  assert.equal(stopped.hasRemoteContent,true);
+  assert.equal(stopped.canRetry,true);
+  const [again]=await engine.dispatch('jobs.enqueue',params);
+  assert.equal(again.id,first.id);
+  assert.equal(again.state,'cancelled');
+  await engine.tick();assert.equal(creates,1);
+  await assert.rejects(engine.dispatch('jobs.enqueue',{...params,action:'publish'}),{code:'TARGET_BUSY'});
+  await engine.dispatch('jobs.retry',{id:first.id});
+  await engine.tick();
+  const done=await store.get('jobs',first.id);
+  assert.equal(done.state,'succeeded');
+  assert.equal(done.result.remoteId,'existing-product');
+  assert.equal(creates,1);
+  assert.equal((await store.all('jobs')).length,1);
+});
+
+test('cancelled tasks without remote content may be enqueued again',async()=>{
+  const {engine,account,draft}=await fixture();
+  const params={draftId:draft.id,accountIds:[account.id],action:'draft'};
+  const [first]=await engine.dispatch('jobs.enqueue',params);
+  const stopped=await engine.dispatch('jobs.cancel',{id:first.id});
+  assert.equal(stopped.hasRemoteContent,false);assert.equal(stopped.canRetry,false);
+  await assert.rejects(engine.dispatch('jobs.retry',{id:first.id}),{code:'INVALID_STATE'});
+  const [second]=await engine.dispatch('jobs.enqueue',params);
+  assert.notEqual(second.id,first.id);assert.equal(second.state,'queued');
+});
+
+test('AI cannot resume a cancelled public task without renewed local approval',async()=>{
+  const {engine,store,account,draft}=await fixture(async()=>({
+    done:false,checkpoint:{remoteId:'retained-product',resumable:true,stage:'publish_existing'}
+  }));
+  const [job]=await engine.dispatch('jobs.enqueue',{draftId:draft.id,accountIds:[account.id],action:'publish'});
+  await engine.tick();await engine.dispatch('jobs.cancel',{id:job.id});
+  const resumed=await engine.dispatch('jobs.retry',{id:job.id},'agent');
+  assert.equal(resumed.state,'awaiting_approval');
+  assert.equal(resumed.approvedAt,null);
+  assert.equal((await store.get('jobs',job.id)).checkpoint.remoteId,'retained-product');
+});
+
+test('production recovery resumes read-only and fixed-resource stages but keeps unknown creates blocked',async()=>{
+  const store=new MemoryStore(),engine=new Engine({store,session:new MemorySession()});
+  const shopifyIds={currencyVerified:true,remoteId:'gid://shopify/Product/12',
+    variantId:'gid://shopify/ProductVariant/34',inventoryItemId:'gid://shopify/InventoryItem/56'};
+  const rows=[
+    ['woo-read','woocommerce',{},'queued'],
+    ['shopify-read','shopify',{},'queued'],
+    ['shopify-price','shopify',{...shopifyIds,stage:'set_price'},'queued'],
+    ['shopify-inventory','shopify',{...shopifyIds,priceApplied:true,stage:'read_inventory'},'queued'],
+    ['woo-create','woocommerce',{currencyVerified:true,stage:'create_product'},'uncertain'],
+    ['shopify-create','shopify',{currencyVerified:true,stage:'create_product'},'uncertain'],
+    ['youtube-create','youtube',{},'uncertain']
+  ];
+  for(const [id,platform,checkpoint] of rows) await store.put('jobs',{id,platform,checkpoint,
+    state:'running',inFlight:{instance:'stopped-worker'},createdAt:new Date().toISOString(),content:{assetIds:[]},action:'draft'});
+  await engine.recover();
+  for(const [id,,,expected] of rows) {
+    assert.equal((await store.get('jobs',id)).state,expected,id);
+    if(expected==='uncertain') await assert.rejects(engine.dispatch('jobs.retry',{id}),{code:'OUTCOME_UNCERTAIN'});
+  }
+  await store.put('jobs',{id:'known-uncertain',platform:'shopify',checkpoint:{...shopifyIds,stage:'set_price'},
+    state:'uncertain',createdAt:new Date().toISOString(),content:{assetIds:[]},action:'draft'});
+  const known=(await engine.dispatch('jobs.list')).find(j=>j.id==='known-uncertain');
+  assert.equal(known.canRetry,true);assert.equal(known.hasRemoteContent,true);
+  assert.equal((await engine.dispatch('jobs.retry',{id:'known-uncertain'})).state,'queued');
+});
+
+test('cancelled uploads keep referenced media until their remote work is resolved',async()=>{
+  const {engine,store}=await fixture();
+  await store.put('assets',{id:'cancelled-upload-media',name:'retained.mp4',size:4,type:'video/mp4',blob:new Blob(['data'])});
+  await store.put('assets',{id:'cancelled-unsent-media',name:'unused.mp4',size:4,type:'video/mp4',blob:new Blob(['data'])});
+  await store.put('jobs',{id:'cancelled-upload',state:'cancelled',
+    checkpoint:{sessionUrl:'https://www.googleapis.com/upload/youtube/v3/videos?upload_id=fixture'},
+    content:{assetIds:['cancelled-upload-media']}});
+  await store.put('jobs',{id:'cancelled-unsent',state:'cancelled',checkpoint:{},content:{assetIds:['cancelled-unsent-media']}});
+  await assert.rejects(engine.dispatch('assets.delete',{id:'cancelled-upload-media'}),{code:'ASSET_IN_USE'});
+  assert.deepEqual(await engine.dispatch('assets.prune'),{removed:1,bytes:4});
+  assert(await store.get('assets','cancelled-upload-media'));
+  assert.equal(await store.get('assets','cancelled-unsent-media'),undefined);
+});
