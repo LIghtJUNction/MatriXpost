@@ -1,0 +1,70 @@
+name: Release preview
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag, for example v0.6.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; node24
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0; node24
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check the existing version tag
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - name: Verify packages, version, and checksums
+        id: package
+        run: node scripts/release-check.mjs "$RELEASE_TAG"
+      - name: Publish a complete preview release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft > dist/release-state.json; then
+            if ! node --input-type=module -e "import fs from 'node:fs'; process.exit(JSON.parse(fs.readFileSync('dist/release-state.json')).isDraft ? 0 : 1)"; then
+              echo "This release is already public. Published assets are left unchanged; use a new version tag."
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease \
+              --title "MatriXpost $RELEASE_VERSION · 开发预览" --notes-file dist/RELEASE_NOTES.md
+          fi
+          gh release upload "$RELEASE_TAG" --clobber \
+            "dist/MatriXpost-chromium-$RELEASE_VERSION.zip" \
+            "dist/MatriXpost-ai-bridge-$RELEASE_VERSION.zip" \
+            "dist/MatriXpost-$RELEASE_VERSION.zip" dist/SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease \
+            --title "MatriXpost $RELEASE_VERSION · 开发预览" --notes-file dist/RELEASE_NOTES.md
