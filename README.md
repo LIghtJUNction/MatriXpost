@@ -90,9 +90,14 @@ npm run build
 # 浏览器验收需要外部已安装的 Playwright 与 Chromium。
 MATRIXPOST_PLAYWRIGHT_MODULE=/absolute/path/to/playwright \
 MATRIXPOST_CHROMIUM=/usr/bin/chromium \
+MATRIXPOST_PERMISSION_MODE=native \
 node scripts/browser-test.mjs
 ```
 
 单元与协议测试使用 fixture 响应和本机 HTTP 服务。浏览器脚本加载真实扩展，测试草稿、账号、保险箱、MCP、重启恢复与窄屏布局；它使用隔离配置并阻断外网发布。日常开发以本机验收为准，GitHub 工作流仅手动触发打包。
+
+Linux 浏览器验收使用 `native` 权限模式，需要安装 `xvfb-run` 和 `dbus-run-session`。脚本创建独立 Xvfb 显示与 D-Bus 会话，在测试浏览器中请求 `https://example.com/*` 和 `http://127.0.0.1/*` 两个测试地址的访问权限。看到 `NATIVE_PERMISSION_WAIT` 后，通过能够查看该隔离显示的桌面工具检查 `test-results/permissions-native.png` 中的真实权限窗口，并点击“允许”；脚本随后核对浏览器实际授予的权限。这个步骤会等待真实点击，无法仅靠无头命令自动完成。成功页面截图会先回到页顶，最多等待 8 秒让临时提示消失；失败截图立即保留当时的现场。
+
+本版完成 72 项核心与协议测试、12 项真实 Chromium 浏览器检查。具体环境、覆盖范围与尚未验证的部分见 [验收记录](docs/VALIDATION.md)。
 
 目录结构和状态约定见 [架构说明](docs/ARCHITECTURE.md)。当前实现依据的官方接口资料列在 [平台矩阵](docs/PLATFORMS.md#官方资料) 中。

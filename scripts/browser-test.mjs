@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile, access } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -33,6 +33,13 @@ if (permissionMode === 'native' && process.env.MATRIXPOST_UNDER_XVFB !== '1') {
 }
 const passphrase = `matrixpost-smoke-${randomUUID()}`;
 const credentials = { consumerKey: 'ck_matrixpost_smoke_fixture', consumerSecret: 'cs_matrixpost_smoke_fixture' };
+// Deterministic binary fixture for file ingestion and Blob persistence, not codec or playback validation.
+const videoFixture = {
+  name: 'matrixpost-storage-fixture.mp4',
+  mimeType: 'video/mp4',
+  buffer: Buffer.from(Array.from({ length: 1024 }, (_, index) => (index * 31 + 17) % 256)),
+};
+const videoFixtureHash = createHash('sha256').update(videoFixture.buffer).digest('hex');
 const secrets = [passphrase, ...Object.values(credentials)];
 const clean = (value) => secrets.reduce((text, secret) => text.replaceAll(secret, '[redacted]'), String(value));
 const errors = [];
@@ -59,6 +66,25 @@ async function waitForDraft(title) {
     return result?.ok && result.result.some((draft) => draft.title === title);
   }, title, { timeout: 10000 });
   return (await rpc('drafts.list')).find((draft) => draft.title === title);
+}
+
+async function assertStoredVideoFixture(assetId) {
+  const stored = await page.evaluate(async (assetId) => {
+    const { IndexedStore } = await import('./core/store.js');
+    const record = await new IndexedStore().get('assets', assetId);
+    if (!record) return null;
+    const isBlob = record.blob instanceof Blob;
+    return {
+      id: record.id, name: record.name, size: record.size, type: record.type, isBlob,
+      blobSize: record.blob?.size, blobType: record.blob?.type,
+      bytes: isBlob ? Array.from(new Uint8Array(await record.blob.arrayBuffer())) : null,
+    };
+  }, assetId);
+  assert.deepEqual(stored, {
+    id: assetId, name: videoFixture.name, size: videoFixture.buffer.length, type: videoFixture.mimeType,
+    isBlob: true, blobSize: videoFixture.buffer.length, blobType: videoFixture.mimeType,
+    bytes: Array.from(videoFixture.buffer),
+  }, 'IndexedDB must contain the exact selected file bytes and matching Blob metadata.');
 }
 
 async function navigate(view) {
@@ -234,11 +260,21 @@ async function acceptNativePermissionPrompt(origins) {
   // Inspect the screenshot and click the real Allow button on this isolated display.
   // Never guess coordinates or substitute a mock permission result.
   await page.waitForFunction(() => globalThis.__matrixSmokePermission?.pending === false, null, { timeout: 60000 });
-  report.permissionsGrantedVia = 'Actual permission dialog on an isolated Xvfb desktop';
+  report.permissionsGrantedVia = 'Real Chromium permissions.request result on an isolated Xvfb desktop';
 }
 
-async function screenshot(name) {
+async function screenshot(name, { failure = false } = {}) {
   const path = join(outputPath, name);
+  if (!failure) {
+    await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: 'instant' }));
+    try {
+      await page.waitForFunction(() => document.querySelectorAll('.toast').length === 0, null, { timeout: 8000 });
+    } catch (error) {
+      if (error.name !== 'TimeoutError') throw error;
+      (report.screenshotTransientTimeouts ||= []).push(name);
+    }
+    await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: 'instant' }));
+  }
   await page.screenshot({ path, fullPage: true, animations: 'disabled' });
   report.screenshots.push(name);
 }
@@ -274,6 +310,10 @@ async function main() {
   await page.locator('#draft-title').fill(videoTitle);
   await page.locator('#draft-description').fill('记录灵感，用一次创作连接更多平台。\n这是一份本地浏览器验证草稿。');
   await page.locator('#draft-tags').fill('MatriXpost, 创作, 产品');
+  await page.locator('#media-file').setInputFiles(videoFixture);
+  await page.locator('#selected-assets .asset-row strong').filter({ hasText: videoFixture.name }).waitFor({ state: 'visible' });
+  await page.waitForFunction(() => !document.querySelector('#upload-zone').classList.contains('busy'));
+  assert.equal(await page.locator('#selected-assets .asset-row').count(), 1);
   await page.locator('#draft-title').focus();
   await page.waitForTimeout(3200); // The app refreshes snapshots every three seconds; it must preserve editor input.
   assert.equal(await page.locator('#draft-title').inputValue(), videoTitle);
@@ -283,6 +323,13 @@ async function main() {
   assert.equal(videoDraft.kind, 'video');
   assert.deepEqual(videoDraft.tags, ['MatriXpost', '创作', '产品']);
   checked('UI draft save and Ctrl+Enter preserve focused editor across refresh');
+  assert.equal(videoDraft.assetIds.length, 1, 'Saving the UI draft must retain its selected video asset reference.');
+  const videoAssetId = videoDraft.assetIds[0];
+  assert.equal(typeof videoAssetId, 'string');
+  await assertStoredVideoFixture(videoAssetId);
+  checked('UI video file ingestion preserves exact fixture bytes in IndexedDB', {
+    bytes: videoFixture.buffer.length, sha256: videoFixtureHash, scope: 'File ingestion and storage only; no codec or playback validation.',
+  });
 
   await page.locator('#vault-open').click();
   await page.locator('#vault-passphrase').fill(passphrase);
@@ -431,6 +478,10 @@ async function main() {
   assert.equal(persisted.drafts.length, 3);
   assert.equal(persisted.accounts.length, 2);
   assert.ok(persisted.drafts.some((draft) => draft.id === videoDraft.id && draft.title === videoTitle));
+  assert.deepEqual(persisted.drafts.find((draft) => draft.id === videoDraft.id).assetIds, [videoAssetId]);
+  assert.equal(persisted.assets.length, 1);
+  assert.equal(persisted.assets[0].id, videoAssetId);
+  await assertStoredVideoFixture(videoAssetId);
   assert.ok(persisted.drafts.some((draft) => draft.id === productDraft.id && draft.product.price === '29.90'));
   assert.equal(persisted.jobs[0].state, 'cancelled');
   assert.equal(persisted.vault.configured, true);
@@ -445,7 +496,9 @@ async function main() {
     return Object.entries(credentials).every(([key, expected]) => value[key] === expected);
   }, { accountId: woo.id, credentials });
   assert.equal(decrypts, true);
-  checked('Full browser restart preserves drafts/accounts/ciphertext and clears the unlocked vault key');
+  checked('Full browser restart preserves drafts/accounts/video bytes/ciphertext and clears the unlocked vault key', {
+    videoBytes: videoFixture.buffer.length, videoSha256: videoFixtureHash,
+  });
   await assertNoExternalWork();
   assert.deepEqual(errors, [], 'The browser emitted page or console errors.');
   checked('No page errors, console errors, or platform network requests');
@@ -459,7 +512,7 @@ catch (error) {
   console.error(report.error);
   if (report.bridgeEvents) console.error(`BRIDGE_DIAGNOSTICS ${JSON.stringify(report.bridgeEvents)}`);
   if (page && !page.isClosed()) {
-    try { await screenshot('failure.png'); } catch { /* Preserve the original failure. */ }
+    try { await screenshot('failure.png', { failure: true }); } catch { /* Preserve the original failure without waiting or changing its viewport. */ }
   }
   process.exitCode = 1;
 } finally {
