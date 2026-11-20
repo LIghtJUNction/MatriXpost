@@ -1,6 +1,6 @@
 import { assert, AppError } from './errors.js';
 
-export const VERSION='0.5.0';
+export const VERSION='0.6.0';
 export const MAX_BATCH=50;
 export const ACTIVE_STATES=['queued','running','awaiting_approval','blocked'];
 export const uuid=()=>crypto.randomUUID();

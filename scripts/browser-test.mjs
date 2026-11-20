@@ -35,7 +35,7 @@ const passphrase = `matrixpost-smoke-${randomUUID()}`;
 const credentials = { consumerKey: 'ck_matrixpost_smoke_fixture', consumerSecret: 'cs_matrixpost_smoke_fixture' };
 // Deterministic binary fixture for file ingestion and Blob persistence, not codec or playback validation.
 const videoFixture = {
-  name: 'matrixpost-storage-fixture.mp4',
+  name: '周末手冲咖啡.mp4',
   mimeType: 'video/mp4',
   buffer: Buffer.from(Array.from({ length: 1024 }, (_, index) => (index * 31 + 17) % 256)),
 };
@@ -66,6 +66,34 @@ async function waitForDraft(title) {
     return result?.ok && result.result.some((draft) => draft.title === title);
   }, title, { timeout: 10000 });
   return (await rpc('drafts.list')).find((draft) => draft.title === title);
+}
+
+async function waitForDescription(targetPage, id, description) {
+  await targetPage.waitForFunction(async ({ id, description }) => {
+    const response = await chrome.runtime.sendMessage({ channel: 'matrixpost', method: 'drafts.list', params: {}, source: 'ui' });
+    return response?.ok && response.result.some((draft) => draft.id === id && draft.description === description);
+  }, { id, description }, { timeout: 10000 });
+}
+
+async function assertUsableForm(scope = '#editor-form') {
+  const details = await page.locator(scope).evaluate((form) => {
+    const visible = [...form.querySelectorAll('input:not([type="hidden"]):not([type="file"]), textarea, select, button')].filter((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== 'hidden';
+    });
+    return {
+      controls: visible.length,
+      unlabeled: visible.filter((element) => !element.labels?.length && !element.getAttribute('aria-label') && !element.textContent.trim()).map((element) => element.id),
+      clipped: visible.filter((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.left < -1 || rect.right > innerWidth + 1;
+      }).map((element) => element.id),
+    };
+  });
+  assert.ok(details.controls > 0, `${scope} must expose visible controls.`);
+  assert.deepEqual(details.unlabeled, [], `${scope} contains controls without accessible labels.`);
+  assert.deepEqual(details.clipped, [], `${scope} contains controls outside the viewport.`);
+  return details;
 }
 
 async function assertStoredVideoFixture(assetId) {
@@ -230,13 +258,15 @@ async function assertNoOverflow(view) {
     return {
       viewport: width,
       document: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth),
-      offenders: [...document.querySelectorAll('main *')].filter((element) => {
+      offenders: [...document.querySelectorAll('main *, dialog[open] *')].filter((element) => {
         const rect = element.getBoundingClientRect();
         return rect.width > 0 && (rect.right > width + 2 || rect.left < -2) && getComputedStyle(element).position !== 'fixed';
       }).slice(0, 8).map((element) => ({ tag: element.tagName, id: element.id, class: element.className })),
+      dialogs: [...document.querySelectorAll('dialog[open]')].map((element) => ({ id: element.id, width: element.clientWidth, scrollWidth: element.scrollWidth })),
     };
   });
   assert.ok(result.document <= result.viewport + 1, `${view} causes document overflow: ${JSON.stringify(result)}`);
+  assert.ok(result.dialogs.every((dialog) => dialog.scrollWidth <= dialog.width + 1), `${view} causes horizontal dialog overflow: ${JSON.stringify(result.dialogs)}`);
   return { view, width: result.viewport, documentWidth: result.document };
 }
 
@@ -306,10 +336,11 @@ async function main() {
     return;
   }
 
-  const videoTitle = '一段好内容，开启新的连接';
+  const videoTitle = '周末手冲咖啡：20 克粉的冲煮记录';
+  const videoDescription = '周六早上试了新到的埃塞豆。20 克咖啡粉、300 克水，分三次注水。\n这份草稿用于本地验收，不会发布到平台。';
   await page.locator('#draft-title').fill(videoTitle);
-  await page.locator('#draft-description').fill('记录灵感，用一次创作连接更多平台。\n这是一份本地浏览器验证草稿。');
-  await page.locator('#draft-tags').fill('MatriXpost, 创作, 产品');
+  await page.locator('#draft-description').fill(videoDescription);
+  await page.locator('#draft-tags').fill('手冲咖啡, 周末, 冲煮记录');
   await page.locator('#media-file').setInputFiles(videoFixture);
   await page.locator('#selected-assets .asset-row strong').filter({ hasText: videoFixture.name }).waitFor({ state: 'visible' });
   await page.waitForFunction(() => !document.querySelector('#upload-zone').classList.contains('busy'));
@@ -318,11 +349,19 @@ async function main() {
   await page.waitForTimeout(3200); // The app refreshes snapshots every three seconds; it must preserve editor input.
   assert.equal(await page.locator('#draft-title').inputValue(), videoTitle);
   assert.equal(await page.locator('#draft-title').evaluate((element) => element === document.activeElement), true);
-  await page.keyboard.press('Control+Enter');
   const videoDraft = await waitForDraft(videoTitle);
   assert.equal(videoDraft.kind, 'video');
-  assert.deepEqual(videoDraft.tags, ['MatriXpost', '创作', '产品']);
-  checked('UI draft save and Ctrl+Enter preserve focused editor across refresh');
+  assert.deepEqual(videoDraft.tags, ['手冲咖啡', '周末', '冲煮记录']);
+  assert.equal(videoDraft.description, videoDescription);
+  assert.equal(await page.locator('#editor-error').isVisible(), false);
+  checked('Typing automatically saves the draft without moving focus across snapshot refresh');
+  await page.keyboard.press('Tab');
+  assert.equal(await page.locator('#draft-description').evaluate((element) => element === document.activeElement), true, 'Tab must move from the title to the description.');
+  await page.keyboard.press('Control+Enter');
+  await page.waitForFunction(() => document.querySelector('#save-draft')?.disabled === false);
+  assert.equal((await rpc('drafts.list')).filter((draft) => draft.id === videoDraft.id).length, 1);
+  assert.equal((await rpc('drafts.list')).find((draft) => draft.id === videoDraft.id).revision, videoDraft.revision, 'Saving unchanged content must keep its revision.');
+  checked('Keyboard navigation and Ctrl+Enter save preserve the same draft revision');
   assert.equal(videoDraft.assetIds.length, 1, 'Saving the UI draft must retain its selected video asset reference.');
   const videoAssetId = videoDraft.assetIds[0];
   assert.equal(typeof videoAssetId, 'string');
@@ -330,6 +369,33 @@ async function main() {
   checked('UI video file ingestion preserves exact fixture bytes in IndexedDB', {
     bytes: videoFixture.buffer.length, sha256: videoFixtureHash, scope: 'File ingestion and storage only; no codec or playback validation.',
   });
+
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForFunction((title) => document.querySelector('#draft-title')?.value === title, videoTitle);
+  assert.equal(await page.locator('#draft-description').inputValue(), videoDescription);
+  assert.equal(await page.locator('#selected-assets .asset-row').count(), 1);
+  checked('Reload restores the saved editor and its selected video');
+
+  const stalePage = await context.newPage();
+  await stalePage.goto(`chrome-extension://${extensionId}/app.html`, { waitUntil: 'load' });
+  await stalePage.waitForFunction((title) => document.querySelector('#draft-title')?.value === title, videoTitle);
+  const latestDescription = `${videoDescription}\n补记：水温 92°C，最后一段注水放慢。`;
+  await page.locator('#draft-description').fill(latestDescription);
+  await waitForDescription(page, videoDraft.id, latestDescription);
+  const secondWindowDescription = `${videoDescription}\n另一份笔记：下次试试 90°C。`;
+  await stalePage.locator('#draft-description').fill(secondWindowDescription);
+  await stalePage.locator('#editor-error').waitFor({ state: 'visible', timeout: 10000 });
+  assert.equal((await rpc('drafts.list')).find((draft) => draft.id === videoDraft.id).description, latestDescription);
+  assert.equal(await stalePage.locator('#draft-description').inputValue(), secondWindowDescription);
+  await stalePage.locator('#save-copy').click();
+  await stalePage.waitForFunction(async ({ id, description }) => {
+    const response = await chrome.runtime.sendMessage({ channel: 'matrixpost', method: 'drafts.list', params: {}, source: 'ui' });
+    return response?.ok && response.result.some((draft) => draft.id !== id && draft.description === description);
+  }, { id: videoDraft.id, description: secondWindowDescription });
+  assert.equal((await rpc('drafts.list')).find((draft) => draft.id === videoDraft.id).description, latestDescription);
+  await stalePage.close();
+  await page.bringToFront();
+  checked('Two extension windows reject a stale revision and preserve the second edit as a separate draft');
 
   await page.locator('#vault-open').click();
   await page.locator('#vault-passphrase').fill(passphrase);
@@ -339,16 +405,27 @@ async function main() {
   assert.equal((await rpc('snapshot')).vault.unlocked, true);
   checked('Vault can be created through the extension UI');
 
-  await navigate('accounts');
-  await page.locator('#accounts-add').click();
+  await page.locator('#target-add-account').click();
   await page.locator('#account-platform').selectOption('bilibili');
-  await page.locator('#account-label').fill('视频账号 · 本地测试');
+  await page.locator('#account-label').fill('周末咖啡日记');
+  await assertUsableForm('#account-form');
+  await screenshot('account-setup-wide.png');
+  await page.setViewportSize({ width: 360, height: 800 });
+  await assertNoOverflow('account-setup-360');
+  await assertUsableForm('#account-form');
+  await screenshot('account-setup-360.png');
+  await page.setViewportSize({ width: 1440, height: 1050 });
   await page.locator('#account-save').click();
   await page.locator('#account-dialog').waitFor({ state: 'hidden' });
+  const browserAccount = (await rpc('accounts.list')).find((account) => account.platform === 'bilibili');
+  await page.waitForFunction((label) => [...document.querySelectorAll('#target-accounts input[type="checkbox"]')].some((element) => element.getAttribute('aria-label') === `选择 ${label}` && element.checked), browserAccount.label);
+  assert.equal(await page.locator('#target-accounts').getByRole('checkbox', { name: `选择 ${browserAccount.label}`, exact: true }).isChecked(), true);
+  checked('Adding an account from the editor keeps the draft and selects the new target');
+  await navigate('accounts');
   await grantOrigins(['https://example.com/*', 'http://127.0.0.1/*']);
   await page.locator('#accounts-add').click();
   await page.locator('#account-platform').selectOption('woocommerce');
-  await page.locator('#account-label').fill('示例店铺 · 本地测试');
+  await page.locator('#account-label').fill('小器物 · 测试店铺');
   await page.locator('#account-endpoint').fill('https://example.com');
   await page.locator('#credential-consumerKey').fill(credentials.consumerKey);
   await page.locator('#credential-consumerSecret').fill(credentials.consumerSecret);
@@ -376,16 +453,34 @@ async function main() {
   await navigate('compose');
   await page.locator('#new-draft').click();
   await page.locator('[data-kind="product"]').click();
-  const productTitle = 'MatriXpost 创作者笔记本';
+  const productTitle = '白色陶瓷杯 · 300 mL';
   await page.locator('#draft-title').fill(productTitle);
-  await page.locator('#draft-description').fill('轻巧、简洁，让每一个好想法都有地方停留。\n本地测试资料，不会上架。');
+  await page.locator('#draft-description').fill('哑光白釉，容量 300 mL，杯口直径 8.5 cm。可放入洗碗机。\n本地验收资料，不会上架。');
   await page.locator('#product-price').fill('29.90');
   await page.locator('#product-quantity').fill('12');
-  await page.locator('#product-sku').fill('MX-NOTE-001');
+  await page.locator('#product-sku').fill('CUP-WHITE-300');
   await page.locator('#save-draft').click();
   const productDraft = await waitForDraft(productTitle);
   assert.equal(productDraft.product.price, '29.90');
   assert.equal(productDraft.product.quantity, 12);
+  await page.locator('#target-accounts').getByRole('checkbox', { name: `选择 ${woo.label}`, exact: true }).check();
+  await page.locator('#publish-action').selectOption('publish');
+  await page.locator('#preview-publish').click();
+  await page.locator('#preview-dialog').waitFor({ state: 'visible' });
+  assert.ok((await page.locator('#preview-summary').innerText()).includes(productTitle));
+  assert.ok((await page.locator('#preview-targets').innerText()).includes(woo.label));
+  assert.equal(await page.locator('#enqueue-confirm').isEnabled(), true);
+  await screenshot('publish-check-wide.png');
+  await page.setViewportSize({ width: 420, height: 900 });
+  await assertNoOverflow('publish-check-420');
+  await screenshot('publish-check-420.png');
+  await page.setViewportSize({ width: 360, height: 800 });
+  await assertNoOverflow('publish-check-360');
+  await screenshot('publish-check-360.png');
+  await page.locator('#preview-dialog .dialog-footer [data-close-dialog]').click();
+  assert.equal((await rpc('jobs.list')).length, 0, 'Inspecting a publish plan must not create or execute a task.');
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  checked('Publish preview shows the selected content/account and remains reviewable at 360px without enqueueing');
   const preview = await rpc('publish.preview', { draftId: productDraft.id, accountIds: [woo.id], action: 'publish' });
   assert.equal(preview.valid, true);
   const jobs = await rpc('jobs.enqueue', { draftId: productDraft.id, accountIds: [woo.id], action: 'publish', scheduledAt: new Date(Date.now() + 3600000).toISOString() }, 'agent');
@@ -397,6 +492,13 @@ async function main() {
     catch (error) { return error.code === 'METHOD_DENIED'; }
   }, jobs[0].id);
   assert.equal(approvalDenied, true);
+  await navigate('queue');
+  await page.locator('.job-approval-preview').waitFor({ state: 'visible' });
+  await screenshot('task-review-wide.png');
+  await page.setViewportSize({ width: 420, height: 900 });
+  await assertNoOverflow('task-review-420');
+  await screenshot('task-review-420.png');
+  await page.setViewportSize({ width: 1440, height: 1050 });
   await rpc('jobs.cancel', { id: jobs[0].id }, 'agent');
   assert.equal((await rpc('jobs.list'))[0].state, 'cancelled');
   checked('Product UI validates fields; AI publish waits for approval and cannot self-approve');
@@ -449,25 +551,90 @@ async function main() {
 
   await navigate('drafts');
   await page.locator('#draft-search').fill(videoTitle);
-  await page.locator('#draft-list').getByRole('button', { name: '继续编辑' }).click();
+  await page.locator('#draft-list .draft-card').filter({ hasText: '补记：水温 92°C' }).getByRole('button', { name: '继续编辑' }).click();
   await page.locator('#view-compose').waitFor({ state: 'visible' });
   const targets = page.locator('#target-accounts input[type="checkbox"]');
   if (await targets.count()) await targets.first().check();
+  assert.equal(await page.locator('#publish-action-field').isVisible(), false, 'A browser-assisted account must not offer an API publish action.');
+  assert.equal(await page.locator('.schedule-options').isVisible(), false, 'A browser-assisted account must not offer unattended scheduling.');
+  assert.equal((await page.locator('#preview-publish').innerText()).trim(), '准备到平台后台');
   await page.setViewportSize({ width: 1440, height: 1050 });
   await assertNoOverflow('compose-wide');
+  await assertUsableForm();
   await screenshot('workspace-wide.png');
+  await page.locator('#settings-open').click();
+  await page.locator('#settings-dialog button[data-theme="dark"]').click();
+  await page.waitForFunction(() => document.documentElement.dataset.theme === 'dark');
+  await page.locator('#settings-dialog [data-close-dialog]').click();
+  await assertNoOverflow('compose-dark');
+  await screenshot('workspace-dark.png');
+  await page.locator('#settings-open').click();
+  await page.locator('#settings-dialog button[data-theme="light"]').click();
+  await page.waitForFunction(() => document.documentElement.dataset.theme === 'light');
+  await page.locator('#settings-dialog [data-close-dialog]').click();
   await page.setViewportSize({ width: 420, height: 900 });
   const responsive = [];
   responsive.push(await assertNoOverflow('compose-mobile'));
+  await assertUsableForm();
   await screenshot('workspace-mobile.png');
   for (const view of ['drafts', 'queue', 'accounts', 'platforms', 'ai']) {
     await navigate(view);
     responsive.push(await assertNoOverflow(`${view}-mobile`));
   }
+  await page.setViewportSize({ width: 360, height: 800 });
+  await navigate('compose');
+  responsive.push(await assertNoOverflow('compose-360'));
+  await assertUsableForm();
+  await screenshot('workspace-360.png');
+  for (const view of ['drafts', 'queue', 'accounts', 'platforms', 'ai']) {
+    await navigate(view);
+    responsive.push(await assertNoOverflow(`${view}-360`));
+  }
   await page.setViewportSize({ width: 1440, height: 1050 });
   await navigate('accounts');
   await screenshot('accounts.png');
-  checked('All workspace views avoid document overflow at 420px', { responsive });
+  checked('All six workspace views and editor controls remain usable at 360px and 420px', { responsive, assistedControlsHidden: true, darkThemeViaSettings: true });
+
+  await navigate('drafts');
+  await page.locator('#draft-search').fill(productTitle);
+  await page.locator('#draft-list').getByRole('button', { name: '继续编辑' }).click();
+  await page.locator('#view-compose').waitFor({ state: 'visible' });
+  await page.locator('#target-accounts').getByRole('checkbox', { name: `选择 ${woo.label}`, exact: true }).check();
+  assert.equal(await page.locator('#publish-action-field').isVisible(), true);
+  assert.equal(await page.locator('.schedule-options').isVisible(), true);
+  await page.locator('#publish-action').selectOption('draft');
+  const rememberedSchedule = await page.evaluate(() => {
+    const local = new Date(Date.now() + 6 * 3600000);
+    const two = (value) => String(value).padStart(2, '0');
+    return `${local.getFullYear()}-${two(local.getMonth() + 1)}-${two(local.getDate())}T${two(local.getHours())}:${two(local.getMinutes())}`;
+  });
+  if (await page.locator('.schedule-options').getAttribute('open') === null) await page.locator('.schedule-options > summary').click();
+  await page.locator('#publish-time').fill(rememberedSchedule);
+  await page.locator('#publish-time').press('Tab');
+
+  // Seed interruption boundaries in the isolated test profile; no remote object is created.
+  // The next real browser startup must run the production recovery logic against these records.
+  const uncertainJobId = await page.evaluate(async (jobId) => {
+    const { IndexedStore } = await import('./core/store.js');
+    const store = new IndexedStore();
+    const original = await store.get('jobs', jobId);
+    original.checkpoint = { remoteId: '42', promote: true, stage: 'publish_existing' };
+    await store.put('jobs', original);
+    const uncertain = {
+      ...structuredClone(original),
+      id: `${jobId}-interrupted-fixture`,
+      key: `${original.key}-interrupted-fixture`,
+      draftId: `${original.draftId}-interrupted-fixture`,
+      title: '棉麻收纳袋 · 创建结果待核对',
+      action: 'draft', state: 'running',
+      checkpoint: { currencyVerified: true, stage: 'create_product' },
+      inFlight: { instance: 'previous-browser-fixture', at: new Date().toISOString() },
+      error: null, result: null,
+    };
+    uncertain.content.title = uncertain.title;
+    await store.put('jobs', uncertain);
+    return uncertain.id;
+  }, jobs[0].id);
 
   await assertNoExternalWork();
   await context.close();
@@ -475,17 +642,26 @@ async function main() {
   const restarted = await launch();
   assert.equal(restarted.extensionId, extensionId);
   const persisted = await rpc('snapshot');
-  assert.equal(persisted.drafts.length, 3);
+  assert.equal(persisted.drafts.length, 4);
   assert.equal(persisted.accounts.length, 2);
   assert.ok(persisted.drafts.some((draft) => draft.id === videoDraft.id && draft.title === videoTitle));
+  assert.equal(persisted.drafts.find((draft) => draft.id === videoDraft.id).description, latestDescription);
   assert.deepEqual(persisted.drafts.find((draft) => draft.id === videoDraft.id).assetIds, [videoAssetId]);
   assert.equal(persisted.assets.length, 1);
   assert.equal(persisted.assets[0].id, videoAssetId);
   await assertStoredVideoFixture(videoAssetId);
   assert.ok(persisted.drafts.some((draft) => draft.id === productDraft.id && draft.product.price === '29.90'));
-  assert.equal(persisted.jobs[0].state, 'cancelled');
+  assert.equal(persisted.jobs.find((job) => job.id === jobs[0].id).state, 'cancelled');
   assert.equal(persisted.vault.configured, true);
   assert.equal(persisted.vault.unlocked, false, 'A full browser restart must clear the in-memory vault key.');
+  await page.waitForFunction((title) => document.querySelector('#draft-title')?.value === title, productTitle);
+  assert.equal(await page.locator('#draft-description').inputValue(), productDraft.description);
+  assert.equal(await page.locator('#product-price').inputValue(), productDraft.product.price);
+  assert.equal(await page.locator('#product-quantity').inputValue(), String(productDraft.product.quantity));
+  assert.equal(await page.locator('#product-sku').inputValue(), productDraft.product.sku);
+  assert.equal(await page.locator('#publish-action').inputValue(), 'draft');
+  assert.equal(await page.locator('#publish-time').inputValue(), rememberedSchedule);
+  assert.equal(await page.locator('#target-accounts').getByRole('checkbox', { name: `选择 ${woo.label}`, exact: true }).isChecked(), true);
   await rpc('vault.unlock', { passphrase });
   const decrypts = await page.evaluate(async ({ accountId, credentials }) => {
     const { IndexedStore } = await import('./core/store.js');
@@ -498,6 +674,47 @@ async function main() {
   assert.equal(decrypts, true);
   checked('Full browser restart preserves drafts/accounts/video bytes/ciphertext and clears the unlocked vault key', {
     videoBytes: videoFixture.buffer.length, videoSha256: videoFixtureHash,
+  });
+  checked('Full browser restart restores the product editor, WooCommerce target, action, and local scheduled time');
+
+  const interrupted = persisted.jobs.find((job) => job.id === uncertainJobId);
+  assert.equal(interrupted.state, 'uncertain');
+  assert.equal(interrupted.canRetry, false);
+  assert.equal(interrupted.hasRemoteContent, false);
+  const resumedRecord = persisted.jobs.find((job) => job.id === jobs[0].id);
+  assert.equal(resumedRecord.hasRemoteContent, true);
+  assert.equal(resumedRecord.canRetry, true);
+  const duplicates = await rpc('jobs.enqueue', { draftId: productDraft.id, revision: productDraft.revision, accountIds: [woo.id], action: 'publish' }, 'agent');
+  assert.equal(duplicates.length, 1);
+  assert.equal(duplicates[0].id, jobs[0].id);
+  assert.equal(duplicates[0].state, 'cancelled');
+  const recovered = await rpc('jobs.retry', { id: jobs[0].id }, 'agent');
+  assert.equal(recovered.state, 'awaiting_approval', 'AI must not bypass review when continuing a public publish.');
+  assert.equal(recovered.hasRemoteContent, true);
+  await rpc('jobs.cancel', { id: jobs[0].id }, 'agent');
+  const unknownRetry = await page.evaluate(async (id) => {
+    const { rpc } = await import('./core/client.js');
+    try { await rpc('jobs.retry', { id }, 'agent'); return { rejected: false }; }
+    catch (error) { return { rejected: true, code: error.code }; }
+  }, uncertainJobId);
+  assert.deepEqual(unknownRetry, { rejected: true, code: 'OUTCOME_UNCERTAIN' });
+  await navigate('queue');
+  await page.locator('.job-card').filter({ hasText: '创建结果待核对' }).waitFor({ state: 'visible' });
+  const unknownCard = page.locator('.job-card').filter({ hasText: '创建结果待核对' });
+  assert.equal(await unknownCard.getByRole('button', { name: /重试|继续此任务|继续任务/ }).count(), 0);
+  const reviewLink = unknownCard.getByRole('link', { name: '到平台核对', exact: true });
+  assert.equal(await reviewLink.getAttribute('href'), 'https://example.com/wp-admin/edit.php?post_type=product');
+  assert.equal(await reviewLink.getAttribute('target'), '_blank');
+  await screenshot('task-recovery-wide.png');
+  await page.setViewportSize({ width: 420, height: 900 });
+  await assertNoOverflow('task-recovery-420');
+  await screenshot('task-recovery-420.png');
+  await page.setViewportSize({ width: 360, height: 800 });
+  await assertNoOverflow('task-recovery-360');
+  await screenshot('task-recovery-360.png');
+  checked('Browser restart protects unknown create outcomes and retains the original cancelled remote object', {
+    scope: 'Persisted interruption fixtures in an isolated browser profile; no live platform objects.',
+    unknownState: interrupted.state, duplicateJobIdPreserved: true, aiResumeRequiresApproval: true,
   });
   await assertNoExternalWork();
   assert.deepEqual(errors, [], 'The browser emitted page or console errors.');
